@@ -1,0 +1,16 @@
+[package]
+name = "jlcircuit-eda-bridge"
+version = "0.1.0"
+description = "Independent CircuitFabric bridge contract for JLCircuit EDA."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+circuitfabric-codex-runtime.workspace = true
+circuitfabric-plugin-api.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

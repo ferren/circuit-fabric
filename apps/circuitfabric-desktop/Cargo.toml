@@ -1,0 +1,36 @@
+[package]
+name = "circuitfabric-desktop"
+version = "0.1.0"
+description = "GPUI desktop control plane for CircuitFabric."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+native-ui = ["dep:gpui", "dep:gpui-component", "dep:gpui_platform"]
+
+[dependencies]
+circuitfabric-codex-runtime.workspace = true
+circuitfabric-contracts.workspace = true
+gpui = { git = "https://github.com/zed-industries/zed", optional = true }
+gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "731e33c780357007c8316cefab8583590032812f", optional = true }
+gpui_platform = { git = "https://github.com/zed-industries/zed", optional = true, features = ["font-kit"] }
+
+[target.'cfg(windows)'.dependencies]
+raw-window-handle = "0.6.2"
+windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging"] }
+
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3.0.11"
+
+[lints.rust]
+# The Windows platform adapter has one narrowly scoped FFI module. The crate
+# denies unsafe code by default and explicitly permits it only for that module.
+unsafe_code = "allow"
+unused_must_use = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"

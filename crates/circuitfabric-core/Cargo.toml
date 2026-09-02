@@ -1,0 +1,16 @@
+[package]
+name = "circuitfabric-core"
+version = "0.1.0"
+description = "Deterministic logical-circuit hashing and validation."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+circuitfabric-contracts.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

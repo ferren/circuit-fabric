@@ -1,0 +1,13 @@
+[package]
+name = "circuitfabric-contracts"
+version = "0.1.0"
+description = "Versioned, runtime-neutral contracts for CircuitFabric."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+
+[lints]
+workspace = true

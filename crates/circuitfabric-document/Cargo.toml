@@ -1,0 +1,15 @@
+[package]
+name = "circuitfabric-document"
+version = "0.1.0"
+description = "Project-scoped document indexing and source-aware retrieval."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+circuitfabric-contracts.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

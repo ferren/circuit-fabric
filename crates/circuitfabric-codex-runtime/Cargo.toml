@@ -1,0 +1,15 @@
+[package]
+name = "circuitfabric-codex-runtime"
+version = "0.1.0"
+description = "Local Codex App Server configuration and JSON-RPC client for CircuitFabric."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

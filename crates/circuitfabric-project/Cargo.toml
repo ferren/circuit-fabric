@@ -1,0 +1,15 @@
+[package]
+name = "circuitfabric-project"
+version = "0.1.0"
+description = "Project-scoped resource organization for CircuitFabric."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+circuitfabric-contracts.workspace = true
+circuitfabric-document.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,21 @@
+{
+  "name": "circuitfabric-jlc-eda",
+  "uuid": "d08e836c5c864f1fad566fbf4bcd1684",
+  "displayName": "CircuitFabric",
+  "description": "CircuitFabric assistant bridge for local Codex App Server sessions.",
+  "version": "0.2.2",
+  "publisher": "CircuitFabric",
+  "engines": { "eda": "^3.2.0" },
+  "license": "MIT",
+  "categories": "Other",
+  "keywords": ["ai", "codex", "schematic", "pcb"],
+  "allowExternalInteraction": true,
+  "activationEvents": {},
+  "dependentExtensions": {},
+  "entry": "./dist/index",
+  "headerMenus": {
+    "home": [{ "id": "circuitfabric-home", "title": "CircuitFabric", "menuItems": [{ "id": "circuitfabric-open", "title": "打开 CircuitFabric 助手", "registerFn": "openCircuitFabricAssistant" }] }],
+    "sch": [{ "id": "circuitfabric-sch", "title": "CircuitFabric", "menuItems": [{ "id": "circuitfabric-open-sch", "title": "与当前原理图助手对话", "registerFn": "openCircuitFabricAssistant" }] }],
+    "pcb": [{ "id": "circuitfabric-pcb", "title": "CircuitFabric", "menuItems": [{ "id": "circuitfabric-open-pcb", "title": "与当前 PCB 助手对话", "registerFn": "openCircuitFabricAssistant" }] }]
+  }
+}
