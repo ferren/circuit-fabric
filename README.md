@@ -35,6 +35,7 @@ EDA, netlist, BOM, simulation, and verification plugins
 - `assets/branding/`: project-owned application artwork, including the multi-size Windows icon resource.
 - [Architecture](docs/architecture.md) / [架构](docs/architecture.zh-CN.md): target architecture, ownership, constraints, and plugin boundaries.
 - [Implementation plan](docs/implementation-plan.md) / [实施计划](docs/implementation-plan.zh-CN.md): phased delivery plan and acceptance criteria.
+- [Provider settings](docs/provider-settings.md): multi-provider configuration and credential boundary.
 - [TODO](TODO.md): implementation backlog in execution order.
 
 ## Status
@@ -51,7 +52,7 @@ cargo test --workspace --exclude circuitfabric-desktop
 cargo clippy --workspace --exclude circuitfabric-desktop --all-targets -- -D warnings
 ```
 
-The desktop crate is a GPUI control-plane scaffold. Build its native UI with `--features native-ui` after the pinned GPUI dependencies are available. The JLCircuit extension package can be rebuilt with `./scripts/package-jlc-extension.ps1`; see [`artifacts/README.md`](artifacts/README.md).
+The desktop crate is a GPUI control-plane scaffold with a multi-provider manager. Build its native UI with `--features native-ui` after the pinned GPUI dependencies are available. Provider settings are saved under the platform application-data directory and contain API-key environment-variable names only. The JLCircuit extension package can be rebuilt with `./scripts/package-jlc-extension.ps1`; see [`artifacts/README.md`](artifacts/README.md).
 
 ## Core principles
 

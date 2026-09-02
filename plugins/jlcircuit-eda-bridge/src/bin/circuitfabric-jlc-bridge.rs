@@ -50,6 +50,9 @@ fn main() -> Result<(), String> {
 
 fn serve_connection(mut stream: TcpStream, settings: &RuntimeSettings) -> Result<(), String> {
     websocket_handshake(&mut stream)?;
+    let provider = settings.default_provider().ok_or_else(|| {
+        format!("default provider is not configured: {}", settings.default_provider_id)
+    })?;
     let mut client: Option<CodexAppServerClient> = None;
     let mut threads = BTreeMap::<String, String>::new();
     let mut project_id: Option<String> = None;
@@ -87,7 +90,7 @@ fn serve_connection(mut stream: TcpStream, settings: &RuntimeSettings) -> Result
                     .filter(|value| !value.trim().is_empty())
                     .ok_or_else(|| "chat requires text".to_owned())?;
                 if client.is_none() {
-                    let mut app_server = CodexAppServerClient::launch(&settings.codex)
+                    let mut app_server = CodexAppServerClient::launch(&settings.codex, provider)
                         .map_err(|error| error.to_string())?;
                     app_server.initialize().map_err(|error| error.to_string())?;
                     client = Some(app_server);
@@ -97,7 +100,7 @@ fn serve_connection(mut stream: TcpStream, settings: &RuntimeSettings) -> Result
                     thread_id.clone()
                 } else {
                     let thread_id = app_server
-                        .start_thread(settings.codex.model.as_deref())
+                        .start_thread(Some(&provider.model))
                         .map_err(|error| error.to_string())?;
                     threads.insert(session_id.to_owned(), thread_id.clone());
                     thread_id

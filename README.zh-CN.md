@@ -35,6 +35,7 @@ EDA、网表、BOM、仿真与验证插件
 - `assets/branding/`：项目自有应用美术资源，包括多尺寸 Windows 图标资源。
 - [Architecture](docs/architecture.md) / [架构](docs/architecture.zh-CN.md)：目标架构、所有权、约束和插件边界。
 - [Implementation plan](docs/implementation-plan.md) / [实施计划](docs/implementation-plan.zh-CN.md)：分阶段交付计划和验收标准。
+- [Provider settings](docs/provider-settings.md)：多 Provider 配置与凭据边界。
 - [TODO](TODO.md)：按执行顺序维护的实现待办。
 
 ## 当前状态
@@ -51,7 +52,7 @@ cargo test --workspace --exclude circuitfabric-desktop
 cargo clippy --workspace --exclude circuitfabric-desktop --all-targets -- -D warnings
 ```
 
-桌面 crate 当前是 GPUI 控制面骨架；准备好已锁定版本的 GPUI 依赖后，可使用 `--features native-ui` 构建原生界面。嘉立创 EDA 扩展包可通过 `./scripts/package-jlc-extension.ps1` 重新生成，详见 [`artifacts/README.md`](artifacts/README.md)。
+桌面 crate 当前是带多 Provider 管理器的 GPUI 控制面骨架；准备好已锁定版本的 GPUI 依赖后，可使用 `--features native-ui` 构建原生界面。Provider 设置保存在系统应用数据目录中，只包含 API Key 环境变量名，不保存密钥值。嘉立创 EDA 扩展包可通过 `./scripts/package-jlc-extension.ps1` 重新生成，详见 [`artifacts/README.md`](artifacts/README.md)。
 
 ## 核心原则
 
