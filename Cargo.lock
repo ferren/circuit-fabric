@@ -977,6 +977,7 @@ dependencies = [
  "circuitfabric-contracts",
  "embed-resource",
  "gpui",
+ "gpui-base",
  "gpui-component",
  "gpui_platform",
  "raw-window-handle",

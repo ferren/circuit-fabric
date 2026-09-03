@@ -14,13 +14,253 @@ mod windows_icon;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ControlPlaneScreen {
+    Overview,
     Projects,
     Documents,
+    Semantics,
     EdaServices,
     AgentsAndMcp,
     SessionsAndTasks,
+    ChangesAndApprovals,
+    BomAndExport,
+    Plugins,
     Usage,
-    SemanticQueryAndBom,
+    Settings,
+}
+
+impl ControlPlaneScreen {
+    #[cfg(feature = "native-ui")]
+    const ALL: [Self; 12] = [
+        Self::Overview,
+        Self::Projects,
+        Self::Documents,
+        Self::Semantics,
+        Self::EdaServices,
+        Self::AgentsAndMcp,
+        Self::SessionsAndTasks,
+        Self::ChangesAndApprovals,
+        Self::BomAndExport,
+        Self::Plugins,
+        Self::Usage,
+        Self::Settings,
+    ];
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Overview => "Overview",
+            Self::Projects => "Projects",
+            Self::Documents => "Documents",
+            Self::Semantics => "Circuit semantics",
+            Self::EdaServices => "EDA services",
+            Self::AgentsAndMcp => "Agents & tools",
+            Self::SessionsAndTasks => "Sessions & tasks",
+            Self::ChangesAndApprovals => "Changes & approvals",
+            Self::BomAndExport => "BOM & export",
+            Self::Plugins => "Plugins",
+            Self::Usage => "Usage & audit",
+            Self::Settings => "Settings",
+        }
+    }
+
+    #[must_use]
+    pub const fn group(self) -> &'static str {
+        match self {
+            Self::Overview | Self::Projects | Self::Documents | Self::Semantics => {
+                "DESIGN EVIDENCE"
+            }
+            Self::EdaServices | Self::AgentsAndMcp | Self::SessionsAndTasks => "RUNTIME TOOLS",
+            Self::ChangesAndApprovals | Self::BomAndExport => "MATERIALIZE & DELIVER",
+            Self::Plugins | Self::Usage | Self::Settings => "GOVERNANCE",
+        }
+    }
+
+    #[must_use]
+    pub const fn is_todo(self) -> bool {
+        !matches!(self, Self::Overview | Self::AgentsAndMcp)
+    }
+}
+
+#[cfg(feature = "native-ui")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UiLanguage {
+    SimplifiedChinese,
+    English,
+}
+
+#[cfg(feature = "native-ui")]
+impl UiLanguage {
+    const fn toggled(self) -> Self {
+        match self {
+            Self::SimplifiedChinese => Self::English,
+            Self::English => Self::SimplifiedChinese,
+        }
+    }
+
+    const fn toggle_label(self) -> &'static str {
+        match self {
+            Self::SimplifiedChinese => "EN",
+            Self::English => "中文",
+        }
+    }
+
+    const fn choose(self, chinese: &'static str, english: &'static str) -> &'static str {
+        match self {
+            Self::SimplifiedChinese => chinese,
+            Self::English => english,
+        }
+    }
+
+    const fn screen_label(self, screen: ControlPlaneScreen) -> &'static str {
+        match self {
+            Self::English => screen.label(),
+            Self::SimplifiedChinese => match screen {
+                ControlPlaneScreen::Overview => "总览",
+                ControlPlaneScreen::Projects => "项目",
+                ControlPlaneScreen::Documents => "文档",
+                ControlPlaneScreen::Semantics => "电路语义",
+                ControlPlaneScreen::EdaServices => "EDA 服务",
+                ControlPlaneScreen::AgentsAndMcp => "智能体与工具",
+                ControlPlaneScreen::SessionsAndTasks => "会话与任务",
+                ControlPlaneScreen::ChangesAndApprovals => "变更与审批",
+                ControlPlaneScreen::BomAndExport => "BOM 与导出",
+                ControlPlaneScreen::Plugins => "插件",
+                ControlPlaneScreen::Usage => "用量与审计",
+                ControlPlaneScreen::Settings => "设置",
+            },
+        }
+    }
+
+    const fn group_label(self, screen: ControlPlaneScreen) -> &'static str {
+        match self {
+            Self::English => screen.group(),
+            Self::SimplifiedChinese => match screen {
+                ControlPlaneScreen::Overview
+                | ControlPlaneScreen::Projects
+                | ControlPlaneScreen::Documents
+                | ControlPlaneScreen::Semantics => "设计证据",
+                ControlPlaneScreen::EdaServices
+                | ControlPlaneScreen::AgentsAndMcp
+                | ControlPlaneScreen::SessionsAndTasks => "运行工具",
+                ControlPlaneScreen::ChangesAndApprovals | ControlPlaneScreen::BomAndExport => {
+                    "物化交付"
+                }
+                ControlPlaneScreen::Plugins
+                | ControlPlaneScreen::Usage
+                | ControlPlaneScreen::Settings => "治理",
+            },
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    const fn page_copy(
+        self,
+        screen: ControlPlaneScreen,
+    ) -> (&'static str, &'static str, &'static str) {
+        match (self, screen) {
+            (Self::SimplifiedChinese, ControlPlaneScreen::Projects) => (
+                "项目",
+                "项目会把电路事实、文档、会话和配置收拢到同一个有作用域的工作区。",
+                "TODO：创建并持久化项目记录，然后加入可搜索的列表和详情标签页。",
+            ),
+            (Self::SimplifiedChinese, ControlPlaneScreen::Documents) => (
+                "文档",
+                "已授权的设计证据会保留来源定位信息，供智能体进行可引用的检索。",
+                "TODO：加入文档登记、安全扫描和证据感知检索。",
+            ),
+            (Self::SimplifiedChinese, ControlPlaneScreen::Semantics) => (
+                "电路语义",
+                "快照、拓扑、约束和验证事实会完整呈现，不会隐藏不确定性。",
+                "TODO：加入快照历史、语义查询和拓扑可视化。",
+            ),
+            (Self::SimplifiedChinese, ControlPlaneScreen::EdaServices) => (
+                "EDA 服务",
+                "已连接 EDA 后端将展示能力、健康度、端点和回读状态。",
+                "TODO：加入 bridge 发现、健康上报和能力协商。",
+            ),
+            (Self::SimplifiedChinese, ControlPlaneScreen::SessionsAndTasks) => (
+                "会话与任务",
+                "此只读回放界面将展示智能体轮次、工具调用、证据与任务进度。",
+                "TODO：加入会话事件持久化和关联证据的回放时间线。",
+            ),
+            (Self::SimplifiedChinese, ControlPlaneScreen::ChangesAndApprovals) => (
+                "变更与审批",
+                "每个 ChangeSet 都会先与精确基线比对，之后才允许审批物化。",
+                "TODO：加入审批抽屉、IR Diff、审计事件和回滚策略。",
+            ),
+            (Self::SimplifiedChinese, ControlPlaneScreen::BomAndExport) => (
+                "BOM 与导出",
+                "BOM、网表和仿真导出将持续关联到可追溯的语义快照。",
+                "TODO：加入 BOM 生成以及 CSV、Excel、JSON、网表和 SPICE 导出。",
+            ),
+            (Self::SimplifiedChinese, ControlPlaneScreen::Plugins) => (
+                "插件",
+                "这里将统一治理插件 manifest、权限、签名、版本和健康状态。",
+                "TODO：加入 manifest 发现、签名校验和权限控制。",
+            ),
+            (Self::SimplifiedChinese, ControlPlaneScreen::Usage) => (
+                "用量与审计",
+                "Token 用量和不可变工程审计事件将按项目和运行时聚合。",
+                "TODO：加入用量汇总、筛选和审计导出。",
+            ),
+            (Self::SimplifiedChinese, ControlPlaneScreen::Settings) => (
+                "设置",
+                "外观、语言、数据目录、凭据提供方和日志偏好会在这里配置。",
+                "TODO：加入主题选择和其余全局偏好。",
+            ),
+            (Self::English, ControlPlaneScreen::Projects) => (
+                "Projects",
+                "Project records will keep circuit facts, documents, sessions, and configuration in one scoped workspace.",
+                "TODO: Create and persist project records; then add a searchable list and detail tabs.",
+            ),
+            (Self::English, ControlPlaneScreen::Documents) => (
+                "Documents",
+                "Authorized design evidence will be source-addressable and ready for citation by agents.",
+                "TODO: Add document registration, safe scanning, and evidence-aware search.",
+            ),
+            (Self::English, ControlPlaneScreen::Semantics) => (
+                "Circuit semantics",
+                "Snapshots, topology, constraints, and verification facts will be presented without hiding uncertainty.",
+                "TODO: Add snapshot history, semantic queries, and topology visualization.",
+            ),
+            (Self::English, ControlPlaneScreen::EdaServices) => (
+                "EDA services",
+                "Connected EDA backends will show capabilities, health, endpoint, and readback status.",
+                "TODO: Add bridge discovery, health reporting, and capability negotiation.",
+            ),
+            (Self::English, ControlPlaneScreen::SessionsAndTasks) => (
+                "Sessions & tasks",
+                "This read-only replay surface will show agent turns, tool calls, evidence, and task progress.",
+                "TODO: Add session event persistence and an evidence-linked replay timeline.",
+            ),
+            (Self::English, ControlPlaneScreen::ChangesAndApprovals) => (
+                "Changes & approvals",
+                "ChangeSets will be reviewed against their exact baseline before any materialization is approved.",
+                "TODO: Add the approval drawer, IR diff, audit events, and rollback policy.",
+            ),
+            (Self::English, ControlPlaneScreen::BomAndExport) => (
+                "BOM & export",
+                "BOM, netlist, and simulation exports will remain traceable to a semantic snapshot.",
+                "TODO: Add BOM generation plus CSV, Excel, JSON, netlist, and SPICE exporters.",
+            ),
+            (Self::English, ControlPlaneScreen::Plugins) => (
+                "Plugins",
+                "Plugin manifests, permissions, signatures, versions, and health will be governed here.",
+                "TODO: Add manifest discovery, signature verification, and permission controls.",
+            ),
+            (Self::English, ControlPlaneScreen::Usage) => (
+                "Usage & audit",
+                "Token usage and immutable engineering audit events will be grouped by project and runtime.",
+                "TODO: Add usage aggregation, filtering, and audit export.",
+            ),
+            (Self::English, ControlPlaneScreen::Settings) => (
+                "Settings",
+                "Appearance, language, data directory, credential provider, and log preferences will live here.",
+                "TODO: Add theme selection and the remaining global preferences.",
+            ),
+            (_, ControlPlaneScreen::Overview | ControlPlaneScreen::AgentsAndMcp) => unreachable!(),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -51,17 +291,45 @@ fn main() {
 
     use circuitfabric_codex_runtime::{LlmProviderSettings, RuntimeSettings};
     use gpui::{
-        AppContext, Context, Entity, Image, ImageFormat, InteractiveElement, IntoElement,
-        ParentElement, Render, Styled, Window, WindowOptions, div, img, px, rgb,
+        AppContext, Context, Entity, FontWeight, Image, ImageFormat, InteractiveElement,
+        IntoElement, KeystrokeEvent, ParentElement, Render, StatefulInteractiveElement, Styled,
+        Window, WindowOptions, div, img, prelude::FluentBuilder as _, px, rgb, rgba,
     };
+    use gpui_base::{InputBase, input::InputEditorStyle};
     use gpui_component::{
         Root, StyledExt,
         button::{Button, ButtonVariants},
-        input::{Input, InputState},
+        input::{Input, InputEvent, InputState},
+        scroll::ScrollableElement as _,
     };
 
     const APP_LOGO: &[u8] =
         include_bytes!("../../../assets/branding/circuitfabric-logo-v3-framed-transparent.png");
+    const SIDEBAR_MARK: &[u8] =
+        include_bytes!("../../../assets/branding/circuitfabric-sidebar-mark.png");
+
+    // Design tokens: a dark-navy sidebar, a light content surface, and a cyan accent.
+    const SIDEBAR_BG: u32 = 0x000f_172a;
+    const SIDEBAR_DIVIDER: u32 = 0x001e_293b;
+    const SIDEBAR_GROUP: u32 = 0x005f_7085;
+    const SIDEBAR_TEXT: u32 = 0x009c_a7b8;
+    const SIDEBAR_TEXT_ACTIVE: u32 = 0x00f1_f5f9;
+    const SIDEBAR_ITEM_HOVER: u32 = 0x001a_2637;
+    const SIDEBAR_ITEM_ACTIVE: u32 = 0x001e_2d46;
+    const SIDEBAR_ITEM_PRESSED: u32 = 0x0026_3756;
+    const ACCENT: u32 = 0x0022_d3ee;
+    const ACCENT_SOFT: u32 = 0x0067_e8f9;
+
+    const SURFACE_BG: u32 = 0x00f1_f5f9;
+    const CARD_BG: u32 = 0x00ff_ffff;
+    const BORDER: u32 = 0x00e2_e8f0;
+    const TEXT_PRIMARY: u32 = 0x000f_172a;
+    const TEXT_SECONDARY: u32 = 0x0047_5563;
+    const TEXT_MUTED: u32 = 0x006b_7280;
+
+    fn status_dot(color: u32) -> impl IntoElement {
+        div().size(px(8.)).rounded_full().bg(rgb(color)).flex_none()
+    }
 
     struct ProviderFields {
         id: Entity<InputState>,
@@ -78,14 +346,20 @@ fn main() {
 
     struct ControlPlaneView {
         logo: Arc<Image>,
+        sidebar_mark: Arc<Image>,
         command: Entity<InputState>,
         working_directory: Entity<InputState>,
         bridge_address: Entity<InputState>,
         providers: Vec<ProviderFields>,
         default_provider_id: String,
         selected_provider: usize,
+        screen: ControlPlaneScreen,
+        language: UiLanguage,
         settings_path: std::path::PathBuf,
         status: String,
+        command_palette_open: bool,
+        command_search: Entity<InputState>,
+        command_selected: usize,
     }
 
     impl ControlPlaneView {
@@ -146,8 +420,28 @@ fn main() {
                 .cloned()
                 .map(|provider| Self::provider_fields(window, provider, cx))
                 .collect();
+            let command_search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索模块…"));
+            command_search.update(cx, |state, _| {
+                state.set_editor_style(InputEditorStyle {
+                    foreground: rgb(SIDEBAR_TEXT_ACTIVE).into(),
+                    muted_foreground: rgb(SIDEBAR_TEXT).into(),
+                    background: rgb(SIDEBAR_BG).into(),
+                    border: rgb(SIDEBAR_DIVIDER).into(),
+                    selection: rgba(0x0022_d36e).into(),
+                    caret: rgb(SIDEBAR_TEXT_ACTIVE).into(),
+                    ..InputEditorStyle::default()
+                });
+            });
+            cx.subscribe(&command_search, |view, _, event, cx| {
+                if let InputEvent::Change = event {
+                    view.command_selected = 0;
+                    cx.notify();
+                }
+            })
+            .detach();
             Self {
                 logo: Arc::new(Image::from_bytes(ImageFormat::Png, APP_LOGO.to_vec())),
+                sidebar_mark: Arc::new(Image::from_bytes(ImageFormat::Png, SIDEBAR_MARK.to_vec())),
                 command: Self::input(window, settings.codex.command, "codex", cx),
                 working_directory: Self::input(
                     window,
@@ -164,8 +458,13 @@ fn main() {
                 providers,
                 default_provider_id: settings.default_provider_id,
                 selected_provider: 0,
+                screen: ControlPlaneScreen::Overview,
+                language: UiLanguage::SimplifiedChinese,
                 settings_path,
                 status: "尚未保存。Provider 只保存 API Key 环境变量名，不会保存密钥值。".to_owned(),
+                command_palette_open: false,
+                command_search,
+                command_selected: 0,
             }
         }
 
@@ -224,13 +523,13 @@ fn main() {
             };
             self.providers.push(Self::provider_fields(window, provider, cx));
             self.selected_provider = self.providers.len() - 1;
-            self.status = "已添加 Provider，请填写配置后保存。".to_owned();
+            "已添加 Provider，请填写配置后保存。".clone_into(&mut self.status);
             cx.notify();
         }
 
         fn remove_provider(&mut self, cx: &mut Context<Self>) {
             if self.providers.len() <= 1 {
-                self.status = "至少保留一个 Provider。".to_owned();
+                "至少保留一个 Provider。".clone_into(&mut self.status);
                 cx.notify();
                 return;
             }
@@ -278,7 +577,7 @@ fn main() {
         fn save_settings(&mut self, cx: &mut Context<Self>) {
             let providers = self.provider_values(cx);
             if providers.is_empty() {
-                self.status = "未保存：至少需要一个 Provider。".to_owned();
+                "未保存：至少需要一个 Provider。".clone_into(&mut self.status);
                 cx.notify();
                 return;
             }
@@ -296,10 +595,12 @@ fn main() {
                 providers.iter().find(|provider| provider.id == default_provider_id)
             {
                 settings.codex.model = Some(provider.model.clone());
-                settings.codex.api_key_environment_variable =
-                    provider.api_key_environment_variable.clone();
+                settings
+                    .codex
+                    .api_key_environment_variable
+                    .clone_from(&provider.api_key_environment_variable);
             }
-            settings.default_provider_id = default_provider_id.clone();
+            settings.default_provider_id.clone_from(&default_provider_id);
             settings.providers = providers;
             settings.bridge.listen_address = self.bridge_address.read(cx).value().to_string();
             self.status = match settings.save(&self.settings_path) {
@@ -334,31 +635,63 @@ fn main() {
         }
     }
 
-    impl Render for ControlPlaneView {
-        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    impl ControlPlaneView {
+        #[allow(clippy::too_many_lines)]
+        fn render_legacy_provider_form(
+            &mut self,
+            _: &mut Window,
+            cx: &mut Context<Self>,
+        ) -> impl IntoElement {
             let entity = cx.entity().clone();
+            let language = self.language;
             let selected = self.selected_provider.min(self.providers.len() - 1);
             let provider = &self.providers[selected];
             let selected_provider_id = provider.id.read(cx).value().to_string();
             let selected_is_default = selected_provider_id == self.default_provider_id;
-            let mut provider_list = div().v_flex().gap_1();
+            let mut provider_list = div().flex().flex_wrap().gap_2();
             for (index, provider) in self.providers.iter().enumerate() {
                 let provider_id = provider.id.read(cx).value().to_string();
+                let is_selected = index == selected;
                 let label = if provider_id == self.default_provider_id {
-                    format!("★ {provider_id} (默认)")
+                    format!("★ {provider_id}")
                 } else {
-                    provider_id
+                    provider_id.clone()
                 };
                 let selector = entity.clone();
                 provider_list = provider_list.child(
-                    Button::new(format!("select-provider-{index}")).label(label).on_click(
-                        move |_, _, cx| {
+                    div()
+                        .id(format!("select-provider-{index}"))
+                        .px_3()
+                        .h(px(32.))
+                        .flex()
+                        .items_center()
+                        .rounded_full()
+                        .cursor_pointer()
+                        .text_sm()
+                        .font_weight(if is_selected {
+                            FontWeight::SEMIBOLD
+                        } else {
+                            FontWeight::NORMAL
+                        })
+                        .border_1()
+                        .when(is_selected, |this| {
+                            this.bg(rgb(0x000e_7490))
+                                .border_color(rgb(0x000e_7490))
+                                .text_color(rgb(CARD_BG))
+                        })
+                        .when(!is_selected, |this| {
+                            this.bg(rgb(CARD_BG))
+                                .border_color(rgb(BORDER))
+                                .text_color(rgb(TEXT_SECONDARY))
+                        })
+                        .hover(|this| this.bg(rgb(SURFACE_BG)))
+                        .on_click(move |_, _, cx| {
                             selector.update(cx, |view, cx| {
                                 view.selected_provider = index;
                                 cx.notify();
                             });
-                        },
-                    ),
+                        })
+                        .child(label),
                 );
             }
             let add_provider = entity.clone();
@@ -366,7 +699,7 @@ fn main() {
             let set_default = entity.clone();
             let toggle_provider = entity.clone();
             let toggle_vision = entity.clone();
-            div().v_flex().size_full().items_center().justify_center().bg(rgb(0x00f4_f7ff)).child(
+            div().v_flex().size_full().min_w(px(760.)).items_center().justify_center().bg(rgb(0x00f4_f7ff)).child(
                 div()
                     .v_flex()
                     .items_center()
@@ -388,18 +721,18 @@ fn main() {
                             .w(px(720.))
                             .v_flex()
                             .gap_3()
-                            .child(Self::field("Codex command", "codex-command", &self.command))
+                            .child(Self::field(language.choose("Codex 命令", "Codex command"), "codex-command", &self.command))
                             .child(Self::field(
-                                "Working directory",
+                                language.choose("工作目录", "Working directory"),
                                 "working-directory",
                                 &self.working_directory,
                             ))
                             .child(Self::field(
-                                "JLC bridge address",
+                                language.choose("JLC bridge 地址", "JLC bridge address"),
                                 "bridge-address",
                                 &self.bridge_address,
                             ))
-                            .child(div().text_lg().child("LLM Provider 管理"))
+                            .child(div().text_lg().child(language.choose("LLM Provider 管理", "LLM Provider management")))
                             .child(
                                 div()
                                     .text_sm()
@@ -428,7 +761,7 @@ fn main() {
                                             }),
                                     ),
                             )
-                            .child(div().text_sm().child(format!("当前编辑：{}", selected_provider_id)))
+                            .child(div().text_sm().child(format!("当前编辑：{selected_provider_id}")))
                             .child(Self::field("Provider ID", "provider-id", &provider.id))
                             .child(Self::field("显示名称", "provider-name", &provider.name))
                             .child(Self::field("LLM Base URL", "provider-base-url", &provider.base_url))
@@ -489,13 +822,721 @@ fn main() {
                             .child(
                                 Button::new("save-runtime")
                                     .primary()
-                                    .label("Save App Server settings")
+                                    .label(language.choose("保存 App Server 设置", "Save App Server settings"))
                                     .on_click(move |_, _, cx| {
                                         entity.update(cx, ControlPlaneView::save_settings);
                                     }),
                             ),
                     ),
             )
+        }
+    }
+
+    impl ControlPlaneView {
+        fn section_page(language: UiLanguage, screen: ControlPlaneScreen) -> impl IntoElement {
+            let (title, description, next_step) = language.page_copy(screen);
+            div().size_full().min_w(px(720.)).v_flex().justify_center().items_center().p_8().child(
+                div()
+                    .w(px(680.))
+                    .v_flex()
+                    .gap_4()
+                    .p_6()
+                    .bg(rgb(CARD_BG))
+                    .rounded_xl()
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .shadow_sm()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(div().w(px(4.)).h(px(22.)).rounded_full().bg(rgb(ACCENT)))
+                            .child(
+                                div()
+                                    .text_xl()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .child(title),
+                            ),
+                    )
+                    .child(div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(description))
+                    .child(
+                        div()
+                            .flex()
+                            .items_start()
+                            .gap_2p5()
+                            .p_3()
+                            .bg(rgb(SURFACE_BG))
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py_0p5()
+                                    .rounded_sm()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(0x000e_7490))
+                                    .bg(rgb(0x00e0_f2fe))
+                                    .child("TODO"),
+                            )
+                            .child(
+                                div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(next_step),
+                            ),
+                    ),
+            )
+        }
+
+        #[allow(clippy::too_many_lines)]
+        fn overview_page(language: UiLanguage) -> impl IntoElement {
+            let metric = |value: &'static str, label: &'static str, color: u32| {
+                div()
+                    .flex_1()
+                    .v_flex()
+                    .gap_2()
+                    .p_4()
+                    .bg(rgb(CARD_BG))
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .shadow_xs()
+                    .child(
+                        div().flex().items_center().gap_2().child(status_dot(color)).child(
+                            div()
+                                .text_lg()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(TEXT_PRIMARY))
+                                .child(value),
+                        ),
+                    )
+                    .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(label))
+            };
+
+            let panel = |title: &'static str, body: &'static str| {
+                div()
+                    .flex_1()
+                    .v_flex()
+                    .gap_3()
+                    .p_5()
+                    .bg(rgb(CARD_BG))
+                    .rounded_xl()
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .shadow_xs()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(TEXT_PRIMARY))
+                            .child(title),
+                    )
+                    .child(div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(body))
+            };
+
+            div()
+                .size_full()
+                .min_w(px(760.))
+                .v_flex()
+                .gap_5()
+                .p_6()
+                .child(
+                    div()
+                        .v_flex()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xl()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(TEXT_PRIMARY))
+                                .child(language.choose("总览", "Overview")),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(TEXT_SECONDARY))
+                                .child(language.choose(
+                                    "以证据为先、安全管理设计工作区。",
+                                    "A safe, evidence-first view of your design workspace.",
+                                )),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap_3()
+                        .child(metric("0", language.choose("项目", "Projects"), 0x003b_82f6))
+                        .child(metric(
+                            "0",
+                            language.choose("已授权文档", "Authorized documents"),
+                            0x008b_5cf6,
+                        ))
+                        .child(metric("0", language.choose("在线 bridge", "Online bridges"), 0x0022_c55e))
+                        .child(metric("0", language.choose("待审批", "Pending approvals"), 0x00f5_9e0b)),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap_4()
+                        .child(panel(
+                            language.choose("运行时健康度", "Runtime health"),
+                            language.choose(
+                                "尚未连接——请在「智能体与工具」中配置运行时和 EDA bridge。",
+                                "Not connected — configure a runtime and EDA bridge in Agents & tools.",
+                            ),
+                        ))
+                        .child(panel(
+                            language.choose("最近会话", "Recent sessions"),
+                            language.choose(
+                                "还没有会话历史。会话回放将在此显示。",
+                                "No session history yet. Session replay will appear here.",
+                            ),
+                        ))
+                        .child(panel(
+                            language.choose("需要关注", "Attention needed"),
+                            language.choose(
+                                "尚未记录验证结果。",
+                                "No verification result has been recorded.",
+                            ),
+                        )),
+                )
+        }
+    }
+
+    impl ControlPlaneView {
+        fn command_matches(&self, cx: &Context<Self>) -> Vec<ControlPlaneScreen> {
+            let needle = self.command_search.read(cx).value().to_lowercase();
+            ControlPlaneScreen::ALL
+                .into_iter()
+                .filter(|screen| {
+                    needle.is_empty()
+                        || self.language.screen_label(*screen).to_lowercase().contains(&needle)
+                })
+                .collect()
+        }
+
+        fn open_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+            self.command_palette_open = true;
+            self.command_selected = 0;
+            self.command_search.update(cx, |state, cx| {
+                state.set_value("", window, cx);
+                state.focus(window, cx);
+            });
+            cx.notify();
+        }
+
+        fn close_command_palette(&mut self, cx: &mut Context<Self>) {
+            if self.command_palette_open {
+                self.command_palette_open = false;
+                cx.notify();
+            }
+        }
+
+        fn toggle_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+            if self.command_palette_open {
+                self.close_command_palette(cx);
+            } else {
+                self.open_command_palette(window, cx);
+            }
+        }
+
+        fn command_activate(&mut self, screen: ControlPlaneScreen, cx: &mut Context<Self>) {
+            self.screen = screen;
+            self.close_command_palette(cx);
+        }
+
+        fn handle_command_keystroke(
+            &mut self,
+            event: &KeystrokeEvent,
+            window: &mut Window,
+            cx: &mut Context<Self>,
+        ) {
+            let keystroke = &event.keystroke;
+
+            if keystroke.modifiers.secondary() && keystroke.key.eq_ignore_ascii_case("k") {
+                self.toggle_command_palette(window, cx);
+                return;
+            }
+
+            if !self.command_palette_open {
+                return;
+            }
+
+            match keystroke.key.as_str() {
+                "escape" => self.close_command_palette(cx),
+                "enter" => {
+                    let screen = self.command_matches(cx).get(self.command_selected).copied();
+                    if let Some(screen) = screen {
+                        self.command_activate(screen, cx);
+                    }
+                }
+                "up" => {
+                    let count = self.command_matches(cx).len();
+                    if count > 0 {
+                        self.command_selected = (self.command_selected + count - 1) % count;
+                        cx.notify();
+                    }
+                }
+                "down" => {
+                    let count = self.command_matches(cx).len();
+                    if count > 0 {
+                        self.command_selected = (self.command_selected + 1) % count;
+                        cx.notify();
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        #[allow(clippy::too_many_lines)]
+        fn render_command_palette(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+            let entity = cx.entity().clone();
+            let language = self.language;
+            let matches = self.command_matches(cx);
+            let selected = self.command_selected.min(matches.len().saturating_sub(1));
+
+            let mut list = div().v_flex().gap_0p5().p_2();
+            for (index, screen) in matches.iter().copied().enumerate() {
+                let is_selected = index == selected;
+                let label = language.screen_label(screen);
+                let group = language.group_label(screen);
+                let navigator = entity.clone();
+                list = list.child(
+                    div()
+                        .id(format!("command-item-{}", screen.label()))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .px_2()
+                        .h(px(36.))
+                        .rounded_md()
+                        .cursor_pointer()
+                        .when(is_selected, |this| this.bg(rgb(ACCENT)).text_color(rgb(SIDEBAR_BG)))
+                        .when(!is_selected, |this| this.text_color(rgb(SIDEBAR_TEXT)))
+                        .when(!is_selected, |this| {
+                            this.hover(|this| this.bg(rgb(SIDEBAR_ITEM_HOVER)))
+                        })
+                        .on_click(move |_, _, cx| {
+                            navigator.update(cx, |view, cx| view.command_activate(screen, cx));
+                        })
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(if is_selected {
+                                    FontWeight::SEMIBOLD
+                                } else {
+                                    FontWeight::NORMAL
+                                })
+                                .child(label),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(if is_selected {
+                                    rgb(SIDEBAR_BG)
+                                } else {
+                                    rgb(SIDEBAR_GROUP)
+                                })
+                                .child(group),
+                        ),
+                );
+            }
+
+            let body = if matches.is_empty() {
+                div()
+                    .px_3()
+                    .py_4()
+                    .text_sm()
+                    .text_color(rgb(SIDEBAR_TEXT))
+                    .child(language.choose("无匹配模块", "No matching modules"))
+            } else {
+                list
+            };
+
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .flex_col()
+                .items_center()
+                .pt_16()
+                .child(
+                    div()
+                        .id("command-palette-backdrop")
+                        .absolute()
+                        .inset_0()
+                        .bg(rgba(0x0000_0080))
+                        .occlude()
+                        .on_click(move |_, _, cx| {
+                            entity.update(cx, ControlPlaneView::close_command_palette);
+                        }),
+                )
+                .child(
+                    div()
+                        .relative()
+                        .w(px(560.))
+                        .v_flex()
+                        .overflow_hidden()
+                        .rounded_xl()
+                        .border_1()
+                        .border_color(rgb(SIDEBAR_DIVIDER))
+                        .bg(rgb(SIDEBAR_BG))
+                        .shadow_lg()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .px_3()
+                                .h(px(44.))
+                                .border_b_1()
+                                .border_color(rgb(SIDEBAR_DIVIDER))
+                                .child(
+                                    InputBase::new("command-palette-search")
+                                        .flex_1()
+                                        .h_full()
+                                        .flex()
+                                        .items_center()
+                                        .text_sm()
+                                        .text_color(rgb(SIDEBAR_TEXT_ACTIVE))
+                                        .child(self.command_search.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(SIDEBAR_GROUP))
+                                        .child(language.choose("ESC 关闭", "ESC to close")),
+                                ),
+                        )
+                        .child(body),
+                )
+        }
+    }
+
+    impl Render for ControlPlaneView {
+        #[allow(clippy::too_many_lines)]
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let command_palette = if self.command_palette_open {
+                Some(self.render_command_palette(cx).into_any_element())
+            } else {
+                None
+            };
+            let entity = cx.entity().clone();
+            let active_screen = self.screen;
+            let language = self.language;
+            let mut navigation = div().v_flex().gap_0p5();
+            let mut current_group = "";
+
+            for screen in ControlPlaneScreen::ALL {
+                if screen.group() != current_group {
+                    current_group = screen.group();
+                    navigation = navigation.child(
+                        div()
+                            .pt_4()
+                            .pb_1()
+                            .px_3()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(SIDEBAR_GROUP))
+                            .child(language.group_label(screen)),
+                    );
+                }
+
+                let selector = entity.clone();
+                let active = screen == active_screen;
+                let label = language.screen_label(screen);
+                let is_todo = screen.is_todo();
+                navigation = navigation.child(
+                    div()
+                        .id(format!("nav-{}", screen.label()))
+                        .w_full()
+                        .h(px(36.))
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .when(active, |this| this.bg(rgb(SIDEBAR_ITEM_ACTIVE)))
+                        .hover(|this| this.bg(rgb(SIDEBAR_ITEM_HOVER)))
+                        .active(|this| this.bg(rgb(SIDEBAR_ITEM_PRESSED)))
+                        .on_click(move |_, _, cx| {
+                            selector.update(cx, |view, cx| {
+                                view.screen = screen;
+                                cx.notify();
+                            });
+                        })
+                        .child(
+                            div()
+                                .w(px(3.))
+                                .h(px(18.))
+                                .rounded_full()
+                                .flex_none()
+                                .when(active, |this| this.bg(rgb(ACCENT))),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .truncate()
+                                .text_sm()
+                                .font_weight(if active {
+                                    FontWeight::SEMIBOLD
+                                } else {
+                                    FontWeight::NORMAL
+                                })
+                                .text_color(if active {
+                                    rgb(SIDEBAR_TEXT_ACTIVE)
+                                } else {
+                                    rgb(SIDEBAR_TEXT)
+                                })
+                                .child(label),
+                        )
+                        .when(is_todo, |this| {
+                            this.child(
+                                div()
+                                    .px_1p5()
+                                    .py_0p5()
+                                    .rounded_sm()
+                                    .text_xs()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(if active {
+                                        rgb(ACCENT_SOFT)
+                                    } else {
+                                        rgb(SIDEBAR_GROUP)
+                                    })
+                                    .child("TODO"),
+                            )
+                        }),
+                );
+            }
+
+            let page = match active_screen {
+                ControlPlaneScreen::Overview => Self::overview_page(language).into_any_element(),
+                ControlPlaneScreen::AgentsAndMcp => {
+                    self.render_legacy_provider_form(window, cx).into_any_element()
+                }
+                screen => Self::section_page(language, screen).into_any_element(),
+            };
+
+            div()
+                .size_full()
+                .flex()
+                .bg(rgb(SURFACE_BG))
+                .text_color(rgb(TEXT_PRIMARY))
+                .child(
+                    // Sidebar
+                    div()
+                        .w(px(248.))
+                        .flex_none()
+                        .h_full()
+                        .v_flex()
+                        .p_3()
+                        .bg(rgb(SIDEBAR_BG))
+                        .text_color(rgb(SIDEBAR_TEXT))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .px_1()
+                                .pb_4()
+                                .mb_1()
+                                .border_b_1()
+                                .border_color(rgb(SIDEBAR_DIVIDER))
+                                // This compact mark intentionally omits the logo's outer
+                                // frame: the tile itself supplies the only frame at this size.
+                                .child(
+                                    div()
+                                        .size(px(40.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_md()
+                                        .bg(rgb(SIDEBAR_ITEM_ACTIVE))
+                                        .border_1()
+                                        .border_color(rgb(ACCENT_SOFT))
+                                        .child(img(self.sidebar_mark.clone()).size(px(32.))),
+                                )
+                                .child(
+                                    div()
+                                        .v_flex()
+                                        .gap_0p5()
+                                        .child(
+                                            div()
+                                                .text_base()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(rgb(SIDEBAR_TEXT_ACTIVE))
+                                                .child("CircuitFabric"),
+                                        )
+                                        .child(
+                                            div().text_xs().text_color(rgb(SIDEBAR_GROUP)).child(
+                                                language.choose(
+                                                    "电路设计控制面",
+                                                    "Circuit control plane",
+                                                ),
+                                            ),
+                                        ),
+                                ),
+                        )
+                        .child(navigation)
+                        .child(div().flex_1())
+                        .child(
+                            div()
+                                .px_1()
+                                .pt_3()
+                                .v_flex()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(status_dot(0x0094_a3b8))
+                                        .child(
+                                            div().text_xs().text_color(rgb(SIDEBAR_TEXT)).child(
+                                                language.choose("运行时离线", "Runtime offline"),
+                                            ),
+                                        ),
+                                )
+                                .child(
+                                    div().text_xs().text_color(rgb(SIDEBAR_GROUP)).child(
+                                        language.choose(
+                                            "v0.1 · 本地控制面",
+                                            "v0.1 · local control plane",
+                                        ),
+                                    ),
+                                ),
+                        ),
+                )
+                .child(
+                    // Main column
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .v_flex()
+                        .bg(rgb(CARD_BG))
+                        .relative()
+                        .child(
+                            // Top bar
+                            div()
+                                .h(px(56.))
+                                .px_5()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .border_b_1()
+                                .border_color(rgb(BORDER))
+                                .child(
+                                    div()
+                                        .v_flex()
+                                        .gap_0p5()
+                                        .child(
+                                            div()
+                                                .text_base()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(rgb(TEXT_PRIMARY))
+                                                .child(language.screen_label(active_screen)),
+                                        )
+                                        .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(
+                                            language.choose("未选择项目", "No project selected"),
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .id("command-palette-trigger")
+                                                .flex()
+                                                .items_center()
+                                                .px_2()
+                                                .h(px(28.))
+                                                .rounded_md()
+                                                .border_1()
+                                                .border_color(rgb(BORDER))
+                                                .bg(rgb(SURFACE_BG))
+                                                .cursor_pointer()
+                                                .hover(|this| this.bg(rgb(BORDER)))
+                                                .on_click({
+                                                    let opener = entity.clone();
+                                                    move |_, window, cx| {
+                                                        opener.update(cx, |view, cx| {
+                                                            view.open_command_palette(window, cx);
+                                                        });
+                                                    }
+                                                })
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(rgb(TEXT_MUTED))
+                                                        .child(if cfg!(target_os = "macos") {
+                                                            "⌘K"
+                                                        } else {
+                                                            "Ctrl K"
+                                                        }),
+                                                ),
+                                        )
+                                        .child(
+                                            Button::new("toggle-language")
+                                                .ghost()
+                                                .label(language.toggle_label())
+                                                .on_click(move |_, _, cx| {
+                                                    entity.update(cx, |view, cx| {
+                                                        view.language = view.language.toggled();
+                                                        cx.notify();
+                                                    });
+                                                }),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            // Scrollable content
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .overflow_scrollbar()
+                                .id("main-content-scroll")
+                                .bg(rgb(SURFACE_BG))
+                                .child(page),
+                        )
+                        .child(
+                            // Status bar
+                            div()
+                                .h(px(28.))
+                                .px_5()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .bg(rgb(CARD_BG))
+                                .border_t_1()
+                                .border_color(rgb(BORDER))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(status_dot(0x0094_a3b8))
+                                        .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(
+                                            language.choose(
+                                                "Bridge 未连接 · 验证未运行",
+                                                "Bridge not connected · Verification not run",
+                                            ),
+                                        )),
+                                )
+                                .child(
+                                    div().text_xs().text_color(rgb(TEXT_MUTED)).child(
+                                        language.choose(
+                                            "CircuitFabric 桌面端",
+                                            "CircuitFabric desktop",
+                                        ),
+                                    ),
+                                ),
+                        )
+                        .when_some(command_palette, ParentElement::child),
+                )
         }
     }
 
@@ -509,11 +1550,25 @@ fn main() {
                     ..Default::default()
                 },
                 |window, cx| {
+                    // `WindowOptions::default` leaves the native title unset on
+                    // Windows, which produces an otherwise normal caption bar with
+                    // an empty text region.
+                    window.set_window_title("CircuitFabric");
+
                     #[cfg(windows)]
                     windows_icon::apply(window)
                         .expect("failed to apply the CircuitFabric Windows window icon");
 
                     let view = cx.new(|cx| ControlPlaneView::new(window, cx));
+                    cx.observe_keystrokes({
+                        let view = view.clone();
+                        move |event, window, cx| {
+                            view.update(cx, |view, cx| {
+                                view.handle_command_keystroke(event, window, cx);
+                            });
+                        }
+                    })
+                    .detach();
                     cx.new(|cx| Root::new(view, window, cx))
                 },
             )
