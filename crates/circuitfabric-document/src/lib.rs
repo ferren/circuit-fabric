@@ -22,15 +22,19 @@ struct IndexedDocument {
 
 #[derive(Default)]
 pub struct DocumentService {
-    documents: BTreeMap<String, IndexedDocument>,
+    documents: BTreeMap<(ProjectId, String), IndexedDocument>,
 }
 
 impl DocumentService {
     /// Registers already-extracted text and derives citation-ready line fragments.
     ///
+    /// Document identifiers are scoped per project: two projects may register the same `id`
+    /// (for example after importing the same file) without sharing or overwriting each other.
+    ///
     /// # Errors
     ///
-    /// Returns [`DocumentError::AlreadyExists`] when `id` is already registered.
+    /// Returns [`DocumentError::AlreadyExists`] when `id` is already registered for this
+    /// project.
     pub fn register_text(
         &mut self,
         project_id: ProjectId,
@@ -40,7 +44,8 @@ impl DocumentService {
         source_locator: impl Into<String>,
         text: impl Into<String>,
     ) -> Result<DocumentRecord, DocumentError> {
-        if self.documents.contains_key(&id) {
+        let key = (project_id.clone(), id.clone());
+        if self.documents.contains_key(&key) {
             return Err(DocumentError::AlreadyExists(id));
         }
 
@@ -69,7 +74,7 @@ impl DocumentService {
             })
             .collect();
 
-        self.documents.insert(id, IndexedDocument { record: record.clone(), fragments });
+        self.documents.insert(key, IndexedDocument { record: record.clone(), fragments });
         Ok(record)
     }
 
@@ -94,6 +99,51 @@ mod tests {
     use circuitfabric_contracts::DocumentKind;
 
     use super::*;
+
+    #[test]
+    fn identical_document_ids_belong_to_their_own_projects() {
+        let mut service = DocumentService::default();
+        service
+            .register_text(
+                "project-a".to_owned(),
+                "doc-shared".to_owned(),
+                DocumentKind::Markdown,
+                "A".to_owned(),
+                "a.md".to_owned(),
+                "Alpha capacitor note.".to_owned(),
+            )
+            .expect("register for project A");
+
+        let error = service
+            .register_text(
+                "project-a".to_owned(),
+                "doc-shared".to_owned(),
+                DocumentKind::Markdown,
+                "A again".to_owned(),
+                "a2.md".to_owned(),
+                "Duplicate id within one project.".to_owned(),
+            )
+            .expect_err("duplicate within a project is rejected");
+        assert_eq!(error, DocumentError::AlreadyExists("doc-shared".to_owned()));
+
+        service
+            .register_text(
+                "project-b".to_owned(),
+                "doc-shared".to_owned(),
+                DocumentKind::Markdown,
+                "B".to_owned(),
+                "b.md".to_owned(),
+                "Beta capacitor note.".to_owned(),
+            )
+            .expect("same id in another project is allowed");
+
+        let alpha = service.retrieve("project-a", "capacitor");
+        let beta = service.retrieve("project-b", "capacitor");
+        assert_eq!(alpha.fragments.len(), 1);
+        assert_eq!(beta.fragments.len(), 1);
+        assert_eq!(alpha.fragments[0].text, "Alpha capacitor note.");
+        assert_eq!(beta.fragments[0].text, "Beta capacitor note.");
+    }
 
     #[test]
     fn retrieval_is_limited_to_the_requesting_project() {

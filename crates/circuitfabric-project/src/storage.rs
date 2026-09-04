@@ -70,27 +70,11 @@ impl ProjectManifest {
     }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DocumentIndex {
-    schema_version: u32,
-    documents: Vec<DocumentIndexEntry>,
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ProjectConfigurationDocument {
     schema_version: u32,
     configuration: ProjectConfiguration,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DocumentIndexEntry {
-    id: String,
-    relative_path: PathBuf,
-    content_hash: String,
-    source_locator: String,
 }
 
 /// A non-mutating report about required paths within an opened project root.
@@ -152,6 +136,26 @@ pub enum ProjectStorageError {
     },
     #[error("failed to serialize `{path}`: {source}")]
     Serialize { path: PathBuf, source: serde_json::Error },
+    #[error("document source `{path}` cannot be read: {source}")]
+    DocumentSourceNotFound { path: PathBuf, source: io::Error },
+    #[error("document index is missing at `{path}`")]
+    MissingDocumentIndex { path: PathBuf },
+    #[error("cannot parse document index `{path}`: {source}")]
+    ParseDocumentIndex { path: PathBuf, source: serde_json::Error },
+    #[error("document index `{path}` uses unsupported schema version {found}; expected {expected}")]
+    UnsupportedDocumentIndexSchema { path: PathBuf, found: u32, expected: u32 },
+    #[error("managed document copy `{path}` exists with different content")]
+    ManagedCopyConflict { path: PathBuf },
+    #[error("session ID `{session_id}` is invalid")]
+    InvalidSessionId { session_id: String },
+    #[error("session file `{path}` already exists")]
+    SessionAlreadyExists { path: PathBuf },
+    #[error("session `{session_id}` has no record in this project")]
+    SessionNotFound { session_id: String },
+    #[error("cannot parse session record `{path}`: {reason}")]
+    ParseSession { path: PathBuf, reason: String },
+    #[error("a session cannot be completed with status `running`")]
+    InvalidCompletionStatus,
 }
 
 /// The only filesystem entry point for a project root.
@@ -199,9 +203,9 @@ impl ProjectStorage {
         )?;
         Self::write_json_atomically(
             &storage.document_index_path(),
-            &DocumentIndex {
+            &crate::documents::DocumentIndex {
                 schema_version: PROJECT_STORAGE_SCHEMA_VERSION,
-                ..DocumentIndex::default()
+                documents: Vec::new(),
             },
         )?;
         Self::write_json_atomically(&storage.manifest_path(), &storage.manifest)?;
@@ -342,7 +346,7 @@ impl ProjectStorage {
         self.resolve_relative_path(Path::new("schematics").join(backend_id))
     }
 
-    fn write_json_atomically<T: Serialize>(
+    pub(crate) fn write_json_atomically<T: Serialize>(
         path: &Path,
         value: &T,
     ) -> Result<(), ProjectStorageError> {
@@ -420,7 +424,7 @@ impl ProjectRegistry {
 
         let mut registry = Self::default();
         for mut entry in document.projects {
-            entry.canonical_root_path = dunce::simplified(&entry.canonical_root_path).to_owned();
+            entry.canonical_root_path = dunce::simplified(&entry.canonical_root_path).to_path_buf();
             registry.register_entry(entry)?;
         }
         Ok(registry)

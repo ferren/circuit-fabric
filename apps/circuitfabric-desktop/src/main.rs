@@ -111,6 +111,13 @@ impl UiLanguage {
         }
     }
 
+    fn choose_owned(self, chinese: String, english: String) -> String {
+        match self {
+            Self::SimplifiedChinese => chinese,
+            Self::English => english,
+        }
+    }
+
     const fn screen_label(self, screen: ControlPlaneScreen) -> &'static str {
         match self {
             Self::English => screen.label(),
@@ -288,13 +295,17 @@ fn main() {
 #[allow(clippy::too_many_lines)]
 fn main() {
     use std::{
+        collections::BTreeMap,
         path::{Path, PathBuf},
         sync::Arc,
     };
 
     use circuitfabric_codex_runtime::{LlmProviderSettings, RuntimeSettings};
     use circuitfabric_contracts::Project;
-    use circuitfabric_project::{ProjectRegistry, ProjectStorage, ProjectWorkspace};
+    use circuitfabric_project::{
+        DocumentCategory, ProjectDocument, ProjectRegistry, ProjectStorage, ProjectWorkspace,
+        SessionListing, SessionReplay, is_text_extractable, rfc3339,
+    };
     use gpui::{
         AppContext, Context, Entity, FontWeight, Image, ImageFormat, InteractiveElement,
         IntoElement, KeystrokeEvent, ParentElement, Render, StatefulInteractiveElement, Styled,
@@ -390,6 +401,19 @@ fn main() {
         NeedsConfiguration,
     }
 
+    /// One project's cached view of its persisted workspace state.
+    #[derive(Default)]
+    struct ProjectWorkspaceData {
+        documents: Vec<ProjectDocument>,
+        session_listing: SessionListing,
+    }
+
+    /// The read-only replay currently displayed in the Sessions tab.
+    struct SessionReplaySelection {
+        project_id: ProjectId,
+        replay: SessionReplay,
+    }
+
     struct ControlPlaneView {
         logo: Arc<Image>,
         sidebar_mark: Arc<Image>,
@@ -409,6 +433,10 @@ fn main() {
         workspace: ProjectWorkspace,
         project_registry: ProjectRegistry,
         project_registry_path: PathBuf,
+        project_storages: BTreeMap<ProjectId, ProjectStorage>,
+        project_data: BTreeMap<ProjectId, ProjectWorkspaceData>,
+        session_replay: Option<SessionReplaySelection>,
+        evidence_query: Entity<InputState>,
         selected_project: Option<ProjectId>,
         project_search: Entity<InputState>,
         project_filter: ProjectFilter,
@@ -425,27 +453,63 @@ fn main() {
             settings_path.with_file_name("projects.json")
         }
 
+        /// Loads one opened storage into the in-memory workspace and caches its listings.
+        fn attach_project_storage(
+            workspace: &mut ProjectWorkspace,
+            storages: &mut BTreeMap<ProjectId, ProjectStorage>,
+            data: &mut BTreeMap<ProjectId, ProjectWorkspaceData>,
+            storage: ProjectStorage,
+        ) -> Result<(), String> {
+            let project_id = storage.manifest().project.id.clone();
+            workspace
+                .create_project(storage.manifest().project.clone())
+                .map_err(|error| error.to_string())?;
+            if let Err(error) = workspace.hydrate_project_documents(&project_id, &storage) {
+                return Err(format!("文档证据未恢复：{error}"));
+            }
+            let documents =
+                storage.list_documents().map_err(|error| format!("文档索引未读取：{error}"))?;
+            let session_listing =
+                storage.list_sessions().map_err(|error| format!("会话记录未读取：{error}"))?;
+            data.insert(project_id.clone(), ProjectWorkspaceData { documents, session_listing });
+            storages.insert(project_id, storage);
+            Ok(())
+        }
+
         fn restore_project_workspace(
             registry_path: &Path,
-        ) -> (ProjectRegistry, ProjectWorkspace, Vec<String>) {
+        ) -> (
+            ProjectRegistry,
+            ProjectWorkspace,
+            BTreeMap<ProjectId, ProjectStorage>,
+            BTreeMap<ProjectId, ProjectWorkspaceData>,
+            Vec<String>,
+        ) {
             let registry = match ProjectRegistry::load_or_default(registry_path) {
                 Ok(registry) => registry,
                 Err(error) => {
                     return (
                         ProjectRegistry::default(),
                         ProjectWorkspace::default(),
+                        BTreeMap::new(),
+                        BTreeMap::new(),
                         vec![format!("项目注册表未加载：{error}")],
                     );
                 }
             };
             let mut workspace = ProjectWorkspace::default();
+            let mut storages = BTreeMap::new();
+            let mut data = BTreeMap::new();
             let mut diagnostics = Vec::new();
             for entry in registry.entries() {
                 match ProjectStorage::open(&entry.canonical_root_path) {
                     Ok(storage) if storage.manifest().project.id == entry.project_id => {
-                        if let Err(error) =
-                            workspace.create_project(storage.manifest().project.clone())
-                        {
+                        if let Err(error) = Self::attach_project_storage(
+                            &mut workspace,
+                            &mut storages,
+                            &mut data,
+                            storage,
+                        ) {
                             diagnostics.push(format!("未恢复项目 `{}`：{error}", entry.project_id));
                         }
                     }
@@ -458,7 +522,7 @@ fn main() {
                     }
                 }
             }
-            (registry, workspace, diagnostics)
+            (registry, workspace, storages, data, diagnostics)
         }
 
         fn input(
@@ -513,8 +577,13 @@ fn main() {
             let settings_path = RuntimeSettings::default_path();
             let settings = RuntimeSettings::load_or_default(&settings_path).unwrap_or_default();
             let project_registry_path = Self::project_registry_path(&settings_path);
-            let (project_registry, workspace, project_restore_diagnostics) =
-                Self::restore_project_workspace(&project_registry_path);
+            let (
+                project_registry,
+                workspace,
+                project_storages,
+                project_data,
+                project_restore_diagnostics,
+            ) = Self::restore_project_workspace(&project_registry_path);
             let providers = settings
                 .providers
                 .iter()
@@ -541,13 +610,14 @@ fn main() {
             })
             .detach();
             let project_search = Self::input(window, String::new(), "Search projects", cx);
+            let evidence_query = Self::input(window, String::new(), "capacitor", cx);
             let new_project_id = Self::input(window, String::new(), "power-supply", cx);
             let new_project_name = Self::input(window, String::new(), "Power supply", cx);
             let new_project_description =
                 Self::input(window, String::new(), "Optional design workspace description", cx);
             let new_project_root =
                 Self::input(window, String::new(), "Choose an existing empty folder", cx);
-            for input in [&project_search, &new_project_id, &new_project_root] {
+            for input in [&project_search, &evidence_query, &new_project_id, &new_project_root] {
                 cx.subscribe(input, |_, _, event, cx| {
                     if let InputEvent::Change = event {
                         cx.notify();
@@ -589,6 +659,10 @@ fn main() {
                 workspace,
                 project_registry,
                 project_registry_path,
+                project_storages,
+                project_data,
+                session_replay: None,
+                evidence_query,
                 selected_project: None,
                 project_search,
                 project_filter: ProjectFilter::All,
@@ -792,6 +866,86 @@ fn main() {
             }
             self.selected_project = Some(project_id);
             self.project_tab = ProjectDetailTab::Overview;
+            self.session_replay = None;
+            cx.notify();
+        }
+
+        /// Reloads one project's cached document/session listings from its root.
+        fn refresh_project_data(&mut self, project_id: &str) -> Result<(), String> {
+            let storage = self
+                .project_storages
+                .get(project_id)
+                .ok_or_else(|| "项目根目录未打开".to_owned())?;
+            let documents =
+                storage.list_documents().map_err(|error| format!("文档索引未读取：{error}"))?;
+            let session_listing =
+                storage.list_sessions().map_err(|error| format!("会话记录未读取：{error}"))?;
+            self.project_data.entry(project_id.to_owned()).or_default().documents = documents;
+            self.project_data.entry(project_id.to_owned()).or_default().session_listing =
+                session_listing;
+            Ok(())
+        }
+
+        fn import_project_document(&mut self, category: DocumentCategory, cx: &mut Context<Self>) {
+            let Some(project_id) = self.selected_project.clone() else {
+                return;
+            };
+            let Some(storage) = self.project_storages.get(&project_id) else {
+                self.status = "未导入：项目根目录未打开。".to_owned();
+                cx.notify();
+                return;
+            };
+            let dialog_title = match category {
+                DocumentCategory::Datasheet => "导入 Datasheet",
+                DocumentCategory::ReferenceDesign => "导入参考设计",
+            };
+            let Some(source) = FileDialog::new().set_title(dialog_title).pick_file() else {
+                return;
+            };
+            match self.workspace.import_project_document(&project_id, storage, &source, category) {
+                Ok(document) => {
+                    let searchable = is_text_extractable(&document.document_kind);
+                    if let Err(error) = self.refresh_project_data(&project_id) {
+                        self.status = format!("文档已导入，但列表未刷新：{error}");
+                    } else {
+                        self.status = format!(
+                            "已导入 `{}`（{}，{}…）{}。",
+                            document.original_file_name,
+                            document.id,
+                            &document.content_hash[..23],
+                            if searchable {
+                                "，文本可证据检索"
+                            } else {
+                                "，暂不参与文本检索"
+                            },
+                        );
+                    }
+                }
+                Err(error) => self.status = format!("未导入文档：{error}"),
+            }
+            cx.notify();
+        }
+
+        fn open_session_replay(&mut self, session_id: String, cx: &mut Context<Self>) {
+            let Some(project_id) = self.selected_project.clone() else {
+                return;
+            };
+            let Some(storage) = self.project_storages.get(&project_id) else {
+                self.status = "未打开会话：项目根目录未打开。".to_owned();
+                cx.notify();
+                return;
+            };
+            match storage.load_session(&session_id) {
+                Ok(replay) => {
+                    self.session_replay = Some(SessionReplaySelection { project_id, replay });
+                }
+                Err(error) => self.status = format!("未打开会话：{error}"),
+            }
+            cx.notify();
+        }
+
+        fn close_session_replay(&mut self, cx: &mut Context<Self>) {
+            self.session_replay = None;
             cx.notify();
         }
 
@@ -831,6 +985,7 @@ fn main() {
             }
 
             let project = storage.manifest().project.clone();
+            let opened_root = storage.root().display().to_string();
             if let Some(registered_root) = self.project_registry.root_for(&project.id) {
                 if registered_root != storage.root() {
                     self.status = format!(
@@ -846,20 +1001,24 @@ fn main() {
                 cx.notify();
                 return;
             }
-            if self.workspace.project(&project.id).is_none()
-                && let Err(error) = self.workspace.create_project(project.clone())
-            {
-                self.status = format!("未打开项目：{error}");
-                cx.notify();
-                return;
+            if self.workspace.project(&project.id).is_none() {
+                if let Err(error) = Self::attach_project_storage(
+                    &mut self.workspace,
+                    &mut self.project_storages,
+                    &mut self.project_data,
+                    storage,
+                ) {
+                    self.status = format!("未打开项目：{error}");
+                    cx.notify();
+                    return;
+                }
             }
             if let Err(error) = self.project_registry.mark_opened(&project.id) {
                 self.status = format!("项目已打开，但未能记录最近活动：{error}");
             } else if let Err(error) = self.persist_project_registry() {
                 self.status = format!("项目已打开，但未能保存项目注册表：{error}");
             } else {
-                self.status =
-                    format!("已打开项目 `{}`：{}。", project.id, storage.root().display());
+                self.status = format!("已打开项目 `{}`：{opened_root}。", project.id);
             }
             self.selected_project = Some(project.id);
             self.project_tab = ProjectDetailTab::Overview;
@@ -888,45 +1047,51 @@ fn main() {
             };
 
             match ProjectStorage::create(&root, project.clone()) {
-                Ok(storage) => match self.project_registry.register(&storage) {
-                    Ok(()) => match self.workspace.create_project(project) {
+                Ok(storage) => {
+                    let created_root = storage.root().display().to_string();
+                    match self.project_registry.register(&storage) {
                         Ok(()) => {
-                            let persistence_error = self.persist_project_registry().err();
-                            self.selected_project = Some(id.clone());
-                            self.project_tab = ProjectDetailTab::Overview;
-                            self.project_form_open = false;
-                            self.new_project_id
-                                .update(cx, |state, cx| state.set_value("", window, cx));
-                            self.new_project_name
-                                .update(cx, |state, cx| state.set_value("", window, cx));
-                            self.new_project_description
-                                .update(cx, |state, cx| state.set_value("", window, cx));
-                            self.new_project_root
-                                .update(cx, |state, cx| state.set_value("", window, cx));
-                            self.status = match persistence_error {
-                                Some(error) => format!(
-                                    "项目文件已创建于 {}，但项目注册表未保存：{error}。",
-                                    storage.root().display()
-                                ),
-                                None => {
-                                    format!("已创建项目 `{id}`：{}。", storage.root().display())
+                            let attached = Self::attach_project_storage(
+                                &mut self.workspace,
+                                &mut self.project_storages,
+                                &mut self.project_data,
+                                storage,
+                            );
+                            match attached {
+                                Ok(()) => {
+                                    let persistence_error = self.persist_project_registry().err();
+                                    self.selected_project = Some(id.clone());
+                                    self.project_tab = ProjectDetailTab::Overview;
+                                    self.project_form_open = false;
+                                    self.new_project_id
+                                        .update(cx, |state, cx| state.set_value("", window, cx));
+                                    self.new_project_name
+                                        .update(cx, |state, cx| state.set_value("", window, cx));
+                                    self.new_project_description
+                                        .update(cx, |state, cx| state.set_value("", window, cx));
+                                    self.new_project_root
+                                        .update(cx, |state, cx| state.set_value("", window, cx));
+                                    self.status = match persistence_error {
+                                        Some(error) => format!(
+                                            "项目文件已创建于 {created_root}，但项目注册表未保存：{error}。"
+                                        ),
+                                        None => format!("已创建项目 `{id}`：{created_root}。"),
+                                    };
                                 }
-                            };
+                                Err(error) => {
+                                    self.status = format!(
+                                        "项目文件已创建于 {created_root}，但未能加入当前工作区：{error}。"
+                                    );
+                                }
+                            }
                         }
                         Err(error) => {
                             self.status = format!(
-                                "项目文件已创建于 {}，但未能加入当前工作区：{error}。",
-                                storage.root().display()
+                                "项目文件已创建于 {created_root}，但未能注册：{error}。文件未被删除。"
                             );
                         }
-                    },
-                    Err(error) => {
-                        self.status = format!(
-                            "项目文件已创建于 {}，但未能注册：{error}。文件未被删除。",
-                            storage.root().display()
-                        );
                     }
-                },
+                }
                 Err(error) => self.status = format!("未创建项目：{error}"),
             }
             cx.notify();
@@ -1408,6 +1573,25 @@ fn main() {
                     || language.choose("根目录未注册", "Root not registered").to_owned(),
                     |path| path.display().to_string(),
                 );
+                let (document_count, session_count, last_activity) =
+                    self.project_data.get(&project.id).map_or((0, 0, None), |data| {
+                        let last_activity = data
+                            .session_listing
+                            .sessions
+                            .first()
+                            .map(|summary| rfc3339(summary.metadata.started_at_unix_seconds));
+                        (data.documents.len(), data.session_listing.sessions.len(), last_activity)
+                    });
+                let document_label = language.choose_owned(
+                    format!("{document_count} 份文档"),
+                    format!("{document_count} documents"),
+                );
+                let session_label = language.choose_owned(
+                    format!("{session_count} 个会话"),
+                    format!("{session_count} sessions"),
+                );
+                let activity_label = last_activity
+                    .unwrap_or_else(|| language.choose("尚无活动", "No activity yet").to_owned());
                 cards = cards.child(
                     div()
                         .id(format!("project-card-{}", project.id))
@@ -1456,9 +1640,9 @@ fn main() {
                                 .gap_3()
                                 .text_xs()
                                 .text_color(rgb(TEXT_MUTED))
-                                .child(language.choose("0 份文档", "0 documents"))
-                                .child(language.choose("0 个会话", "0 sessions"))
-                                .child(language.choose("尚无活动", "No activity yet")),
+                                .child(document_label)
+                                .child(session_label)
+                                .child(activity_label),
                         ),
                 );
             }
@@ -1631,6 +1815,21 @@ fn main() {
                 || language.choose("根目录未注册", "Root not registered").to_owned(),
                 |path| path.display().to_string(),
             );
+            let (document_count, session_count) = self
+                .project_data
+                .get(&project.id)
+                .map_or((0, 0), |data| (data.documents.len(), data.session_listing.sessions.len()));
+            let session_tokens = self
+                .project_data
+                .get(&project.id)
+                .map(|data| {
+                    data.session_listing.sessions.iter().fold(0_u64, |total, summary| {
+                        total
+                            + summary.metadata.usage.input_tokens
+                            + summary.metadata.usage.output_tokens
+                    })
+                })
+                .unwrap_or(0);
             let mut tabs = div().flex().gap_1().flex_wrap();
             for tab in ProjectDetailTab::ALL {
                 let chooser = entity.clone();
@@ -1680,27 +1879,26 @@ fn main() {
                         div()
                             .flex()
                             .gap_3()
-                            .child(Self::project_empty_metric(language.choose("文档", "Documents")))
-                            .child(Self::project_empty_metric(language.choose("会话", "Sessions")))
-                            .child(Self::project_empty_metric(language.choose("用量", "Usage"))),
+                            .child(Self::project_metric(
+                                document_count.to_string(),
+                                language.choose("授权文档", "Authorized documents"),
+                            ))
+                            .child(Self::project_metric(
+                                session_count.to_string(),
+                                language.choose("会话记录", "Session records"),
+                            ))
+                            .child(Self::project_metric(
+                                session_tokens.to_string(),
+                                language.choose("累计 tokens", "Total tokens"),
+                            )),
                     )
                     .into_any_element(),
-                ProjectDetailTab::Documents => Self::project_empty_state(
-                    language.choose("还没有授权文档", "No authorized documents yet"),
-                    language.choose(
-                        "文档登记后会显示其来源、内容哈希和可引用片段。",
-                        "Registered documents will show their source, content hash, and citation-ready fragments.",
-                    ),
-                )
-                .into_any_element(),
-                ProjectDetailTab::Sessions => Self::project_empty_state(
-                    language.choose("还没有会话", "No sessions yet"),
-                    language.choose(
-                        "此项目的智能体会话和工具调用记录将仅显示在这里。",
-                        "Agent sessions and tool calls scoped to this project will appear only here.",
-                    ),
-                )
-                .into_any_element(),
+                ProjectDetailTab::Documents => {
+                    self.render_documents_tab(&project, cx).into_any_element()
+                }
+                ProjectDetailTab::Sessions => {
+                    self.render_sessions_tab(&project, cx).into_any_element()
+                }
                 ProjectDetailTab::AgentConfiguration => {
                     let scope_summary = if let Some(configuration) = configuration {
                         format!(
@@ -1802,7 +2000,7 @@ fn main() {
                 )
         }
 
-        fn project_empty_metric(label: &'static str) -> impl IntoElement {
+        fn project_metric(value: String, label: &'static str) -> impl IntoElement {
             div()
                 .flex_1()
                 .v_flex()
@@ -1812,8 +2010,473 @@ fn main() {
                 .border_1()
                 .border_color(rgb(BORDER))
                 .bg(rgb(CARD_BG))
-                .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child("0"))
+                .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(value))
                 .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(label))
+        }
+
+        #[allow(clippy::too_many_lines)]
+        fn render_documents_tab(
+            &mut self,
+            project: &Project,
+            cx: &mut Context<Self>,
+        ) -> impl IntoElement {
+            let entity = cx.entity().clone();
+            let language = self.language;
+            let documents = self
+                .project_data
+                .get(&project.id)
+                .map(|data| data.documents.clone())
+                .unwrap_or_default();
+
+            let header = div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .text_base()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(language.choose("授权文档", "Authorized documents")),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child({
+                            let importer = entity.clone();
+                            Button::new("import-datasheet")
+                                .label(language.choose("导入 Datasheet", "Import datasheet"))
+                                .on_click(move |_, _, cx| {
+                                    importer.update(cx, |view, cx| {
+                                        view.import_project_document(
+                                            DocumentCategory::Datasheet,
+                                            cx,
+                                        );
+                                    });
+                                })
+                        })
+                        .child({
+                            let importer = entity.clone();
+                            Button::new("import-reference-design")
+                                .primary()
+                                .label(language.choose("导入参考设计", "Import reference design"))
+                                .on_click(move |_, _, cx| {
+                                    importer.update(cx, |view, cx| {
+                                        view.import_project_document(
+                                            DocumentCategory::ReferenceDesign,
+                                            cx,
+                                        );
+                                    });
+                                })
+                        }),
+                );
+
+            if documents.is_empty() {
+                return div()
+                    .v_flex()
+                    .gap_4()
+                    .size_full()
+                    .child(header)
+                    .child(
+                        Self::project_empty_state(
+                            language.choose("还没有授权文档", "No authorized documents yet"),
+                            language.choose(
+                                "导入第一份 datasheet 或参考设计后，会记录内容哈希与来源，并可被证据检索引用。",
+                                "Import the first datasheet or reference design; its content hash and source are recorded and citable.",
+                            ),
+                        ),
+                    )
+                    .into_any_element();
+            }
+
+            let mut list = div().v_flex().gap_2();
+            for document in documents {
+                let searchable = is_text_extractable(&document.document_kind);
+                let category_style = match document.category {
+                    DocumentCategory::Datasheet => (0x00e0_f2fe, 0x000e_7490),
+                    DocumentCategory::ReferenceDesign => (0x00f3_e8ff, 0x0076_2b_a3),
+                };
+                list = list.child(
+                    div()
+                        .v_flex()
+                        .gap_1()
+                        .p_3()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .bg(rgb(CARD_BG))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child(document.original_file_name.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .px_1p5()
+                                        .py_0p5()
+                                        .rounded_sm()
+                                        .text_xs()
+                                        .bg(rgb(category_style.0))
+                                        .text_color(rgb(category_style.1))
+                                        .child(document.category.label()),
+                                )
+                                .child(
+                                    div()
+                                        .px_1p5()
+                                        .py_0p5()
+                                        .rounded_sm()
+                                        .text_xs()
+                                        .bg(rgb(if searchable { 0x00dc_fce7 } else { SURFACE_BG }))
+                                        .text_color(rgb(if searchable {
+                                            0x0016_a34a
+                                        } else {
+                                            TEXT_MUTED
+                                        }))
+                                        .child(if searchable {
+                                            language.choose("文本可检索", "Text searchable")
+                                        } else {
+                                            language.choose("仅哈希存档", "Hash-only archive")
+                                        }),
+                                )
+                                .child(
+                                    div().ml_auto().text_xs().text_color(rgb(TEXT_MUTED)).child(
+                                        format!(
+                                            "{} · {} bytes",
+                                            &document.content_hash[..19],
+                                            document.byte_size
+                                        ),
+                                    ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(TEXT_MUTED))
+                                .child(format!("{} · {}", document.id, document.source_locator)),
+                        ),
+                );
+            }
+
+            let query = self.evidence_query.read(cx).value().trim().to_owned();
+            let evidence = if query.is_empty() {
+                None
+            } else {
+                self.workspace.retrieve_document_evidence(&project.id, &query).ok()
+            };
+            let mut search_panel = div()
+                .v_flex()
+                .gap_2()
+                .p_3()
+                .rounded_lg()
+                .border_1()
+                .border_color(rgb(BORDER))
+                .bg(rgb(SURFACE_BG))
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(language.choose("项目内证据检索", "Project-scoped evidence search")),
+                )
+                .child(div().id("evidence-query").w_full().child(Input::new(&self.evidence_query)));
+            match evidence {
+                Some(package) if !package.fragments.is_empty() => {
+                    search_panel = search_panel.child(
+                        div().text_xs().text_color(rgb(TEXT_MUTED)).child(language.choose_owned(
+                            format!("命中 {} 个可引用片段：", package.fragments.len()),
+                            format!("{} citation-ready fragments:", package.fragments.len()),
+                        )),
+                    );
+                    for fragment in package.fragments.iter().take(12) {
+                        search_panel = search_panel.child(
+                            div()
+                                .v_flex()
+                                .gap_0p5()
+                                .p_2()
+                                .rounded_md()
+                                .bg(rgb(CARD_BG))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(0x000e_7490))
+                                        .child(fragment.locator.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(rgb(TEXT_PRIMARY))
+                                        .child(fragment.text.clone()),
+                                ),
+                        );
+                    }
+                }
+                Some(_) => {
+                    search_panel = search_panel.child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(TEXT_MUTED))
+                            .child(language.choose(
+                                "没有命中片段；换一个关键词，或导入更多文本类文档。",
+                                "No matching fragments; try another keyword or import more text documents.",
+                            )),
+                    );
+                }
+                None => {}
+            }
+
+            div()
+                .v_flex()
+                .gap_4()
+                .size_full()
+                .child(header)
+                .child(list)
+                .child(search_panel)
+                .into_any_element()
+        }
+
+        #[allow(clippy::too_many_lines)]
+        fn render_sessions_tab(
+            &mut self,
+            project: &Project,
+            cx: &mut Context<Self>,
+        ) -> impl IntoElement {
+            let entity = cx.entity().clone();
+            let language = self.language;
+
+            if let Some(selection) = &self.session_replay
+                && selection.project_id == project.id
+            {
+                let replay = &selection.replay;
+                let metadata = &replay.metadata;
+                let closer = entity.clone();
+                let mut body = div().v_flex().gap_0p5();
+                for line in replay.body.lines() {
+                    body = body.child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(TEXT_PRIMARY))
+                            .whitespace_normal()
+                            .child(line.to_owned()),
+                    );
+                }
+                return div()
+                    .v_flex()
+                    .gap_3()
+                    .size_full()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .v_flex()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .text_base()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child(metadata.session_id.clone()),
+                                    )
+                                    .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(
+                                        format!(
+                                                "{} · {} · {} → {}",
+                                                metadata
+                                                    .backend_id
+                                                    .clone()
+                                                    .unwrap_or_else(|| "-".to_owned()),
+                                                rfc3339(metadata.started_at_unix_seconds),
+                                                metadata.status.as_str(),
+                                                metadata
+                                                    .completed_at_unix_seconds
+                                                    .map(rfc3339)
+                                                    .unwrap_or_else(|| "—".to_owned()),
+                                            ),
+                                    )),
+                            )
+                            .child(
+                                Button::new("close-session-replay")
+                                    .ghost()
+                                    .label(language.choose("返回列表", "Back to list"))
+                                    .on_click(move |_, _, cx| {
+                                        closer.update(cx, ControlPlaneView::close_session_replay);
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .text_xs()
+                            .text_color(rgb(TEXT_SECONDARY))
+                            .child(format!(
+                                "{} input / {} output tokens",
+                                metadata.usage.input_tokens, metadata.usage.output_tokens
+                            ))
+                            .when(!metadata.citations.is_empty(), |this| {
+                                this.child(format!(" · 引用 {}", metadata.citations.join("、")))
+                            }),
+                    )
+                    .child(
+                        div()
+                            .id("session-replay-body")
+                            .v_flex()
+                            .gap_0p5()
+                            .p_3()
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .bg(rgb(CARD_BG))
+                            .max_h(px(480.))
+                            .overflow_y_scroll()
+                            .child(body),
+                    )
+                    .into_any_element();
+            }
+
+            let listing = self
+                .project_data
+                .get(&project.id)
+                .map(|data| data.session_listing.clone())
+                .unwrap_or_default();
+
+            if listing.sessions.is_empty() {
+                return div()
+                    .v_flex()
+                    .gap_2()
+                    .items_center()
+                    .justify_center()
+                    .h_full()
+                    .text_center()
+                    .child(
+                        div()
+                            .text_base()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(language.choose("还没有会话", "No sessions yet")),
+                    )
+                    .child(div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(
+                        language.choose(
+                            "会话由受支持的 EDA bridge 启动后，会以 Markdown 审计记录的形式出现在这里。",
+                            "Sessions started from a supported EDA bridge appear here as Markdown audit records.",
+                        ),
+                    ))
+                    .when(!listing.orphaned_temp_files.is_empty(), |this| {
+                        this.child(div().text_xs().text_color(rgb(0x00b4_5309)).child(
+                            language.choose_owned(
+                                format!(
+                                    "检测到 {} 个中断写入的临时文件，可在确认后手动删除。",
+                                    listing.orphaned_temp_files.len()
+                                ),
+                                format!(
+                                    "{} interrupted-write temporary files detected; review and remove them manually.",
+                                    listing.orphaned_temp_files.len()
+                                ),
+                            ),
+                        ))
+                    })
+                    .into_any_element();
+            }
+
+            let mut rows = div().v_flex().gap_2();
+            for summary in &listing.sessions {
+                let metadata = &summary.metadata;
+                let session_id = metadata.session_id.clone();
+                let opener = entity.clone();
+                let (status_bg, status_fg) = match metadata.status.as_str() {
+                    "completed" => (0x00dc_fce7, 0x0016_a34a),
+                    "failed" => (0x00fe_e2e2, 0x00b4_2323),
+                    _ => (0x00fe_f3c7, 0x00b4_5309),
+                };
+                rows = rows.child(
+                    div()
+                        .id(format!("session-row-{}", metadata.session_id))
+                        .v_flex()
+                        .gap_1()
+                        .p_3()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .bg(rgb(CARD_BG))
+                        .cursor_pointer()
+                        .hover(|this| this.border_color(rgb(ACCENT_SOFT)))
+                        .on_click(move |_, _, cx| {
+                            opener.update(cx, |view, cx| {
+                                view.open_session_replay(session_id.clone(), cx);
+                            });
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child(metadata.session_id.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .px_1p5()
+                                        .py_0p5()
+                                        .rounded_sm()
+                                        .text_xs()
+                                        .bg(rgb(status_bg))
+                                        .text_color(rgb(status_fg))
+                                        .child(metadata.status.as_str()),
+                                )
+                                .child(
+                                    div()
+                                        .px_1p5()
+                                        .py_0p5()
+                                        .rounded_sm()
+                                        .text_xs()
+                                        .bg(rgb(SURFACE_BG))
+                                        .text_color(rgb(TEXT_SECONDARY))
+                                        .child(
+                                            metadata
+                                                .backend_id
+                                                .clone()
+                                                .unwrap_or_else(|| "-".to_owned()),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .ml_auto()
+                                        .text_xs()
+                                        .text_color(rgb(TEXT_MUTED))
+                                        .child(rfc3339(metadata.started_at_unix_seconds)),
+                                ),
+                        )
+                        .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(format!(
+                            "{} in / {} out tokens · {}",
+                            metadata.usage.input_tokens,
+                            metadata.usage.output_tokens,
+                            summary.file_name
+                        ))),
+                );
+            }
+            if !listing.orphaned_temp_files.is_empty() {
+                rows = rows.child(
+                    div().text_xs().text_color(rgb(0x00b4_5309)).child(language.choose_owned(
+                        format!(
+                            "检测到 {} 个中断写入的临时文件，可在确认后手动删除。",
+                            listing.orphaned_temp_files.len()
+                        ),
+                        format!(
+                            "{} interrupted-write temporary files detected; review and remove them manually.",
+                            listing.orphaned_temp_files.len()
+                        ),
+                    )),
+                );
+            }
+
+            div().v_flex().gap_3().size_full().child(rows).into_any_element()
         }
 
         fn project_empty_state(title: &'static str, description: &'static str) -> impl IntoElement {
