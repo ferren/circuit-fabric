@@ -300,7 +300,10 @@ fn main() {
         sync::Arc,
     };
 
-    use circuitfabric_codex_runtime::{LlmProviderSettings, RuntimeSettings};
+    use circuitfabric_codex_runtime::{
+        CodexAppServerHandle, LlmProviderSettings, RuntimeSettings, ToolAuthorizationKind,
+        ToolAuthorizationSettings,
+    };
     use circuitfabric_contracts::Project;
     use circuitfabric_project::{
         DocumentCategory, ProjectDocument, ProjectRegistry, ProjectStorage, ProjectWorkspace,
@@ -313,13 +316,11 @@ fn main() {
     };
     use gpui_base::{InputBase, input::InputEditorStyle};
     use gpui_component::{
-        Root, StyledExt,
+        Disableable, Root, StyledExt,
         button::{Button, ButtonVariants},
         input::{Input, InputEvent, InputState},
         scroll::ScrollableElement as _,
     };
-    const APP_LOGO: &[u8] =
-        include_bytes!("../../../assets/branding/circuitfabric-logo-v3-framed-transparent.png");
     const SIDEBAR_MARK: &[u8] =
         include_bytes!("../../../assets/branding/circuitfabric-sidebar-mark.png");
 
@@ -357,6 +358,87 @@ fn main() {
         vision_model: Entity<InputState>,
         vision_api_key_environment_variable: Entity<InputState>,
         enabled: bool,
+    }
+
+    /// One selectable runtime adapter on the Agents & tools page. Claude Code and DSH are
+    /// deliberate placeholders: they show the planned surface without claiming to work.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum RuntimeAdapter {
+        CodexAppServer,
+        ClaudeCode,
+        Dsh,
+    }
+
+    impl RuntimeAdapter {
+        const fn label(self) -> &'static str {
+            match self {
+                Self::CodexAppServer => "Codex App Server",
+                Self::ClaudeCode => "Claude Code",
+                Self::Dsh => "DSH",
+            }
+        }
+
+        const fn is_placeholder(self) -> bool {
+            matches!(self, Self::ClaudeCode | Self::Dsh)
+        }
+
+        const fn summary(self, language: UiLanguage) -> &'static str {
+            match self {
+                Self::CodexAppServer => language
+                    .choose("本地子进程 · stdio JSON-RPC", "Local child process · stdio JSON-RPC"),
+                Self::ClaudeCode | Self::Dsh => {
+                    language.choose("占位适配器 · 规划中", "Placeholder adapter · planned")
+                }
+            }
+        }
+    }
+
+    /// What the Agents & tools detail pane currently shows.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum AgentsSelection {
+        Runtime(RuntimeAdapter),
+        Provider,
+        SkillsAndMcp,
+    }
+
+    /// Observable state of the supervised Codex App Server process.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum RuntimeLifecycleStatus {
+        Starting,
+        Running { pid: u32 },
+        Stopped,
+        Failed { reason: String },
+    }
+
+    impl RuntimeLifecycleStatus {
+        const fn dot(&self) -> u32 {
+            match self {
+                Self::Starting => 0x00f5_9e0b,
+                Self::Running { .. } => 0x0022_c55e,
+                Self::Stopped => 0x0094_a3b8,
+                Self::Failed { .. } => 0x00dc_2626,
+            }
+        }
+
+        fn label(self, language: UiLanguage) -> String {
+            match self {
+                Self::Starting => language.choose("正在启动…", "Starting…").to_owned(),
+                Self::Running { pid } => {
+                    format!("{} · PID {pid}", language.choose("运行中", "Running"))
+                }
+                Self::Stopped => language.choose("已停止", "Stopped").to_owned(),
+                Self::Failed { reason } => {
+                    format!("{}：{reason}", language.choose("启动失败", "Start failed"))
+                }
+            }
+        }
+    }
+
+    /// Where a skill or MCP-server authorization is stored.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ToolScope {
+        Global,
+        Project,
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -413,7 +495,6 @@ fn main() {
     }
 
     struct ControlPlaneView {
-        logo: Arc<Image>,
         sidebar_mark: Arc<Image>,
         command: Entity<InputState>,
         working_directory: Entity<InputState>,
@@ -444,6 +525,13 @@ fn main() {
         new_project_name: Entity<InputState>,
         new_project_description: Entity<InputState>,
         new_project_root: Entity<InputState>,
+        agents_selection: AgentsSelection,
+        codex_process: Option<CodexAppServerHandle>,
+        codex_status: RuntimeLifecycleStatus,
+        tool_authorizations: ToolAuthorizationSettings,
+        new_tool_id: Entity<InputState>,
+        new_tool_kind: ToolAuthorizationKind,
+        new_tool_scope: ToolScope,
     }
 
     impl ControlPlaneView {
@@ -461,6 +549,11 @@ fn main() {
             let project_id = storage.manifest().project.id.clone();
             workspace
                 .create_project(storage.manifest().project.clone())
+                .map_err(|error| error.to_string())?;
+            let configuration =
+                storage.load_configuration().map_err(|error| format!("项目配置未恢复：{error}"))?;
+            workspace
+                .set_configuration(&project_id, configuration)
                 .map_err(|error| error.to_string())?;
             if let Err(error) = workspace.hydrate_project_documents(&project_id, &storage) {
                 return Err(format!("文档证据未恢复：{error}"));
@@ -615,7 +708,10 @@ fn main() {
                 Self::input(window, String::new(), "Optional design workspace description", cx);
             let new_project_root =
                 Self::input(window, String::new(), "Choose an existing empty folder", cx);
-            for input in [&project_search, &evidence_query, &new_project_id, &new_project_root] {
+            let new_tool_id = Self::input(window, String::new(), "evidence-search", cx);
+            for input in
+                [&project_search, &evidence_query, &new_project_id, &new_project_root, &new_tool_id]
+            {
                 cx.subscribe(input, |_, _, event, cx| {
                     if let InputEvent::Change = event {
                         cx.notify();
@@ -629,7 +725,6 @@ fn main() {
                 format!("项目恢复提示：{}", project_restore_diagnostics.join("；"))
             };
             Self {
-                logo: Arc::new(Image::from_bytes(ImageFormat::Png, APP_LOGO.to_vec())),
                 sidebar_mark: Arc::new(Image::from_bytes(ImageFormat::Png, SIDEBAR_MARK.to_vec())),
                 command: Self::input(window, settings.codex.command, "codex", cx),
                 working_directory: Self::input(
@@ -670,6 +765,13 @@ fn main() {
                 new_project_name,
                 new_project_description,
                 new_project_root,
+                agents_selection: AgentsSelection::Runtime(RuntimeAdapter::CodexAppServer),
+                codex_process: None,
+                codex_status: RuntimeLifecycleStatus::Stopped,
+                tool_authorizations: settings.tools,
+                new_tool_id,
+                new_tool_kind: ToolAuthorizationKind::Skill,
+                new_tool_scope: ToolScope::Global,
             }
         }
 
@@ -728,6 +830,7 @@ fn main() {
             };
             self.providers.push(Self::provider_fields(window, provider, cx));
             self.selected_provider = self.providers.len() - 1;
+            self.agents_selection = AgentsSelection::Provider;
             "已添加 Provider，请填写配置后保存。".clone_into(&mut self.status);
             cx.notify();
         }
@@ -779,18 +882,14 @@ fn main() {
             cx.notify();
         }
 
-        fn save_settings(&mut self, cx: &mut Context<Self>) {
+        /// Collects every runtime form on the Agents & tools page into persistable settings.
+        fn runtime_settings_from_form(&self, cx: &Context<Self>) -> RuntimeSettings {
             let providers = self.provider_values(cx);
-            if providers.is_empty() {
-                "未保存：至少需要一个 Provider。".clone_into(&mut self.status);
-                cx.notify();
-                return;
-            }
             let default_provider_id =
                 if providers.iter().any(|provider| provider.id == self.default_provider_id) {
                     self.default_provider_id.clone()
                 } else {
-                    providers[0].id.clone()
+                    providers.first().map_or_else(String::new, |provider| provider.id.clone())
                 };
             let mut settings = RuntimeSettings::default();
             settings.codex.command = self.command.read(cx).value().to_string();
@@ -808,28 +907,328 @@ fn main() {
             settings.default_provider_id.clone_from(&default_provider_id);
             settings.providers = providers;
             settings.bridge.listen_address = self.bridge_address.read(cx).value().to_string();
+            settings.tools = self.tool_authorizations.clone();
+            settings
+        }
+
+        fn save_settings(&mut self, cx: &mut Context<Self>) {
+            let settings = self.runtime_settings_from_form(cx);
+            if settings.providers.is_empty() {
+                "未保存：至少需要一个 Provider。".clone_into(&mut self.status);
+                cx.notify();
+                return;
+            }
+            self.default_provider_id.clone_from(&settings.default_provider_id);
             self.status = match settings.save(&self.settings_path) {
                 Ok(()) => format!(
-                    "已保存到 {}。默认 Provider：{}。现在可启动 circuitfabric-jlc-bridge。",
+                    "已保存到 {}。默认 Provider：{}。API Key 仅保存环境变量名。",
                     self.settings_path.display(),
-                    default_provider_id
+                    settings.default_provider_id
                 ),
                 Err(error) => format!("未保存：{error}"),
             };
-            self.default_provider_id = default_provider_id;
             cx.notify();
         }
 
-        fn field(
-            label: &'static str,
-            id: &'static str,
-            state: &Entity<InputState>,
-        ) -> impl IntoElement {
-            div()
-                .v_flex()
-                .gap_1()
-                .child(div().text_sm().child(label))
-                .child(div().id(id).w_full().child(Input::new(state)))
+        /// Starts the supervised Codex App Server child process.
+        ///
+        /// The launch persists the current form first, so what runs is exactly what was saved,
+        /// and briefly watches the process so an immediate exit is reported as a failure.
+        fn start_codex_runtime(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+            if self.codex_process.is_some()
+                || matches!(self.codex_status, RuntimeLifecycleStatus::Starting)
+            {
+                "未启动：Codex App Server 正在运行或正在启动。".clone_into(&mut self.status);
+                cx.notify();
+                return;
+            }
+            let settings = self.runtime_settings_from_form(cx);
+            let Some(provider) = settings.default_provider().cloned() else {
+                "未启动：请先配置默认 Provider。".clone_into(&mut self.status);
+                cx.notify();
+                return;
+            };
+            if let Err(error) = settings.save(&self.settings_path) {
+                self.status = format!("未启动：设置未保存（{error}）。");
+                cx.notify();
+                return;
+            }
+            self.default_provider_id.clone_from(&settings.default_provider_id);
+            match CodexAppServerHandle::launch(&settings.codex, &provider) {
+                Ok(mut handle) => {
+                    self.codex_status = RuntimeLifecycleStatus::Starting;
+                    self.status = format!(
+                        "正在启动 Codex App Server（Provider `{}`）…设置已写入 {}。",
+                        provider.id,
+                        self.settings_path.display()
+                    );
+                    let confirmation = cx.background_spawn(async move {
+                        for _ in 0..24 {
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                            if let Some(exit) = handle.try_exit() {
+                                return Err(format!("进程立即退出（{exit}）"));
+                            }
+                        }
+                        Ok(handle)
+                    });
+                    cx.spawn_in(window, async move |view, cx| {
+                        let confirmation = confirmation.await;
+                        cx.update(|_window, cx| {
+                            view.update(cx, |view, cx| {
+                                match confirmation {
+                                    Ok(handle) => {
+                                        let pid = handle.pid();
+                                        view.codex_process = Some(handle);
+                                        view.codex_status = RuntimeLifecycleStatus::Running {
+                                            pid,
+                                        };
+                                        view.status = format!(
+                                            "Codex App Server 已启动（PID {pid}）。运行状态不持久化：退出 CircuitFabric 时进程随之终止。"
+                                        );
+                                    }
+                                    Err(reason) => {
+                                        view.codex_status = RuntimeLifecycleStatus::Failed {
+                                            reason: reason.clone(),
+                                        };
+                                        view.status = format!("未启动：{reason}");
+                                    }
+                                }
+                                cx.notify();
+                            })
+                            .ok();
+                        })
+                        .ok();
+                    })
+                    .detach();
+                }
+                Err(error) => {
+                    self.codex_status =
+                        RuntimeLifecycleStatus::Failed { reason: error.to_string() };
+                    self.status = format!("未启动：{error}");
+                    cx.notify();
+                }
+            }
+        }
+
+        fn stop_codex_runtime(&mut self, cx: &mut Context<Self>) {
+            if matches!(self.codex_status, RuntimeLifecycleStatus::Starting) {
+                "未停止：Codex App Server 正在启动，请稍候。".clone_into(&mut self.status);
+                cx.notify();
+                return;
+            }
+            let Some(mut process) = self.codex_process.take() else {
+                "运行时当前未在运行。".clone_into(&mut self.status);
+                cx.notify();
+                return;
+            };
+            let pid = process.pid();
+            match process.stop() {
+                Ok(()) => {
+                    self.codex_status = RuntimeLifecycleStatus::Stopped;
+                    self.status = format!(
+                        "已停止 Codex App Server（PID {pid}）。已保存的运行时设置保持不变。"
+                    );
+                }
+                Err(error) => {
+                    self.codex_status =
+                        RuntimeLifecycleStatus::Failed { reason: error.to_string() };
+                    self.status = format!("停止失败（PID {pid}）：{error}");
+                }
+            }
+            cx.notify();
+        }
+
+        /// Reconciles the lifecycle chip with the real process state: a process that died on its
+        /// own is reported as stopped or failed instead of staying green.
+        fn refresh_codex_lifecycle(&mut self) {
+            let exit = self.codex_process.as_mut().and_then(CodexAppServerHandle::try_exit);
+            if let Some(exit) = exit {
+                self.codex_process = None;
+                if exit.success() {
+                    self.codex_status = RuntimeLifecycleStatus::Stopped;
+                } else {
+                    self.codex_status = RuntimeLifecycleStatus::Failed {
+                        reason: format!("进程已退出（{exit}）"),
+                    };
+                }
+            }
+        }
+
+        /// Authorizes one skill or MCP server in the selected scope, persisting immediately.
+        fn authorize_tool(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+            let id = self.new_tool_id.read(cx).value().trim().to_owned();
+            if id.is_empty() || id.chars().any(char::is_whitespace) {
+                "未授权：ID 不能为空且不能包含空白字符。".clone_into(&mut self.status);
+                cx.notify();
+                return;
+            }
+            let kind = self.new_tool_kind;
+            let kind_label = Self::tool_kind_label(kind, self.language);
+            match self.new_tool_scope {
+                ToolScope::Global => {
+                    let previous = self.tool_authorizations.clone();
+                    let list = Self::global_tool_list_mut(&mut self.tool_authorizations, kind);
+                    if list.iter().any(|existing| existing == &id) {
+                        self.status = format!("`{id}` 已是全局授权的{kind_label}。");
+                        cx.notify();
+                        return;
+                    }
+                    list.push(id.clone());
+                    list.sort();
+                    list.dedup();
+                    let settings = self.runtime_settings_from_form(cx);
+                    match settings.save(&self.settings_path) {
+                        Ok(()) => {
+                            self.default_provider_id.clone_from(&settings.default_provider_id);
+                            self.new_tool_id
+                                .update(cx, |state, cx| state.set_value("", window, cx));
+                            self.status = format!(
+                                "已授权{kind_label} `{id}`（全局作用域），已写入 {}。",
+                                self.settings_path.display()
+                            );
+                        }
+                        Err(error) => {
+                            self.tool_authorizations = previous;
+                            self.status =
+                                format!("未授权（全局授权会立即保存运行时设置）：{error}");
+                        }
+                    }
+                }
+                ToolScope::Project => {
+                    let Some(project_id) = self.selected_project.clone() else {
+                        "未授权：请先在「项目」页选择一个项目。".clone_into(&mut self.status);
+                        cx.notify();
+                        return;
+                    };
+                    let Some(storage) = self.project_storages.get(&project_id).cloned() else {
+                        "未授权：项目根目录未打开。".clone_into(&mut self.status);
+                        cx.notify();
+                        return;
+                    };
+                    let mut configuration =
+                        self.workspace.configuration(&project_id).cloned().unwrap_or_default();
+                    let list = match kind {
+                        ToolAuthorizationKind::Skill => &mut configuration.enabled_skill_ids,
+                        ToolAuthorizationKind::McpServer => {
+                            &mut configuration.enabled_mcp_server_ids
+                        }
+                    };
+                    if list.iter().any(|existing| existing == &id) {
+                        self.status =
+                            format!("`{id}` 已是项目 `{project_id}` 授权的{kind_label}。");
+                        cx.notify();
+                        return;
+                    }
+                    list.push(id.clone());
+                    list.sort();
+                    list.dedup();
+                    match self.workspace.set_configuration(&project_id, configuration.clone()) {
+                        Ok(()) => match storage.save_configuration(&configuration) {
+                            Ok(()) => {
+                                self.new_tool_id
+                                    .update(cx, |state, cx| state.set_value("", window, cx));
+                                self.status = format!(
+                                    "已授权{kind_label} `{id}`（项目 `{project_id}` 作用域），已写入 {}。",
+                                    storage.configuration_path().display()
+                                );
+                            }
+                            Err(error) => {
+                                self.status = format!("已更新内存配置，但未写入项目文件：{error}");
+                            }
+                        },
+                        Err(error) => self.status = format!("未授权：{error}"),
+                    }
+                }
+            }
+            cx.notify();
+        }
+
+        /// Revokes one skill or MCP server authorization, persisting immediately.
+        fn revoke_tool(
+            &mut self,
+            scope: ToolScope,
+            kind: ToolAuthorizationKind,
+            id: &str,
+            cx: &mut Context<Self>,
+        ) {
+            let kind_label = Self::tool_kind_label(kind, self.language);
+            match scope {
+                ToolScope::Global => {
+                    let previous = self.tool_authorizations.clone();
+                    let list = Self::global_tool_list_mut(&mut self.tool_authorizations, kind);
+                    list.retain(|existing| existing.as_str() != id);
+                    let settings = self.runtime_settings_from_form(cx);
+                    match settings.save(&self.settings_path) {
+                        Ok(()) => {
+                            self.default_provider_id.clone_from(&settings.default_provider_id);
+                            self.status = format!(
+                                "已撤销{kind_label} `{id}` 的全局授权，已写入 {}。",
+                                self.settings_path.display()
+                            );
+                        }
+                        Err(error) => {
+                            self.tool_authorizations = previous;
+                            self.status = format!("未撤销（撤销会立即保存运行时设置）：{error}");
+                        }
+                    }
+                }
+                ToolScope::Project => {
+                    let Some(project_id) = self.selected_project.clone() else {
+                        "未撤销：当前未选择项目。".clone_into(&mut self.status);
+                        cx.notify();
+                        return;
+                    };
+                    let Some(storage) = self.project_storages.get(&project_id).cloned() else {
+                        "未撤销：项目根目录未打开。".clone_into(&mut self.status);
+                        cx.notify();
+                        return;
+                    };
+                    let mut configuration =
+                        self.workspace.configuration(&project_id).cloned().unwrap_or_default();
+                    let list = match kind {
+                        ToolAuthorizationKind::Skill => &mut configuration.enabled_skill_ids,
+                        ToolAuthorizationKind::McpServer => {
+                            &mut configuration.enabled_mcp_server_ids
+                        }
+                    };
+                    list.retain(|existing| existing.as_str() != id);
+                    match self.workspace.set_configuration(&project_id, configuration.clone()) {
+                        Ok(()) => match storage.save_configuration(&configuration) {
+                            Ok(()) => {
+                                self.status = format!(
+                                    "已撤销{kind_label} `{id}` 在项目 `{project_id}` 中的授权，已写入 {}。",
+                                    storage.configuration_path().display()
+                                );
+                            }
+                            Err(error) => {
+                                self.status = format!("已更新内存配置，但未写入项目文件：{error}");
+                            }
+                        },
+                        Err(error) => self.status = format!("未撤销：{error}"),
+                    }
+                }
+            }
+            cx.notify();
+        }
+
+        const fn tool_kind_label(
+            kind: ToolAuthorizationKind,
+            language: UiLanguage,
+        ) -> &'static str {
+            match kind {
+                ToolAuthorizationKind::Skill => language.choose("技能", "skill"),
+                ToolAuthorizationKind::McpServer => language.choose("MCP 服务器", "MCP server"),
+            }
+        }
+
+        fn global_tool_list_mut(
+            tools: &mut ToolAuthorizationSettings,
+            kind: ToolAuthorizationKind,
+        ) -> &mut Vec<String> {
+            match kind {
+                ToolAuthorizationKind::Skill => &mut tools.authorized_skill_ids,
+                ToolAuthorizationKind::McpServer => &mut tools.authorized_mcp_server_ids,
+            }
         }
 
         fn open_project_form(&mut self, cx: &mut Context<Self>) {
@@ -1186,199 +1585,1211 @@ fn main() {
     }
 
     impl ControlPlaneView {
+        fn agents_group_label(label: &'static str) -> impl IntoElement {
+            div()
+                .pt_1()
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(TEXT_MUTED))
+                .child(label)
+        }
+
+        fn todo_badge() -> impl IntoElement {
+            div()
+                .px_1p5()
+                .py_0p5()
+                .rounded_sm()
+                .text_xs()
+                .font_weight(FontWeight::MEDIUM)
+                .bg(rgb(0x00fe_f3c7))
+                .text_color(rgb(0x00b4_5309))
+                .child("TODO")
+        }
+
+        /// The API-key boundary note shown wherever credentials are referenced.
+        fn info_note(zh: &'static str, en: &'static str, language: UiLanguage) -> impl IntoElement {
+            div()
+                .flex()
+                .items_start()
+                .gap_2p5()
+                .p_3()
+                .rounded_lg()
+                .border_1()
+                .border_color(rgb(ACCENT_SOFT))
+                .bg(rgb(0x00f0_f9ff))
+                .child(
+                    div()
+                        .px_1p5()
+                        .py_0p5()
+                        .flex_none()
+                        .rounded_sm()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(0x000e_7490))
+                        .bg(rgb(0x00e0_f2fe))
+                        .child(language.choose("密钥边界", "Key boundary")),
+                )
+                .child(
+                    div().text_xs().text_color(rgb(TEXT_SECONDARY)).child(language.choose(zh, en)),
+                )
+        }
+
+        /// A "planned, not implemented yet" note in the style of the section placeholders.
+        fn planned_note(text: &'static str) -> impl IntoElement {
+            div()
+                .flex()
+                .items_start()
+                .gap_2p5()
+                .p_3()
+                .rounded_lg()
+                .border_1()
+                .border_color(rgb(BORDER))
+                .bg(rgb(SURFACE_BG))
+                .child(Self::todo_badge())
+                .child(div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(text))
+        }
+
+        fn labeled_field(
+            label: &'static str,
+            id: &'static str,
+            hint: Option<&'static str>,
+            state: &Entity<InputState>,
+        ) -> impl IntoElement {
+            div()
+                .v_flex()
+                .gap_1()
+                .flex_1()
+                .min_w(px(240.))
+                .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(label))
+                .child(
+                    div()
+                        .h(px(36.))
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .bg(rgb(CARD_BG))
+                        .child(
+                            InputBase::new(id)
+                                .flex_1()
+                                .h_full()
+                                .flex()
+                                .items_center()
+                                .child(state.clone()),
+                        ),
+                )
+                .when_some(hint, |this, hint| {
+                    this.child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(hint))
+                })
+        }
+
+        fn tool_authorization_row(
+            scope: ToolScope,
+            kind: ToolAuthorizationKind,
+            id: &str,
+            language: UiLanguage,
+            entity: &Entity<Self>,
+        ) -> impl IntoElement {
+            let revoker = entity.clone();
+            let owned_id = id.to_owned();
+            let scope_key = match scope {
+                ToolScope::Global => "global",
+                ToolScope::Project => "project",
+            };
+            let scope_label = match scope {
+                ToolScope::Global => language.choose("全局", "Global"),
+                ToolScope::Project => language.choose("项目", "Project"),
+            };
+            let (badge_background, badge_foreground) = match kind {
+                ToolAuthorizationKind::Skill => (0x00e0_f2fe, 0x000e_7490),
+                ToolAuthorizationKind::McpServer => (0x00f3_e8ff, 0x0076_2ba3),
+            };
+            div()
+                .id(format!("tool-row-{scope_key}-{kind:?}-{owned_id}"))
+                .flex()
+                .items_center()
+                .gap_2()
+                .p_2()
+                .rounded_md()
+                .border_1()
+                .border_color(rgb(BORDER))
+                .bg(rgb(CARD_BG))
+                .child(
+                    div()
+                        .px_1p5()
+                        .py_0p5()
+                        .rounded_sm()
+                        .text_xs()
+                        .bg(rgb(badge_background))
+                        .text_color(rgb(badge_foreground))
+                        .child(Self::tool_kind_label(kind, language)),
+                )
+                .child(div().text_sm().child(owned_id.clone()))
+                .child(
+                    div()
+                        .ml_auto()
+                        .px_1p5()
+                        .py_0p5()
+                        .rounded_sm()
+                        .text_xs()
+                        .bg(rgb(SURFACE_BG))
+                        .text_color(rgb(TEXT_SECONDARY))
+                        .child(scope_label),
+                )
+                .child(
+                    Button::new(format!("revoke-{scope_key}-{kind:?}-{owned_id}"))
+                        .ghost()
+                        .label(language.choose("撤销", "Revoke"))
+                        .on_click(move |_, _, cx| {
+                            revoker.update(cx, |view, cx| {
+                                view.revoke_tool(scope, kind, &owned_id, cx);
+                            });
+                        }),
+                )
+        }
+
         #[allow(clippy::too_many_lines)]
-        fn render_legacy_provider_form(
+        fn render_agents_page(
             &mut self,
-            _: &mut Window,
+            _window: &mut Window,
             cx: &mut Context<Self>,
         ) -> impl IntoElement {
             let entity = cx.entity().clone();
             let language = self.language;
-            let selected = self.selected_provider.min(self.providers.len() - 1);
-            let provider = &self.providers[selected];
-            let selected_provider_id = provider.id.read(cx).value().to_string();
-            let selected_is_default = selected_provider_id == self.default_provider_id;
-            let mut provider_list = div().flex().flex_wrap().gap_2();
-            for (index, provider) in self.providers.iter().enumerate() {
-                let provider_id = provider.id.read(cx).value().to_string();
-                let is_selected = index == selected;
-                let label = if provider_id == self.default_provider_id {
-                    format!("★ {provider_id}")
-                } else {
-                    provider_id.clone()
-                };
+
+            let mut runtime_cards = div().v_flex().gap_2();
+            for adapter in
+                [RuntimeAdapter::CodexAppServer, RuntimeAdapter::ClaudeCode, RuntimeAdapter::Dsh]
+            {
                 let selector = entity.clone();
-                provider_list = provider_list.child(
+                let selected = matches!(self.agents_selection, AgentsSelection::Runtime(chosen) if chosen == adapter);
+                let is_codex = adapter == RuntimeAdapter::CodexAppServer;
+                let status_label = if is_codex {
+                    self.codex_status.clone().label(language)
+                } else {
+                    String::new()
+                };
+                runtime_cards = runtime_cards.child(
                     div()
-                        .id(format!("select-provider-{index}"))
-                        .px_3()
-                        .h(px(32.))
-                        .flex()
-                        .items_center()
-                        .rounded_full()
-                        .cursor_pointer()
-                        .text_sm()
-                        .font_weight(if is_selected {
-                            FontWeight::SEMIBOLD
-                        } else {
-                            FontWeight::NORMAL
-                        })
+                        .id(format!("runtime-card-{}", adapter.label()))
+                        .v_flex()
+                        .gap_1()
+                        .p_3()
+                        .rounded_lg()
                         .border_1()
-                        .when(is_selected, |this| {
-                            this.bg(rgb(0x000e_7490))
-                                .border_color(rgb(0x000e_7490))
-                                .text_color(rgb(CARD_BG))
-                        })
-                        .when(!is_selected, |this| {
-                            this.bg(rgb(CARD_BG))
-                                .border_color(rgb(BORDER))
-                                .text_color(rgb(TEXT_SECONDARY))
-                        })
-                        .hover(|this| this.bg(rgb(SURFACE_BG)))
+                        .border_color(rgb(if selected { ACCENT } else { BORDER }))
+                        .bg(rgb(if selected { 0x00f0_f9ff } else { CARD_BG }))
+                        .cursor_pointer()
+                        .hover(|this| this.border_color(rgb(ACCENT_SOFT)))
                         .on_click(move |_, _, cx| {
                             selector.update(cx, |view, cx| {
-                                view.selected_provider = index;
+                                view.agents_selection = AgentsSelection::Runtime(adapter);
                                 cx.notify();
                             });
                         })
-                        .child(label),
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .when(is_codex, |row| {
+                                    row.child(status_dot(self.codex_status.dot()))
+                                })
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(if selected {
+                                            FontWeight::SEMIBOLD
+                                        } else {
+                                            FontWeight::MEDIUM
+                                        })
+                                        .child(adapter.label()),
+                                )
+                                .child(
+                                    div()
+                                        .ml_auto()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .when(adapter.is_placeholder(), |row| {
+                                            row.child(Self::todo_badge())
+                                        })
+                                        .when(is_codex, |row| {
+                                            row.child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(TEXT_MUTED))
+                                                    .child(status_label.clone()),
+                                            )
+                                        }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(TEXT_MUTED))
+                                .child(adapter.summary(language)),
+                        ),
                 );
             }
+
+            let selected_provider = self.selected_provider.min(self.providers.len() - 1);
+            let mut provider_cards = div().v_flex().gap_2();
+            for (index, provider) in self.providers.iter().enumerate() {
+                let selector = entity.clone();
+                let selected = self.agents_selection == AgentsSelection::Provider
+                    && index == selected_provider;
+                let provider_id = provider.id.read(cx).value().to_string();
+                let provider_name = provider.name.read(cx).value().to_string();
+                let provider_model = provider.model.read(cx).value().to_string();
+                let is_default = provider_id == self.default_provider_id;
+                provider_cards = provider_cards.child(
+                    div()
+                        .id(format!("provider-card-{index}"))
+                        .v_flex()
+                        .gap_1()
+                        .p_3()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(rgb(if selected { ACCENT } else { BORDER }))
+                        .bg(rgb(if selected { 0x00f0_f9ff } else { CARD_BG }))
+                        .cursor_pointer()
+                        .hover(|this| this.border_color(rgb(ACCENT_SOFT)))
+                        .on_click(move |_, _, cx| {
+                            selector.update(cx, |view, cx| {
+                                view.selected_provider = index;
+                                view.agents_selection = AgentsSelection::Provider;
+                                cx.notify();
+                            });
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(status_dot(if provider.enabled {
+                                    0x0022_c55e
+                                } else {
+                                    0x0094_a3b8
+                                }))
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(if selected {
+                                            FontWeight::SEMIBOLD
+                                        } else {
+                                            FontWeight::MEDIUM
+                                        })
+                                        .truncate()
+                                        .child(provider_name),
+                                )
+                                .when(is_default, |row| {
+                                    row.child(
+                                        div()
+                                            .ml_auto()
+                                            .text_xs()
+                                            .text_color(rgb(0x00b4_5309))
+                                            .child("★"),
+                                    )
+                                }),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .text_xs()
+                                .text_color(rgb(TEXT_MUTED))
+                                .child(div().truncate().child(provider_id))
+                                .child(div().truncate().child(provider_model)),
+                        ),
+                );
+            }
+
+            let tools_selected = self.agents_selection == AgentsSelection::SkillsAndMcp;
+            let global_skill_count = self.tool_authorizations.authorized_skill_ids.len();
+            let global_mcp_count = self.tool_authorizations.authorized_mcp_server_ids.len();
+            let tools_project_line = match self
+                .selected_project
+                .as_deref()
+                .and_then(|project_id| self.workspace.configuration(project_id))
+            {
+                Some(configuration) => language.choose_owned(
+                    format!(
+                        "当前项目：{} 技能 · {} MCP",
+                        configuration.enabled_skill_ids.len(),
+                        configuration.enabled_mcp_server_ids.len()
+                    ),
+                    format!(
+                        "Project: {} skills · {} MCP",
+                        configuration.enabled_skill_ids.len(),
+                        configuration.enabled_mcp_server_ids.len()
+                    ),
+                ),
+                None => language.choose("未选择项目", "No project selected").to_owned(),
+            };
+            let tools_selector = entity.clone();
+            let tools_card = div()
+                .id("tools-card")
+                .v_flex()
+                .gap_1()
+                .p_3()
+                .rounded_lg()
+                .border_1()
+                .border_color(rgb(if tools_selected { ACCENT } else { BORDER }))
+                .bg(rgb(if tools_selected { 0x00f0_f9ff } else { CARD_BG }))
+                .cursor_pointer()
+                .hover(|this| this.border_color(rgb(ACCENT_SOFT)))
+                .on_click(move |_, _, cx| {
+                    tools_selector.update(cx, |view, cx| {
+                        view.agents_selection = AgentsSelection::SkillsAndMcp;
+                        cx.notify();
+                    });
+                })
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(if tools_selected {
+                                    FontWeight::SEMIBOLD
+                                } else {
+                                    FontWeight::MEDIUM
+                                })
+                                .child(language.choose("技能与 MCP 授权", "Skills & MCP")),
+                        )
+                        .child(div().ml_auto().text_xs().text_color(rgb(TEXT_MUTED)).child(
+                            language.choose_owned(
+                                format!("全局 {global_skill_count} · {global_mcp_count}"),
+                                format!("{global_skill_count} · {global_mcp_count} global"),
+                            ),
+                        )),
+                )
+                .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(tools_project_line));
+
+            let detail = match self.agents_selection {
+                AgentsSelection::Runtime(RuntimeAdapter::CodexAppServer) => {
+                    self.render_codex_runtime_detail(cx).into_any_element()
+                }
+                AgentsSelection::Runtime(adapter) => {
+                    Self::render_placeholder_adapter_detail(adapter, language).into_any_element()
+                }
+                AgentsSelection::Provider => self.render_provider_detail(cx).into_any_element(),
+                AgentsSelection::SkillsAndMcp => self.render_skills_detail(cx).into_any_element(),
+            };
+
+            let save_runtime = entity.clone();
             let add_provider = entity.clone();
-            let remove_provider = entity.clone();
+            div()
+                .size_full()
+                .min_w(px(880.))
+                .relative()
+                .v_flex()
+                .gap_4()
+                .p_6()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .v_flex()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_xl()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(language
+                                            .choose("智能体与工具", "Agents & tools")),
+                                )
+                                .child(
+                                    div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(
+                                        language.choose(
+                                            "运行时端点、LLM Provider 与技能/MCP 授权统一在这里管理；API Key 始终只以环境变量名引用。",
+                                            "Runtime endpoints, LLM providers, and skills/MCP authorizations in one place; API keys stay environment-variable names.",
+                                        ),
+                                    ),
+                                ),
+                        )
+                        .child(
+                            Button::new("save-runtime")
+                                .primary()
+                                .label(language.choose("保存设置", "Save settings"))
+                                .on_click(move |_, _, cx| {
+                                    save_runtime.update(cx, ControlPlaneView::save_settings);
+                                }),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h(px(0.))
+                        .flex()
+                        .gap_4()
+                        .child(
+                            div()
+                                .w(px(320.))
+                                .flex_none()
+                                .v_flex()
+                                .gap_2()
+                                .child(Self::agents_group_label(
+                                    language.choose("运行时端点", "Runtime endpoints"),
+                                ))
+                                .child(runtime_cards)
+                                .child(Self::agents_group_label(
+                                    language.choose("LLM Provider", "LLM providers"),
+                                ))
+                                .child(provider_cards)
+                                .child(
+                                    Button::new("add-provider")
+                                        .label(language.choose("添加 Provider", "Add provider"))
+                                        .on_click(move |_, window, cx| {
+                                            add_provider.update(cx, |view, cx| {
+                                                view.add_provider(window, cx);
+                                            });
+                                        }),
+                                )
+                                .child(Self::agents_group_label(
+                                    language.choose("技能与 MCP", "Skills & MCP"),
+                                ))
+                                .child(tools_card),
+                        )
+                        .child(detail),
+                )
+                .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(self.status.clone()))
+        }
+
+        #[allow(clippy::too_many_lines)]
+        fn render_codex_runtime_detail(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+            let entity = cx.entity().clone();
+            let language = self.language;
+            let status = self.codex_status.clone();
+            let is_running = self.codex_process.is_some();
+            let is_starting = matches!(self.codex_status, RuntimeLifecycleStatus::Starting);
+            let starter = entity.clone();
+            let stopper = entity;
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .v_flex()
+                .gap_4()
+                .p_5()
+                .rounded_xl()
+                .border_1()
+                .border_color(rgb(BORDER))
+                .bg(rgb(CARD_BG))
+                .child(
+                    div()
+                        .flex()
+                        .items_start()
+                        .justify_between()
+                        .gap_3()
+                        .child(
+                            div()
+                                .v_flex()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_xl()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child("Codex App Server"),
+                                )
+                                .child(
+                                    div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(
+                                        language.choose(
+                                            "本地 stdio JSON-RPC 端点；由 CircuitFabric 以子进程方式启动与停止。",
+                                            "Local stdio JSON-RPC endpoint; started and stopped as a CircuitFabric child process.",
+                                        ),
+                                    ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .px_2()
+                                .py_1()
+                                .rounded_sm()
+                                .bg(rgb(SURFACE_BG))
+                                .child(status_dot(status.dot()))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child(status.label(language)),
+                                ),
+                        ),
+                )
+                .child(
+                    div()
+                        .v_flex()
+                        .gap_2()
+                        .p_4()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .bg(rgb(SURFACE_BG))
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .child(
+                                    Button::new("start-codex-runtime")
+                                        .primary()
+                                        .disabled(is_running || is_starting)
+                                        .label(language.choose("启动", "Start"))
+                                        .on_click(move |_, window, cx| {
+                                            starter.update(cx, |view, cx| {
+                                                view.start_codex_runtime(window, cx);
+                                            });
+                                        }),
+                                )
+                                .child(
+                                    Button::new("stop-codex-runtime")
+                                        .disabled(!is_running)
+                                        .label(language.choose("停止", "Stop"))
+                                        .on_click(move |_, _, cx| {
+                                            stopper.update(cx, ControlPlaneView::stop_codex_runtime);
+                                        }),
+                                ),
+                        )
+                        .child(
+                            div().text_xs().text_color(rgb(TEXT_MUTED)).child(
+                                language.choose(
+                                    "启动会先保存当前设置，然后以子进程运行 Codex App Server；运行状态不持久化，退出 CircuitFabric 时进程会随之终止。停止只终止进程，不修改已保存的设置。",
+                                    "Start saves the current settings first, then runs the Codex App Server as a child process; the running state is not persisted and ends with CircuitFabric. Stop terminates the process without changing saved settings.",
+                                ),
+                            ),
+                        ),
+                )
+                .child(
+                    div()
+                        .v_flex()
+                        .gap_3()
+                        .child(Self::labeled_field(
+                            language.choose("Codex 命令", "Codex command"),
+                            "codex-command",
+                            None,
+                            &self.command,
+                        ))
+                        .child(Self::labeled_field(
+                            language.choose("工作目录", "Working directory"),
+                            "working-directory",
+                            None,
+                            &self.working_directory,
+                        ))
+                        .child(Self::labeled_field(
+                            language.choose("JLC bridge 地址", "JLC bridge address"),
+                            "bridge-address",
+                            None,
+                            &self.bridge_address,
+                        )),
+                )
+                .child(Self::info_note(
+                    "API Key 仅以环境变量名引用（在 LLM Provider 中配置）；CircuitFabric 不保存、不回显任何密钥值。",
+                    "API keys are referenced by environment-variable name only (configured per LLM provider); CircuitFabric never stores or echoes a key value.",
+                    language,
+                ))
+        }
+
+        fn render_placeholder_adapter_detail(
+            adapter: RuntimeAdapter,
+            language: UiLanguage,
+        ) -> impl IntoElement {
+            let (description, next_step) = match adapter {
+                RuntimeAdapter::ClaudeCode => (
+                    language.choose(
+                        "Claude Code 适配器将作为第二个 agent-runtime 接入，与 Codex App Server 共享相同的端点、生命周期、授权与审计边界。",
+                        "The Claude Code adapter will join as a second agent runtime, sharing the same endpoint, lifecycle, authorization, and audit boundaries as the Codex App Server.",
+                    ),
+                    language.choose(
+                        "TODO：接入 Claude Code 运行时端点、启动/停止生命周期与授权清单。",
+                        "TODO: Add the Claude Code runtime endpoint, start/stop lifecycle, and authorization list.",
+                    ),
+                ),
+                RuntimeAdapter::Dsh | RuntimeAdapter::CodexAppServer => (
+                    language.choose(
+                        "DSH 适配器处于规划阶段，将复用统一的运行时端点与授权模型，不会引入第二套配置界面。",
+                        "The DSH adapter is planned and will reuse the unified runtime endpoint and authorization model instead of a second configuration surface.",
+                    ),
+                    language.choose(
+                        "TODO：确定 DSH 传输方式并接入统一生命周期。",
+                        "TODO: Decide the DSH transport and adopt the unified lifecycle.",
+                    ),
+                ),
+            };
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .v_flex()
+                .gap_4()
+                .p_5()
+                .rounded_xl()
+                .border_1()
+                .border_color(rgb(BORDER))
+                .bg(rgb(CARD_BG))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_xl()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(adapter.label()),
+                        )
+                        .child(Self::todo_badge()),
+                )
+                .child(div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(description))
+                .child(Self::planned_note(next_step))
+        }
+
+        #[allow(clippy::too_many_lines)]
+        fn render_provider_detail(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+            let entity = cx.entity().clone();
+            let language = self.language;
+            let selected = self.selected_provider.min(self.providers.len() - 1);
+            let provider = &self.providers[selected];
+            let provider_id = provider.id.read(cx).value().to_string();
+            let provider_name = provider.name.read(cx).value().to_string();
+            let selected_is_default = provider_id == self.default_provider_id;
             let set_default = entity.clone();
             let toggle_provider = entity.clone();
-            let toggle_vision = entity.clone();
-            div().v_flex().size_full().min_w(px(760.)).items_center().justify_center().bg(rgb(0x00f4_f7ff)).child(
+            let remove_provider = entity.clone();
+            let toggle_vision = entity;
+
+            let default_badge = selected_is_default.then(|| {
+                div()
+                    .px_1p5()
+                    .py_0p5()
+                    .rounded_sm()
+                    .text_xs()
+                    .bg(rgb(0x00fe_f3c7))
+                    .text_color(rgb(0x00b4_5309))
+                    .child(language.choose("★ 默认", "★ Default"))
+            });
+            let enabled_badge = div()
+                .px_1p5()
+                .py_0p5()
+                .rounded_sm()
+                .text_xs()
+                .bg(rgb(if provider.enabled { 0x00dc_fce7 } else { SURFACE_BG }))
+                .text_color(rgb(if provider.enabled { 0x0016_a34a } else { TEXT_MUTED }))
+                .child(if provider.enabled {
+                    language.choose("已启用", "Enabled")
+                } else {
+                    language.choose("已停用", "Disabled")
+                });
+            let vision_badge = div()
+                .px_1p5()
+                .py_0p5()
+                .rounded_sm()
+                .text_xs()
+                .bg(rgb(0x00e0_f2fe))
+                .text_color(rgb(0x000e_7490))
+                .child("Vision");
+
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .v_flex()
+                .gap_4()
+                .p_5()
+                .rounded_xl()
+                .border_1()
+                .border_color(rgb(BORDER))
+                .bg(rgb(CARD_BG))
+                .child(
+                    div()
+                        .flex()
+                        .items_start()
+                        .justify_between()
+                        .gap_3()
+                        .child(
+                            div()
+                                .v_flex()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_xl()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(provider_name),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(rgb(TEXT_MUTED))
+                                        .child(provider_id),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .when_some(default_badge, ParentElement::child)
+                                .child(enabled_badge)
+                                .when(provider.supports_vision, |row| row.child(vision_badge)),
+                        ),
+                )
+                .child(Self::info_note(
+                    "API Key 只记录环境变量名：CircuitFabric 不保存、不回显密钥值；子进程启动时直接从环境读取。",
+                    "API keys are stored as environment-variable names only: CircuitFabric never saves or echoes a key value; the child process reads it from the environment at launch.",
+                    language,
+                ))
+                .child(
+                    div()
+                        .v_flex()
+                        .gap_3()
+                        .child(
+                            div()
+                                .flex()
+                                .gap_3()
+                                .child(Self::labeled_field(
+                                    "Provider ID",
+                                    "provider-id",
+                                    None,
+                                    &provider.id,
+                                ))
+                                .child(Self::labeled_field(
+                                    language.choose("显示名称", "Display name"),
+                                    "provider-name",
+                                    None,
+                                    &provider.name,
+                                )),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap_3()
+                                .child(Self::labeled_field(
+                                    "LLM Base URL",
+                                    "provider-base-url",
+                                    None,
+                                    &provider.base_url,
+                                ))
+                                .child(Self::labeled_field(
+                                    language.choose("LLM 模型", "LLM model"),
+                                    "provider-model",
+                                    None,
+                                    &provider.model,
+                                )),
+                        )
+                        .child(Self::labeled_field(
+                            language.choose("LLM API Key 环境变量名", "LLM API key environment variable"),
+                            "provider-api-key-env",
+                            Some(language.choose(
+                                "仅环境变量名，例如 OPENAI_API_KEY；密钥值不会出现在这里。",
+                                "Environment-variable name only, e.g. OPENAI_API_KEY; the key value never appears here.",
+                            )),
+                            &provider.api_key_environment_variable,
+                        )),
+                )
+                .child(
+                    div()
+                        .v_flex()
+                        .gap_3()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .text_base()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(language.choose("Vision 配置", "Vision configuration")),
+                                )
+                                .child(
+                                    Button::new("toggle-vision")
+                                        .label(if provider.supports_vision {
+                                            language.choose("Vision：已启用", "Vision: enabled")
+                                        } else {
+                                            language.choose("Vision：已停用", "Vision: disabled")
+                                        })
+                                        .on_click(move |_, _, cx| {
+                                            toggle_vision.update(cx, ControlPlaneView::toggle_vision);
+                                        }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap_3()
+                                .child(Self::labeled_field(
+                                    "Vision Base URL",
+                                    "vision-base-url",
+                                    None,
+                                    &provider.vision_base_url,
+                                ))
+                                .child(Self::labeled_field(
+                                    language.choose("Vision 模型", "Vision model"),
+                                    "vision-model",
+                                    None,
+                                    &provider.vision_model,
+                                )),
+                        )
+                        .child(Self::labeled_field(
+                            language.choose(
+                                "Vision API Key 环境变量名",
+                                "Vision API key environment variable",
+                            ),
+                            "vision-api-key-env",
+                            Some(language.choose(
+                                "同样只保存环境变量名。",
+                                "Also an environment-variable name only.",
+                            )),
+                            &provider.vision_api_key_environment_variable,
+                        )),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(
+                            Button::new("set-default-provider")
+                                .label(if selected_is_default {
+                                    language.choose("当前为默认 Provider", "Current default provider")
+                                } else {
+                                    language.choose("设为默认 Provider", "Set as default provider")
+                                })
+                                .disabled(selected_is_default)
+                                .on_click(move |_, _, cx| {
+                                    set_default.update(cx, ControlPlaneView::set_default_provider);
+                                }),
+                        )
+                        .child(
+                            Button::new("toggle-provider")
+                                .label(if provider.enabled {
+                                    language.choose("停用", "Disable")
+                                } else {
+                                    language.choose("启用", "Enable")
+                                })
+                                .on_click(move |_, _, cx| {
+                                    toggle_provider.update(cx, ControlPlaneView::toggle_provider);
+                                }),
+                        )
+                        .child(
+                            Button::new("remove-provider")
+                                .danger()
+                                .label(language.choose("删除", "Remove"))
+                                .on_click(move |_, _, cx| {
+                                    remove_provider.update(cx, ControlPlaneView::remove_provider);
+                                }),
+                        ),
+                )
+        }
+
+        #[allow(clippy::too_many_lines)]
+        fn render_skills_detail(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+            let entity = cx.entity().clone();
+            let language = self.language;
+
+            let scope_note = match self.new_tool_scope {
+                ToolScope::Global => format!(
+                    "{} {}",
+                    language.choose(
+                        "全局授权会立即写入",
+                        "Global authorizations are written immediately to"
+                    ),
+                    self.settings_path.display()
+                ),
+                ToolScope::Project => {
+                    match self
+                        .selected_project
+                        .as_deref()
+                        .and_then(|project_id| self.project_storages.get(project_id))
+                    {
+                        Some(storage) => format!(
+                            "{} {}",
+                            language.choose(
+                                "项目授权会立即写入",
+                                "Project authorizations are written immediately to",
+                            ),
+                            storage.configuration_path().display()
+                        ),
+                        None => language
+                            .choose(
+                                "请先在「项目」页选择并打开一个项目。",
+                                "Select and open a project on the Projects page first.",
+                            )
+                            .to_owned(),
+                    }
+                }
+            };
+
+            let kind_skill = entity.clone();
+            let kind_mcp = entity.clone();
+            let scope_global = entity.clone();
+            let scope_project = entity.clone();
+            let authorizer = entity.clone();
+
+            let mut global_rows = div().v_flex().gap_2();
+            let mut global_count = 0_usize;
+            for kind in [ToolAuthorizationKind::Skill, ToolAuthorizationKind::McpServer] {
+                for id in self.tool_authorizations.ids_for_kind(kind).to_vec() {
+                    global_rows = global_rows.child(Self::tool_authorization_row(
+                        ToolScope::Global,
+                        kind,
+                        &id,
+                        language,
+                        &entity,
+                    ));
+                    global_count += 1;
+                }
+            }
+            if global_count == 0 {
+                global_rows = global_rows.child(
+                    div()
+                        .p_3()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .bg(rgb(SURFACE_BG))
+                        .text_sm()
+                        .text_color(rgb(TEXT_MUTED))
+                        .child(language.choose(
+                            "尚无全局授权——在上方添加第一条技能或 MCP 服务器。",
+                            "No global authorizations yet — add the first skill or MCP server above.",
+                        )),
+                );
+            }
+
+            let project_section = if let Some(project_id) = self.selected_project.clone() {
+                let configuration =
+                    self.workspace.configuration(&project_id).cloned().unwrap_or_default();
+                let mut rows = div().v_flex().gap_2();
+                let mut count = 0_usize;
+                for kind in [ToolAuthorizationKind::Skill, ToolAuthorizationKind::McpServer] {
+                    let ids = match kind {
+                        ToolAuthorizationKind::Skill => configuration.enabled_skill_ids.clone(),
+                        ToolAuthorizationKind::McpServer => {
+                            configuration.enabled_mcp_server_ids.clone()
+                        }
+                    };
+                    for id in ids {
+                        rows = rows.child(Self::tool_authorization_row(
+                            ToolScope::Project,
+                            kind,
+                            &id,
+                            language,
+                            &entity,
+                        ));
+                        count += 1;
+                    }
+                }
+                if count == 0 {
+                    rows = rows.child(
+                        div()
+                            .p_3()
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .bg(rgb(SURFACE_BG))
+                            .text_sm()
+                            .text_color(rgb(TEXT_MUTED))
+                            .child(language.choose(
+                                "此项目尚未授权任何技能或 MCP 服务器。",
+                                "This project has no authorized skills or MCP servers yet.",
+                            )),
+                    );
+                }
                 div()
                     .v_flex()
-                    .items_center()
-                    .gap_3()
-                    .p_8()
-                    .bg(rgb(0x00ff_ffff))
-                    .rounded_xl()
-                    .shadow_lg()
-                    .child(img(self.logo.clone()).size(px(176.)))
-                    .child(div().text_xl().child("CircuitFabric"))
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(0x004b_5563))
-                            .child("Codex App Server + JLC EDA local bridge"),
-                    )
-                    .child(
-                        div()
-                            .w(px(720.))
-                            .v_flex()
-                            .gap_3()
-                            .child(Self::field(language.choose("Codex 命令", "Codex command"), "codex-command", &self.command))
-                            .child(Self::field(
-                                language.choose("工作目录", "Working directory"),
-                                "working-directory",
-                                &self.working_directory,
-                            ))
-                            .child(Self::field(
-                                language.choose("JLC bridge 地址", "JLC bridge address"),
-                                "bridge-address",
-                                &self.bridge_address,
-                            ))
-                            .child(div().text_lg().child(language.choose("LLM Provider 管理", "LLM Provider management")))
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(rgb(0x004b_5563))
-                                    .child("可添加多个 OpenAI-compatible Provider；API Key 只填写环境变量名，不在此界面保存密钥值。"),
-                            )
-                            .child(provider_list)
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap_2()
-                                    .child(
-                                        Button::new("add-provider")
-                                            .label("添加 Provider")
-                                            .on_click(move |_, window, cx| {
-                                                add_provider.update(cx, |view, cx| {
-                                                    view.add_provider(window, cx);
-                                                });
-                                            }),
-                                    )
-                                    .child(
-                                        Button::new("remove-provider")
-                                            .label("删除当前")
-                                            .on_click(move |_, _, cx| {
-                                                remove_provider.update(cx, ControlPlaneView::remove_provider);
-                                            }),
-                                    ),
-                            )
-                            .child(div().text_sm().child(format!("当前编辑：{selected_provider_id}")))
-                            .child(Self::field("Provider ID", "provider-id", &provider.id))
-                            .child(Self::field("显示名称", "provider-name", &provider.name))
-                            .child(Self::field("LLM Base URL", "provider-base-url", &provider.base_url))
-                            .child(Self::field("LLM Model", "provider-model", &provider.model))
-                            .child(Self::field(
-                                "LLM API Key 环境变量名",
-                                "provider-api-key-env",
-                                &provider.api_key_environment_variable,
-                            ))
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap_2()
-                                    .child(
-                                        Button::new("toggle-provider")
-                                            .label(if provider.enabled { "当前：已启用" } else { "当前：已停用" })
-                                            .on_click(move |_, _, cx| {
-                                                toggle_provider.update(cx, ControlPlaneView::toggle_provider);
-                                            }),
-                                    )
-                                    .child(
-                                        Button::new("set-default-provider")
-                                            .label(if selected_is_default { "当前为默认 Provider" } else { "设为默认 Provider" })
-                                            .on_click(move |_, _, cx| {
-                                                set_default.update(cx, ControlPlaneView::set_default_provider);
-                                            }),
-                                    ),
-                            )
-                            .child(div().text_lg().child("Vision 配置"))
-                            .child(Self::field(
-                                "Vision Base URL",
-                                "vision-base-url",
-                                &provider.vision_base_url,
-                            ))
-                            .child(Self::field("Vision LLM Model", "vision-model", &provider.vision_model))
-                            .child(Self::field(
-                                "Vision API Key 环境变量名",
-                                "vision-api-key-env",
-                                &provider.vision_api_key_environment_variable,
-                            ))
-                            .child(
-                                Button::new("toggle-vision")
-                                    .label(if provider.supports_vision {
-                                        "Vision：已启用"
-                                    } else {
-                                        "Vision：已停用"
-                                    })
-                                    .on_click(move |_, _, cx| {
-                                        toggle_vision.update(cx, ControlPlaneView::toggle_vision);
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(rgb(0x004b_5563))
-                                    .child(self.status.clone()),
-                            )
-                            .child(
-                                Button::new("save-runtime")
-                                    .primary()
-                                    .label(language.choose("保存 App Server 设置", "Save App Server settings"))
-                                    .on_click(move |_, _, cx| {
-                                        entity.update(cx, ControlPlaneView::save_settings);
-                                    }),
+                    .gap_2()
+                    .child(div().text_base().font_weight(FontWeight::SEMIBOLD).child(
+                        language.choose_owned(
+                            format!("项目作用域 · {project_id}"),
+                            format!("Project scope · {project_id}"),
+                        ),
+                    ))
+                    .child(rows)
+                    .into_any_element()
+            } else {
+                div()
+                    .p_3()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .bg(rgb(SURFACE_BG))
+                    .text_sm()
+                    .text_color(rgb(TEXT_MUTED))
+                    .child(language.choose(
+                        "在「项目」页选择一个项目后，可在这里管理它的项目级授权。",
+                        "Select a project on the Projects page to manage its project-scoped authorizations here.",
+                    ))
+                    .into_any_element()
+            };
+
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .v_flex()
+                .gap_4()
+                .p_5()
+                .rounded_xl()
+                .border_1()
+                .border_color(rgb(BORDER))
+                .bg(rgb(CARD_BG))
+                .child(
+                    div()
+                        .v_flex()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xl()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(language.choose("技能与 MCP 授权", "Skills & MCP")),
+                        )
+                        .child(
+                            div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(
+                                language.choose(
+                                    "运行时可加载的技能与 MCP 服务器以授权清单为准：全局作用域对所有项目生效，项目作用域只写入该项目的配置文件。",
+                                    "Runtimes may only load authorized skills and MCP servers: the global scope applies to every project, the project scope writes to that project's own configuration file.",
+                                ),
                             ),
-                    ),
-            )
+                        ),
+                )
+                .child(
+                    div()
+                        .v_flex()
+                        .gap_2()
+                        .p_4()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .bg(rgb(SURFACE_BG))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(220.))
+                                        .h(px(36.))
+                                        .px_2()
+                                        .flex()
+                                        .items_center()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(rgb(BORDER))
+                                        .bg(rgb(CARD_BG))
+                                        .child(
+                                            InputBase::new("new-tool-id")
+                                                .flex_1()
+                                                .h_full()
+                                                .flex()
+                                                .items_center()
+                                                .child(self.new_tool_id.clone()),
+                                        ),
+                                )
+                                .child(
+                                    Button::new("tool-kind-skill")
+                                        .label(language.choose("技能", "Skill"))
+                                        .when(
+                                            self.new_tool_kind == ToolAuthorizationKind::Skill,
+                                            ButtonVariants::primary,
+                                        )
+                                        .on_click(move |_, _, cx| {
+                                            kind_skill.update(cx, |view, cx| {
+                                                view.new_tool_kind =
+                                                    ToolAuthorizationKind::Skill;
+                                                cx.notify();
+                                            });
+                                        }),
+                                )
+                                .child(
+                                    Button::new("tool-kind-mcp")
+                                        .label(language.choose("MCP 服务器", "MCP server"))
+                                        .when(
+                                            self.new_tool_kind == ToolAuthorizationKind::McpServer,
+                                            ButtonVariants::primary,
+                                        )
+                                        .on_click(move |_, _, cx| {
+                                            kind_mcp.update(cx, |view, cx| {
+                                                view.new_tool_kind =
+                                                    ToolAuthorizationKind::McpServer;
+                                                cx.notify();
+                                            });
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(1.))
+                                        .h(px(24.))
+                                        .flex_none()
+                                        .bg(rgb(BORDER)),
+                                )
+                                .child(
+                                    Button::new("tool-scope-global")
+                                        .label(language.choose("全局", "Global"))
+                                        .when(self.new_tool_scope == ToolScope::Global, |button| {
+                                            button.primary()
+                                        })
+                                        .on_click(move |_, _, cx| {
+                                            scope_global.update(cx, |view, cx| {
+                                                view.new_tool_scope = ToolScope::Global;
+                                                cx.notify();
+                                            });
+                                        }),
+                                )
+                                .child(
+                                    Button::new("tool-scope-project")
+                                        .label(language.choose("当前项目", "This project"))
+                                        .when(self.new_tool_scope == ToolScope::Project, |button| {
+                                            button.primary()
+                                        })
+                                        .on_click(move |_, _, cx| {
+                                            scope_project.update(cx, |view, cx| {
+                                                view.new_tool_scope = ToolScope::Project;
+                                                cx.notify();
+                                            });
+                                        }),
+                                )
+                                .child(
+                                    Button::new("authorize-tool")
+                                        .primary()
+                                        .label(language.choose("授权", "Authorize"))
+                                        .on_click(move |_, window, cx| {
+                                            authorizer.update(cx, |view, cx| {
+                                                view.authorize_tool(window, cx);
+                                            });
+                                        }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(TEXT_MUTED))
+                                .child(scope_note),
+                        ),
+                )
+                .child(
+                    div()
+                        .v_flex()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_base()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(language.choose(
+                                    "全局作用域（所有项目）",
+                                    "Global scope (all projects)",
+                                )),
+                        )
+                        .child(global_rows),
+                )
+                .child(project_section)
         }
     }
 
@@ -2937,6 +4348,7 @@ fn main() {
     impl Render for ControlPlaneView {
         #[allow(clippy::too_many_lines)]
         fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            self.refresh_codex_lifecycle();
             let command_palette = if self.command_palette_open {
                 Some(self.render_command_palette(cx).into_any_element())
             } else {
@@ -3043,7 +4455,7 @@ fn main() {
                     self.render_projects_page(window, cx).into_any_element()
                 }
                 ControlPlaneScreen::AgentsAndMcp => {
-                    self.render_legacy_provider_form(window, cx).into_any_element()
+                    self.render_agents_page(window, cx).into_any_element()
                 }
                 screen => Self::section_page(language, screen).into_any_element(),
             };
@@ -3121,10 +4533,25 @@ fn main() {
                                         .flex()
                                         .items_center()
                                         .gap_2()
-                                        .child(status_dot(0x0094_a3b8))
+                                        .child(status_dot(self.codex_status.dot()))
                                         .child(
                                             div().text_xs().text_color(rgb(SIDEBAR_TEXT)).child(
-                                                language.choose("运行时离线", "Runtime offline"),
+                                                match &self.codex_status {
+                                                    RuntimeLifecycleStatus::Starting => language
+                                                        .choose("Codex 启动中…", "Codex starting…"),
+                                                    RuntimeLifecycleStatus::Running { .. } => {
+                                                        language
+                                                            .choose("Codex 运行中", "Codex running")
+                                                    }
+                                                    RuntimeLifecycleStatus::Stopped => language
+                                                        .choose("运行时离线", "Runtime offline"),
+                                                    RuntimeLifecycleStatus::Failed { .. } => {
+                                                        language.choose(
+                                                            "Codex 启动失败",
+                                                            "Codex failed to start",
+                                                        )
+                                                    }
+                                                },
                                             ),
                                         ),
                                 )

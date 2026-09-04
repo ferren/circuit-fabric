@@ -99,6 +99,58 @@ impl Default for BridgeSettings {
     }
 }
 
+/// Globally authorized agent skills and MCP servers.
+///
+/// Like provider API keys, an authorization is only an identifier: which skills and MCP servers
+/// the runtimes may load application-wide. Project-scoped authorizations live in each project's
+/// own configuration instead, so the two levels never overwrite each other.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ToolAuthorizationSettings {
+    #[serde(default)]
+    pub authorized_skill_ids: Vec<String>,
+    #[serde(default)]
+    pub authorized_mcp_server_ids: Vec<String>,
+}
+
+impl ToolAuthorizationSettings {
+    /// Returns the identifier list for one authorization kind.
+    #[must_use]
+    pub fn ids_for_kind(&self, kind: ToolAuthorizationKind) -> &[String] {
+        match kind {
+            ToolAuthorizationKind::Skill => &self.authorized_skill_ids,
+            ToolAuthorizationKind::McpServer => &self.authorized_mcp_server_ids,
+        }
+    }
+
+    fn validate(&self) -> Result<(), RuntimeError> {
+        for (label, ids) in
+            [("skill", &self.authorized_skill_ids), ("MCP server", &self.authorized_mcp_server_ids)]
+        {
+            let mut seen = std::collections::BTreeSet::new();
+            for id in ids {
+                if id.trim().is_empty() || id.chars().any(char::is_whitespace) {
+                    return Err(RuntimeError::InvalidSettings(format!(
+                        "authorized {label} ID `{id}` must be non-empty and contain no whitespace"
+                    )));
+                }
+                if !seen.insert(id.clone()) {
+                    return Err(RuntimeError::InvalidSettings(format!(
+                        "authorized {label} ID `{id}` is duplicated"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Which kind of tool an authorization entry names.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToolAuthorizationKind {
+    Skill,
+    McpServer,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeSettings {
     pub codex: CodexAppServerSettings,
@@ -107,6 +159,8 @@ pub struct RuntimeSettings {
     #[serde(default)]
     pub providers: Vec<LlmProviderSettings>,
     pub bridge: BridgeSettings,
+    #[serde(default)]
+    pub tools: ToolAuthorizationSettings,
 }
 
 impl Default for RuntimeSettings {
@@ -116,6 +170,7 @@ impl Default for RuntimeSettings {
             default_provider_id: default_provider_id(),
             providers: vec![LlmProviderSettings::default()],
             bridge: BridgeSettings::default(),
+            tools: ToolAuthorizationSettings::default(),
         }
     }
 }
@@ -134,6 +189,8 @@ pub enum RuntimeError {
     WriteSettings { path: PathBuf, source: std::io::Error },
     #[error("could not launch Codex App Server using `{command}`: {source}")]
     Launch { command: String, source: std::io::Error },
+    #[error("failed to stop the supervised Codex App Server process: {0}")]
+    Stop(#[source] std::io::Error),
     #[error("Codex App Server did not expose {stream}")]
     MissingStream { stream: &'static str },
     #[error("failed to communicate with Codex App Server: {0}")]
@@ -180,6 +237,7 @@ impl RuntimeSettings {
             ));
         }
         self.validate_providers()?;
+        self.tools.validate()?;
         Ok(())
     }
 
@@ -358,30 +416,7 @@ impl CodexAppServerClient {
         settings: &CodexAppServerSettings,
         provider: &LlmProviderSettings,
     ) -> Result<Self, RuntimeError> {
-        let mut child = Command::new(&settings.command)
-            .arg("app-server")
-            .arg("--stdio")
-            .arg("--config")
-            .arg(format!("model_provider={}", toml_string(&provider.id)))
-            .arg("--config")
-            .arg(format!("model={}", toml_string(&provider.model)))
-            .arg("--config")
-            .arg(format!("model_providers.{}.name={}", provider.id, toml_string(&provider.name)))
-            .arg("--config")
-            .arg(format!(
-                "model_providers.{}.base_url={}",
-                provider.id,
-                toml_string(&provider.base_url)
-            ))
-            .arg("--config")
-            .arg(format!(
-                "model_providers.{}.env_key={}",
-                provider.id,
-                toml_string(&provider.api_key_environment_variable)
-            ))
-            .arg("--config")
-            .arg(format!("model_providers.{}.wire_api=\"responses\"", provider.id))
-            .current_dir(&settings.working_directory)
+        let mut child = app_server_command(settings, provider)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -514,6 +549,108 @@ fn toml_string(value: &str) -> String {
     serde_json::to_string(value).expect("serializing a Rust string as TOML must not fail")
 }
 
+/// Builds the `codex app-server` command line shared by the JSON-RPC client and the supervised
+/// lifecycle handle: the provider, model, base URL, and environment-variable name are forwarded
+/// as `--config` overrides, so no API key value ever appears on a command line.
+fn app_server_command(
+    settings: &CodexAppServerSettings,
+    provider: &LlmProviderSettings,
+) -> Command {
+    let mut command = Command::new(&settings.command);
+    command
+        .arg("app-server")
+        .arg("--stdio")
+        .arg("--config")
+        .arg(format!("model_provider={}", toml_string(&provider.id)))
+        .arg("--config")
+        .arg(format!("model={}", toml_string(&provider.model)))
+        .arg("--config")
+        .arg(format!("model_providers.{}.name={}", provider.id, toml_string(&provider.name)))
+        .arg("--config")
+        .arg(format!(
+            "model_providers.{}.base_url={}",
+            provider.id,
+            toml_string(&provider.base_url)
+        ))
+        .arg("--config")
+        .arg(format!(
+            "model_providers.{}.env_key={}",
+            provider.id,
+            toml_string(&provider.api_key_environment_variable)
+        ))
+        .arg("--config")
+        .arg(format!("model_providers.{}.wire_api=\"responses\"", provider.id))
+        .current_dir(&settings.working_directory);
+    command
+}
+
+/// A supervised Codex App Server child process owned by the desktop control plane.
+///
+/// The handle keeps the child's stdin pipe open so the server keeps waiting for JSON-RPC input;
+/// dropping the handle closes that pipe, and [`Self::stop`] terminates the process explicitly.
+/// This is a lifecycle surface only: JSON-RPC conversations stay owned by
+/// [`CodexAppServerClient`], whether spawned here or by a bridge.
+#[derive(Debug)]
+pub struct CodexAppServerHandle {
+    child: Child,
+}
+
+impl CodexAppServerHandle {
+    /// Starts the configured App Server as a keep-alive child process.
+    ///
+    /// stdout and stderr are discarded because the control plane does not speak JSON-RPC to this
+    /// instance; a bridge always launches its own conversation process from the same settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the process cannot be spawned.
+    pub fn launch(
+        settings: &CodexAppServerSettings,
+        provider: &LlmProviderSettings,
+    ) -> Result<Self, RuntimeError> {
+        let child = app_server_command(settings, provider)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|source| RuntimeError::Launch { command: settings.command.clone(), source })?;
+        Ok(Self { child })
+    }
+
+    /// Process identifier of the supervised App Server.
+    #[must_use]
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Non-blocking exit poll: `None` while the process is still running, `Some` with its final
+    /// status once it has terminated.
+    pub fn try_exit(&mut self) -> Option<std::process::ExitStatus> {
+        self.child.try_wait().ok().flatten()
+    }
+
+    /// Terminates the supervised process. Already-exited processes are reaped and reported as
+    /// stopped rather than as an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the process cannot be killed or reaped.
+    pub fn stop(&mut self) -> Result<(), RuntimeError> {
+        if self.try_exit().is_some() {
+            return Ok(());
+        }
+        self.child.kill().map_err(RuntimeError::Stop)?;
+        self.child.wait().map_err(RuntimeError::Stop)?;
+        Ok(())
+    }
+}
+
+impl Drop for CodexAppServerHandle {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}
+
 impl Drop for CodexAppServerClient {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -599,5 +736,94 @@ mod tests {
         assert_eq!(settings.default_provider_id, DEFAULT_PROVIDER_ID);
         assert_eq!(settings.providers[0].model, "legacy-model");
         assert_eq!(settings.providers[0].api_key_environment_variable, "LEGACY_API_KEY");
+        assert_eq!(
+            settings.tools,
+            ToolAuthorizationSettings::default(),
+            "settings saved before tool authorizations existed load an empty allow-list"
+        );
+    }
+
+    #[test]
+    fn tool_authorizations_round_trip_without_secrets() {
+        let mut settings = RuntimeSettings::default();
+        settings.tools.authorized_skill_ids = vec!["evidence-search".to_owned()];
+        settings.tools.authorized_mcp_server_ids = vec!["jlcircuit-bridge".to_owned()];
+
+        settings.validate().expect("tool authorizations are valid");
+        let encoded = serde_json::to_string(&settings).expect("settings serialize");
+        assert!(encoded.contains("evidence-search"));
+        assert!(encoded.contains("jlcircuit-bridge"));
+        let reloaded: RuntimeSettings = serde_json::from_str(&encoded).expect("settings parse");
+        assert_eq!(reloaded.tools, settings.tools);
+        assert_eq!(reloaded.tools.ids_for_kind(ToolAuthorizationKind::Skill), ["evidence-search"]);
+    }
+
+    #[test]
+    fn duplicate_or_whitespace_tool_authorizations_are_rejected() {
+        let duplicated = RuntimeSettings {
+            tools: ToolAuthorizationSettings {
+                authorized_skill_ids: vec![
+                    "evidence-search".to_owned(),
+                    "evidence-search".to_owned(),
+                ],
+                ..ToolAuthorizationSettings::default()
+            },
+            ..RuntimeSettings::default()
+        };
+        assert!(matches!(
+            duplicated.validate(),
+            Err(RuntimeError::InvalidSettings(message)) if message.contains("duplicated")
+        ));
+
+        let spaced = RuntimeSettings {
+            tools: ToolAuthorizationSettings {
+                authorized_skill_ids: vec!["two words".to_owned()],
+                ..ToolAuthorizationSettings::default()
+            },
+            ..RuntimeSettings::default()
+        };
+        assert!(matches!(
+            spaced.validate(),
+            Err(RuntimeError::InvalidSettings(message)) if message.contains("whitespace")
+        ));
+    }
+
+    #[test]
+    fn supervised_launch_reports_a_missing_command_clearly() {
+        let settings = CodexAppServerSettings {
+            command: "circuitfabric-definitely-missing-command".to_owned(),
+            ..CodexAppServerSettings::default()
+        };
+
+        let error = CodexAppServerHandle::launch(&settings, &LlmProviderSettings::default())
+            .expect_err("a missing command must not launch");
+
+        assert!(matches!(error, RuntimeError::Launch { .. }));
+    }
+
+    #[test]
+    fn app_server_arguments_forward_provider_references_not_key_values() {
+        let settings = CodexAppServerSettings::default();
+        let provider = LlmProviderSettings::default();
+
+        let arguments = app_server_command(&settings, &provider)
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert!(arguments.contains(&"app-server".to_owned()));
+        assert!(arguments.contains(&"--stdio".to_owned()));
+        assert!(
+            arguments.contains(&format!(
+                "model_providers.{}.env_key={}",
+                provider.id,
+                toml_string(&provider.api_key_environment_variable)
+            )),
+            "the API key is forwarded as an environment-variable name: {arguments:?}"
+        );
+        assert!(
+            arguments.iter().all(|argument| !argument.contains("sk-")),
+            "no key value may appear on the command line: {arguments:?}"
+        );
     }
 }

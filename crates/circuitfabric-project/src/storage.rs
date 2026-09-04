@@ -103,6 +103,12 @@ pub enum ProjectStorageError {
     MissingManifest { path: PathBuf },
     #[error("project manifest at `{path}` could not be parsed: {source}")]
     ParseManifest { path: PathBuf, source: serde_json::Error },
+    #[error("project configuration at `{path}` could not be parsed: {source}")]
+    ParseConfiguration { path: PathBuf, source: serde_json::Error },
+    #[error(
+        "project configuration at `{path}` uses unsupported schema version {found}; expected {expected}"
+    )]
+    UnsupportedConfigurationSchema { path: PathBuf, found: u32, expected: u32 },
     #[error("project manifest schema version {found} is unsupported (expected {expected})")]
     UnsupportedSchema { found: u32, expected: u32 },
     #[error("project manifest contains an invalid project: {reason}")]
@@ -262,6 +268,51 @@ impl ProjectStorage {
     #[must_use]
     pub fn document_index_path(&self) -> PathBuf {
         self.root.join(CIRCUITFABRIC_DIRECTORY).join(DOCUMENT_INDEX_FILE)
+    }
+
+    /// Loads this project's persisted configuration (skill and MCP allow-lists, instructions).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configuration file cannot be read, parsed, or has an
+    /// unsupported schema version.
+    pub fn load_configuration(&self) -> Result<ProjectConfiguration, ProjectStorageError> {
+        let path = self.configuration_path();
+        let raw = fs::read_to_string(&path).map_err(|source| ProjectStorageError::Io {
+            action: "read project configuration",
+            path: path.clone(),
+            source,
+        })?;
+        let document =
+            serde_json::from_str::<ProjectConfigurationDocument>(&raw).map_err(|source| {
+                ProjectStorageError::ParseConfiguration { path: path.clone(), source }
+            })?;
+        if document.schema_version != PROJECT_STORAGE_SCHEMA_VERSION {
+            return Err(ProjectStorageError::UnsupportedConfigurationSchema {
+                path,
+                found: document.schema_version,
+                expected: PROJECT_STORAGE_SCHEMA_VERSION,
+            });
+        }
+        Ok(document.configuration)
+    }
+
+    /// Replaces this project's persisted configuration atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configuration document cannot be serialized or written.
+    pub fn save_configuration(
+        &self,
+        configuration: &ProjectConfiguration,
+    ) -> Result<(), ProjectStorageError> {
+        Self::write_json_atomically(
+            &self.configuration_path(),
+            &ProjectConfigurationDocument {
+                schema_version: PROJECT_STORAGE_SCHEMA_VERSION,
+                configuration: configuration.clone(),
+            },
+        )
     }
 
     /// Diagnoses the required layout without creating, deleting, or modifying any path.
@@ -670,6 +721,45 @@ mod tests {
 
         let reopened = ProjectStorage::open(&root).expect("open created project");
         assert_eq!(reopened.manifest(), storage.manifest());
+        remove_test_root(&root);
+    }
+
+    #[test]
+    fn project_configuration_round_trips_through_its_root() {
+        let root = test_root("configuration");
+        let storage = ProjectStorage::create(&root, project("configured")).expect("create project");
+
+        assert_eq!(
+            storage.load_configuration().expect("default configuration"),
+            ProjectConfiguration::default(),
+            "a fresh project persists an empty allow-list"
+        );
+        let configuration = ProjectConfiguration {
+            agent_instructions: Some("Prefer cited evidence.".to_owned()),
+            enabled_skill_ids: vec!["evidence-search".to_owned()],
+            enabled_mcp_server_ids: vec!["jlcircuit-bridge".to_owned()],
+        };
+        storage.save_configuration(&configuration).expect("save configuration");
+
+        let reopened = ProjectStorage::open(&root).expect("reopen project");
+        assert_eq!(reopened.load_configuration().expect("reload configuration"), configuration);
+
+        let encoded =
+            fs::read_to_string(reopened.configuration_path()).expect("read configuration document");
+        assert!(encoded.contains("evidence-search"));
+        assert!(encoded.contains("jlcircuit-bridge"));
+        remove_test_root(&root);
+    }
+
+    #[test]
+    fn a_corrupted_configuration_is_reported_not_silently_reset() {
+        let root = test_root("configuration-corrupt");
+        let storage = ProjectStorage::create(&root, project("corrupt")).expect("create project");
+        fs::write(storage.configuration_path(), "{ not json").expect("corrupt configuration");
+
+        let error = storage.load_configuration().expect_err("corrupted configuration must fail");
+
+        assert!(matches!(error, ProjectStorageError::ParseConfiguration { .. }));
         remove_test_root(&root);
     }
 
