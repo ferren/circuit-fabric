@@ -975,6 +975,7 @@ version = "0.1.0"
 dependencies = [
  "circuitfabric-codex-runtime",
  "circuitfabric-contracts",
+ "circuitfabric-project",
  "embed-resource",
  "gpui",
  "gpui-base",

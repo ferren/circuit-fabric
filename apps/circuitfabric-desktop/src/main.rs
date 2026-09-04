@@ -290,6 +290,8 @@ fn main() {
     use std::sync::Arc;
 
     use circuitfabric_codex_runtime::{LlmProviderSettings, RuntimeSettings};
+    use circuitfabric_contracts::Project;
+    use circuitfabric_project::ProjectWorkspace;
     use gpui::{
         AppContext, Context, Entity, FontWeight, Image, ImageFormat, InteractiveElement,
         IntoElement, KeystrokeEvent, ParentElement, Render, StatefulInteractiveElement, Styled,
@@ -344,6 +346,46 @@ fn main() {
         enabled: bool,
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ProjectDetailTab {
+        Overview,
+        Documents,
+        Sessions,
+        AgentConfiguration,
+        Usage,
+    }
+
+    impl ProjectDetailTab {
+        const ALL: [Self; 5] = [
+            Self::Overview,
+            Self::Documents,
+            Self::Sessions,
+            Self::AgentConfiguration,
+            Self::Usage,
+        ];
+
+        const fn label(self, language: UiLanguage) -> &'static str {
+            match (self, language) {
+                (Self::Overview, UiLanguage::SimplifiedChinese) => "概览",
+                (Self::Documents, UiLanguage::SimplifiedChinese) => "文档",
+                (Self::Sessions, UiLanguage::SimplifiedChinese) => "会话",
+                (Self::AgentConfiguration, UiLanguage::SimplifiedChinese) => "智能体配置",
+                (Self::Usage, UiLanguage::SimplifiedChinese) => "用量",
+                (Self::Overview, UiLanguage::English) => "Overview",
+                (Self::Documents, UiLanguage::English) => "Documents",
+                (Self::Sessions, UiLanguage::English) => "Sessions",
+                (Self::AgentConfiguration, UiLanguage::English) => "Agent configuration",
+                (Self::Usage, UiLanguage::English) => "Usage",
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ProjectFilter {
+        All,
+        NeedsConfiguration,
+    }
+
     struct ControlPlaneView {
         logo: Arc<Image>,
         sidebar_mark: Arc<Image>,
@@ -360,6 +402,15 @@ fn main() {
         command_palette_open: bool,
         command_search: Entity<InputState>,
         command_selected: usize,
+        workspace: ProjectWorkspace,
+        selected_project: Option<ProjectId>,
+        project_search: Entity<InputState>,
+        project_filter: ProjectFilter,
+        project_tab: ProjectDetailTab,
+        project_form_open: bool,
+        new_project_id: Entity<InputState>,
+        new_project_name: Entity<InputState>,
+        new_project_description: Entity<InputState>,
     }
 
     impl ControlPlaneView {
@@ -439,6 +490,19 @@ fn main() {
                 }
             })
             .detach();
+            let project_search = Self::input(window, String::new(), "Search projects", cx);
+            let new_project_id = Self::input(window, String::new(), "power-supply", cx);
+            let new_project_name = Self::input(window, String::new(), "Power supply", cx);
+            let new_project_description =
+                Self::input(window, String::new(), "Optional design workspace description", cx);
+            for input in [&project_search, &new_project_id] {
+                cx.subscribe(input, |_, _, event, cx| {
+                    if let InputEvent::Change = event {
+                        cx.notify();
+                    }
+                })
+                .detach();
+            }
             Self {
                 logo: Arc::new(Image::from_bytes(ImageFormat::Png, APP_LOGO.to_vec())),
                 sidebar_mark: Arc::new(Image::from_bytes(ImageFormat::Png, SIDEBAR_MARK.to_vec())),
@@ -465,6 +529,15 @@ fn main() {
                 command_palette_open: false,
                 command_search,
                 command_selected: 0,
+                workspace: ProjectWorkspace::default(),
+                selected_project: None,
+                project_search,
+                project_filter: ProjectFilter::All,
+                project_tab: ProjectDetailTab::Overview,
+                project_form_open: false,
+                new_project_id,
+                new_project_name,
+                new_project_description,
             }
         }
 
@@ -632,6 +705,74 @@ fn main() {
                     .border_color(rgb(0x00cb_d5e1))
                     .child(Input::new(state)),
             )
+        }
+
+        fn open_project_form(&mut self, cx: &mut Context<Self>) {
+            self.project_form_open = true;
+            self.status = "填写项目 ID、名称和可选描述；ID 在当前工作区必须唯一。".to_owned();
+            cx.notify();
+        }
+
+        fn select_project(&mut self, project_id: ProjectId, cx: &mut Context<Self>) {
+            self.selected_project = Some(project_id);
+            self.project_tab = ProjectDetailTab::Overview;
+            cx.notify();
+        }
+
+        fn create_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+            let id = self.new_project_id.read(cx).value().trim().to_owned();
+            let name = self.new_project_name.read(cx).value().trim().to_owned();
+            let description = self.new_project_description.read(cx).value().trim().to_owned();
+            let project = Project {
+                id: id.clone(),
+                name,
+                description: (!description.is_empty()).then_some(description),
+            };
+
+            match self.workspace.create_project(project) {
+                Ok(()) => {
+                    self.selected_project = Some(id.clone());
+                    self.project_tab = ProjectDetailTab::Overview;
+                    self.project_form_open = false;
+                    self.new_project_id.update(cx, |state, cx| state.set_value("", window, cx));
+                    self.new_project_name.update(cx, |state, cx| state.set_value("", window, cx));
+                    self.new_project_description
+                        .update(cx, |state, cx| state.set_value("", window, cx));
+                    self.status = format!(
+                        "已创建项目 `{id}`。项目配置保持为空，直到在项目级配置中显式添加。"
+                    );
+                }
+                Err(error) => self.status = format!("未创建项目：{error}"),
+            }
+            cx.notify();
+        }
+
+        fn project_id_feedback(&self, cx: &Context<Self>) -> (&'static str, u32) {
+            let id = self.new_project_id.read(cx).value();
+            if id.trim().is_empty() {
+                ("请输入唯一项目 ID。", TEXT_MUTED)
+            } else if self.workspace.project(id.trim()).is_some() {
+                ("此项目 ID 已被使用。", 0x00dc_2626)
+            } else {
+                ("此项目 ID 可用。", 0x0016_a34a)
+            }
+        }
+
+        fn project_matches(&self, project: &Project, query: &str) -> bool {
+            let query_matches = query.is_empty()
+                || project.id.to_lowercase().contains(query)
+                || project.name.to_lowercase().contains(query)
+                || project
+                    .description
+                    .as_deref()
+                    .is_some_and(|description| description.to_lowercase().contains(query));
+            let filter_matches = match self.project_filter {
+                ProjectFilter::All => true,
+                ProjectFilter::NeedsConfiguration => {
+                    self.workspace.configuration(&project.id).is_none()
+                }
+            };
+            query_matches && filter_matches
         }
     }
 
@@ -833,6 +974,515 @@ fn main() {
     }
 
     impl ControlPlaneView {
+        #[allow(clippy::too_many_lines)]
+        fn render_projects_page(
+            &mut self,
+            _window: &mut Window,
+            cx: &mut Context<Self>,
+        ) -> impl IntoElement {
+            let entity = cx.entity().clone();
+            let language = self.language;
+            let query = self.project_search.read(cx).value().trim().to_lowercase();
+            let projects = self
+                .workspace
+                .projects()
+                .into_iter()
+                .filter(|project| self.project_matches(project, &query))
+                .cloned()
+                .collect::<Vec<_>>();
+            let selected_project =
+                self.selected_project.as_deref().and_then(|id| self.workspace.project(id)).cloned();
+            let (id_feedback, feedback_color) = self.project_id_feedback(cx);
+
+            let mut cards = div().v_flex().gap_2();
+            if projects.is_empty() {
+                cards = cards.child(
+                    div()
+                        .v_flex()
+                        .gap_2()
+                        .p_5()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .bg(rgb(CARD_BG))
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(language.choose("没有匹配的项目", "No matching projects")),
+                        )
+                        .child(div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(
+                            language.choose(
+                                "清除搜索或筛选，或创建第一个项目。",
+                                "Clear the search or filter, or create the first project.",
+                            ),
+                        )),
+                );
+            }
+            for project in projects {
+                let project_id = project.id.clone();
+                let is_selected = self.selected_project.as_deref() == Some(project.id.as_str());
+                let selector = entity.clone();
+                let description = project.description.unwrap_or_else(|| {
+                    language.choose("尚未添加项目描述", "No project description yet").to_owned()
+                });
+                cards = cards.child(
+                    div()
+                        .id(format!("project-card-{}", project.id))
+                        .v_flex()
+                        .gap_2()
+                        .p_4()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(rgb(if is_selected { ACCENT } else { BORDER }))
+                        .bg(rgb(if is_selected { 0x00f0_f9ff } else { CARD_BG }))
+                        .cursor_pointer()
+                        .hover(|this| this.border_color(rgb(ACCENT_SOFT)))
+                        .on_click(move |_, _, cx| {
+                            selector.update(cx, |view, cx| {
+                                view.select_project(project_id.clone(), cx);
+                            });
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .text_base()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(TEXT_PRIMARY))
+                                        .child(project.name),
+                                )
+                                .child(
+                                    div()
+                                        .px_2()
+                                        .py_0p5()
+                                        .rounded_sm()
+                                        .text_xs()
+                                        .bg(rgb(SURFACE_BG))
+                                        .text_color(rgb(TEXT_SECONDARY))
+                                        .child(project.id),
+                                ),
+                        )
+                        .child(div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(description))
+                        .child(
+                            div()
+                                .flex()
+                                .gap_3()
+                                .text_xs()
+                                .text_color(rgb(TEXT_MUTED))
+                                .child(language.choose("0 份文档", "0 documents"))
+                                .child(language.choose("0 个会话", "0 sessions"))
+                                .child(language.choose("尚无活动", "No activity yet")),
+                        ),
+                );
+            }
+
+            let detail = if let Some(project) = selected_project {
+                self.render_project_detail(project, cx).into_any_element()
+            } else {
+                let opener = entity.clone();
+                div()
+                    .flex_1()
+                    .v_flex()
+                    .items_center()
+                    .justify_center()
+                    .gap_3()
+                    .p_8()
+                    .bg(rgb(CARD_BG))
+                    .rounded_xl()
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(language.choose("选择一个项目", "Select a project")),
+                    )
+                    .child(
+                        div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(language.choose(
+                            "项目详情、文档、会话和项目级配置会显示在这里。",
+                            "Project details, documents, sessions, and project-scoped configuration appear here.",
+                        )),
+                    )
+                    .child(
+                        Button::new("open-project-form-empty")
+                            .primary()
+                            .label(language.choose("新建项目", "New project"))
+                            .on_click(move |_, _, cx| {
+                                opener.update(cx, ControlPlaneView::open_project_form);
+                            }),
+                    )
+                    .into_any_element()
+            };
+
+            let form = self.project_form_open.then(|| {
+                let creator = entity.clone();
+                let closer = entity.clone();
+                div()
+                    .v_flex()
+                    .gap_3()
+                    .p_4()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(ACCENT_SOFT))
+                    .bg(rgb(0x00f0_f9ff))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_base()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(language.choose("新建项目", "New project")),
+                            )
+                            .child(
+                                Button::new("close-project-form")
+                                    .ghost()
+                                    .label(language.choose("取消", "Cancel"))
+                                    .on_click(move |_, _, cx| {
+                                        closer.update(cx, |view, cx| {
+                                            view.project_form_open = false;
+                                            cx.notify();
+                                        });
+                                    }),
+                            ),
+                    )
+                    .child(Self::field("Project ID", "new-project-id", &self.new_project_id))
+                    .child(div().text_xs().text_color(rgb(feedback_color)).child(id_feedback))
+                    .child(Self::field("Name", "new-project-name", &self.new_project_name))
+                    .child(Self::field(
+                        "Description",
+                        "new-project-description",
+                        &self.new_project_description,
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                Button::new("create-project")
+                                    .primary()
+                                    .label(language.choose("创建项目", "Create project"))
+                                    .on_click(move |_, window, cx| {
+                                        creator.update(cx, |view, cx| {
+                                            view.create_project(window, cx);
+                                        });
+                                    }),
+                            )
+                            .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(
+                                language.choose(
+                                    "项目级设置不会修改全局运行时设置。",
+                                    "Project settings never modify global runtime settings.",
+                                ),
+                            )),
+                    )
+                    .into_any_element()
+            });
+
+            let open_form = entity.clone();
+            let all_filter = entity.clone();
+            let setup_filter = entity.clone();
+            div()
+                .size_full()
+                .min_w(px(880.))
+                .v_flex()
+                .gap_4()
+                .p_6()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .v_flex()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_xl()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(language.choose("项目工作区", "Project workspaces")),
+                                )
+                                .child(
+                                    div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(
+                                        language.choose(
+                                            "将项目资料、会话和授权配置限定在同一个设计工作区。",
+                                            "Keep design evidence, sessions, and authorized configuration in one workspace.",
+                                        ),
+                                    ),
+                                ),
+                        )
+                        .child(
+                            Button::new("open-project-form")
+                                .primary()
+                                .label(language.choose("新建项目", "New project"))
+                                .on_click(move |_, _, cx| {
+                                    open_form.update(cx, ControlPlaneView::open_project_form);
+                                }),
+                        ),
+                )
+                .when_some(form, ParentElement::child)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h(px(0.))
+                        .flex()
+                        .gap_4()
+                        .child(
+                            div()
+                                .w(px(330.))
+                                .flex_none()
+                                .v_flex()
+                                .gap_3()
+                                .child(
+                                    div()
+                                        .id("project-search")
+                                        .h(px(34.))
+                                        .px_2()
+                                        .flex()
+                                        .items_center()
+                                        .border_1()
+                                        .border_color(rgb(BORDER))
+                                        .rounded_md()
+                                        .bg(rgb(CARD_BG))
+                                        .child(Input::new(&self.project_search)),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .gap_2()
+                                        .child(
+                                            Button::new("project-filter-all")
+                                                .label(language.choose("全部", "All"))
+                                                .when(self.project_filter == ProjectFilter::All, |button| {
+                                                    button.primary()
+                                                })
+                                                .on_click(move |_, _, cx| {
+                                                    all_filter.update(cx, |view, cx| {
+                                                        view.project_filter = ProjectFilter::All;
+                                                        cx.notify();
+                                                    });
+                                                }),
+                                        )
+                                        .child(
+                                            Button::new("project-filter-needs-configuration")
+                                                .label(language.choose("待配置", "Needs setup"))
+                                                .when(
+                                                    self.project_filter == ProjectFilter::NeedsConfiguration,
+                                                    |button| button.primary(),
+                                                )
+                                                .on_click(move |_, _, cx| {
+                                                    setup_filter.update(cx, |view, cx| {
+                                                        view.project_filter = ProjectFilter::NeedsConfiguration;
+                                                        cx.notify();
+                                                    });
+                                                }),
+                                        ),
+                                )
+                                .child(cards),
+                        )
+                        .child(detail),
+                )
+                .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(self.status.clone()))
+        }
+
+        #[allow(clippy::too_many_lines)]
+        fn render_project_detail(
+            &mut self,
+            project: Project,
+            cx: &mut Context<Self>,
+        ) -> impl IntoElement {
+            let entity = cx.entity().clone();
+            let language = self.language;
+            let selected_tab = self.project_tab;
+            let configuration = self.workspace.configuration(&project.id).cloned();
+            let mut tabs = div().flex().gap_1().flex_wrap();
+            for tab in ProjectDetailTab::ALL {
+                let chooser = entity.clone();
+                let active = tab == selected_tab;
+                tabs = tabs.child(
+                    Button::new(format!("project-tab-{}", tab.label(UiLanguage::English)))
+                        .label(tab.label(language))
+                        .when(active, |button| button.primary())
+                        .on_click(move |_, _, cx| {
+                            chooser.update(cx, |view, cx| {
+                                view.project_tab = tab;
+                                cx.notify();
+                            });
+                        }),
+                );
+            }
+
+            let content = match selected_tab {
+                ProjectDetailTab::Overview => div()
+                    .v_flex()
+                    .gap_3()
+                    .child(
+                        div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(
+                            project.description.clone().unwrap_or_else(|| {
+                                language
+                                    .choose("尚未添加描述。", "No description has been added.")
+                                    .to_owned()
+                            }),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_3()
+                            .child(Self::project_empty_metric(language.choose("文档", "Documents")))
+                            .child(Self::project_empty_metric(language.choose("会话", "Sessions")))
+                            .child(Self::project_empty_metric(language.choose("用量", "Usage"))),
+                    )
+                    .into_any_element(),
+                ProjectDetailTab::Documents => Self::project_empty_state(
+                    language.choose("还没有授权文档", "No authorized documents yet"),
+                    language.choose(
+                        "文档登记后会显示其来源、内容哈希和可引用片段。",
+                        "Registered documents will show their source, content hash, and citation-ready fragments.",
+                    ),
+                )
+                .into_any_element(),
+                ProjectDetailTab::Sessions => Self::project_empty_state(
+                    language.choose("还没有会话", "No sessions yet"),
+                    language.choose(
+                        "此项目的智能体会话和工具调用记录将仅显示在这里。",
+                        "Agent sessions and tool calls scoped to this project will appear only here.",
+                    ),
+                )
+                .into_any_element(),
+                ProjectDetailTab::AgentConfiguration => {
+                    let scope_summary = if let Some(configuration) = configuration {
+                        format!(
+                            "{} skills · {} MCP servers",
+                            configuration.enabled_skill_ids.len(),
+                            configuration.enabled_mcp_server_ids.len()
+                        )
+                    } else {
+                        language
+                            .choose("尚无项目级覆盖项", "No project-scoped overrides")
+                            .to_owned()
+                    };
+                    div()
+                        .v_flex()
+                        .gap_3()
+                        .child(
+                            div()
+                                .text_base()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(language.choose("项目级配置", "Project-scoped configuration")),
+                        )
+                        .child(div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(scope_summary))
+                        .child(
+                            div()
+                                .p_3()
+                                .rounded_lg()
+                                .border_1()
+                                .border_color(rgb(BORDER))
+                                .bg(rgb(SURFACE_BG))
+                                .text_sm()
+                                .text_color(rgb(TEXT_SECONDARY))
+                                .child(language.choose(
+                                    "技能许可、MCP 许可和项目说明会保存在此项目作用域内。Codex 命令、Provider 和 bridge 地址是全局运行时设置，只能在“智能体与工具”中修改，不会被此项目覆盖。",
+                                    "Skill permissions, MCP permissions, and project instructions belong to this project. The Codex command, providers, and bridge address are global runtime settings; they can only be changed in Agents & tools and are never overridden here.",
+                                )),
+                        )
+                        .into_any_element()
+                }
+                ProjectDetailTab::Usage => Self::project_empty_state(
+                    language.choose("尚无用量记录", "No usage recorded"),
+                    language.choose(
+                        "用量会按项目、Provider 和运行时聚合，且不会混入其他项目。",
+                        "Usage will be grouped by project, provider, and runtime without mixing other projects.",
+                    ),
+                )
+                .into_any_element(),
+            };
+
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .v_flex()
+                .gap_4()
+                .p_5()
+                .rounded_xl()
+                .border_1()
+                .border_color(rgb(BORDER))
+                .bg(rgb(CARD_BG))
+                .child(
+                    div()
+                        .flex()
+                        .items_start()
+                        .justify_between()
+                        .gap_3()
+                        .child(
+                            div()
+                                .v_flex()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_xl()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(project.name),
+                                )
+                                .child(
+                                    div().text_sm().text_color(rgb(TEXT_MUTED)).child(project.id),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .px_2()
+                                .py_1()
+                                .rounded_sm()
+                                .bg(rgb(0x00dc_fce7))
+                                .text_xs()
+                                .text_color(rgb(0x0016_a34a))
+                                .child(language.choose("项目作用域", "Project scope")),
+                        ),
+                )
+                .child(tabs)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h(px(0.))
+                        .p_4()
+                        .rounded_lg()
+                        .bg(rgb(SURFACE_BG))
+                        .child(content),
+                )
+        }
+
+        fn project_empty_metric(label: &'static str) -> impl IntoElement {
+            div()
+                .flex_1()
+                .v_flex()
+                .gap_1()
+                .p_3()
+                .rounded_lg()
+                .border_1()
+                .border_color(rgb(BORDER))
+                .bg(rgb(CARD_BG))
+                .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child("0"))
+                .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(label))
+        }
+
+        fn project_empty_state(title: &'static str, description: &'static str) -> impl IntoElement {
+            div()
+                .v_flex()
+                .gap_2()
+                .items_center()
+                .justify_center()
+                .h_full()
+                .text_center()
+                .child(div().text_base().font_weight(FontWeight::SEMIBOLD).child(title))
+                .child(div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(description))
+        }
+
         fn section_page(language: UiLanguage, screen: ControlPlaneScreen) -> impl IntoElement {
             let (title, description, next_step) = language.page_copy(screen);
             div().size_full().min_w(px(720.)).v_flex().justify_center().items_center().p_8().child(
@@ -1225,6 +1875,12 @@ fn main() {
             let entity = cx.entity().clone();
             let active_screen = self.screen;
             let language = self.language;
+            let selected_project_label = self
+                .selected_project
+                .as_deref()
+                .and_then(|id| self.workspace.project(id))
+                .map(|project| format!("{} · {}", project.name, project.id))
+                .unwrap_or_else(|| language.choose("未选择项目", "No project selected").to_owned());
             let mut navigation = div().v_flex().gap_0p5();
             let mut current_group = "";
 
@@ -1313,6 +1969,9 @@ fn main() {
 
             let page = match active_screen {
                 ControlPlaneScreen::Overview => Self::overview_page(language).into_any_element(),
+                ControlPlaneScreen::Projects => {
+                    self.render_projects_page(window, cx).into_any_element()
+                }
                 ControlPlaneScreen::AgentsAndMcp => {
                     self.render_legacy_provider_form(window, cx).into_any_element()
                 }
@@ -1438,9 +2097,12 @@ fn main() {
                                                 .text_color(rgb(TEXT_PRIMARY))
                                                 .child(language.screen_label(active_screen)),
                                         )
-                                        .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(
-                                            language.choose("未选择项目", "No project selected"),
-                                        )),
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(TEXT_MUTED))
+                                                .child(selected_project_label),
+                                        ),
                                 )
                                 .child(
                                     div()

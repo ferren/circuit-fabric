@@ -24,9 +24,22 @@ pub enum ProjectError {
     Document(#[from] DocumentError),
 }
 
+/// Configuration deliberately owned by one project rather than the global runtime.
+///
+/// Runtime connection details and provider credentials belong to the application-wide runtime
+/// settings. This contract contains only the allow-lists and instructions that can change from
+/// one design workspace to another.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ProjectConfiguration {
+    pub agent_instructions: Option<String>,
+    pub enabled_skill_ids: Vec<String>,
+    pub enabled_mcp_server_ids: Vec<String>,
+}
+
 #[derive(Default)]
 pub struct ProjectWorkspace {
     projects: BTreeMap<ProjectId, Project>,
+    configurations: BTreeMap<ProjectId, ProjectConfiguration>,
     documents: DocumentService,
 }
 
@@ -60,6 +73,29 @@ impl ProjectWorkspace {
     #[must_use]
     pub fn projects(&self) -> Vec<&Project> {
         self.projects.values().collect()
+    }
+
+    /// Returns configuration scoped to this project only.
+    #[must_use]
+    pub fn configuration(&self, project_id: &str) -> Option<&ProjectConfiguration> {
+        self.configurations.get(project_id)
+    }
+
+    /// Replaces configuration scoped to an existing project.
+    ///
+    /// This intentionally has no access to global runtime endpoint or provider settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::NotFound`] when the project does not exist.
+    pub fn set_configuration(
+        &mut self,
+        project_id: &str,
+        configuration: ProjectConfiguration,
+    ) -> Result<(), ProjectError> {
+        self.require_project(project_id)?;
+        self.configurations.insert(project_id.to_owned(), configuration);
+        Ok(())
     }
 
     /// Registers extracted text only after its target project has been authorized.
@@ -172,5 +208,37 @@ mod tests {
             workspace.create_project(project("alpha")).expect_err("duplicate project must fail");
 
         assert_eq!(error, ProjectError::AlreadyExists("alpha".to_owned()));
+    }
+
+    #[test]
+    fn configuration_is_scoped_to_its_project() {
+        let mut workspace = ProjectWorkspace::default();
+        workspace.create_project(project("alpha")).expect("new project");
+        workspace.create_project(project("beta")).expect("new project");
+
+        workspace
+            .set_configuration(
+                "alpha",
+                ProjectConfiguration {
+                    enabled_skill_ids: vec!["document-search".to_owned()],
+                    ..ProjectConfiguration::default()
+                },
+            )
+            .expect("existing project");
+
+        assert_eq!(
+            workspace.configuration("alpha").expect("alpha configuration").enabled_skill_ids,
+            ["document-search"]
+        );
+        assert!(workspace.configuration("beta").is_none());
+    }
+
+    #[test]
+    fn configuration_requires_an_existing_project() {
+        let error = ProjectWorkspace::default()
+            .set_configuration("missing", ProjectConfiguration::default())
+            .expect_err("unknown projects cannot receive configuration");
+
+        assert_eq!(error, ProjectError::NotFound("missing".to_owned()));
     }
 }
