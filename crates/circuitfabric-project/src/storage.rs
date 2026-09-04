@@ -291,7 +291,7 @@ impl ProjectStorage {
         let candidate = self.root.join(relative_path);
         let existing_ancestor = nearest_existing_ancestor(&candidate, &self.root);
         let canonical_ancestor =
-            fs::canonicalize(&existing_ancestor).map_err(|source| ProjectStorageError::Io {
+            dunce::canonicalize(&existing_ancestor).map_err(|source| ProjectStorageError::Io {
                 action: "resolve project path",
                 path: existing_ancestor.clone(),
                 source,
@@ -304,7 +304,7 @@ impl ProjectStorage {
         }
         if candidate.exists() {
             let canonical_candidate =
-                fs::canonicalize(&candidate).map_err(|source| ProjectStorageError::Io {
+                dunce::canonicalize(&candidate).map_err(|source| ProjectStorageError::Io {
                     action: "resolve project path",
                     path: candidate.clone(),
                     source,
@@ -419,7 +419,8 @@ impl ProjectRegistry {
         }
 
         let mut registry = Self::default();
-        for entry in document.projects {
+        for mut entry in document.projects {
+            entry.canonical_root_path = dunce::simplified(&entry.canonical_root_path).to_owned();
             registry.register_entry(entry)?;
         }
         Ok(registry)
@@ -560,7 +561,7 @@ fn canonical_existing_directory(root: &Path) -> Result<PathBuf, ProjectStorageEr
     if !metadata.is_dir() {
         return Err(ProjectStorageError::RootNotDirectory { path: root.to_owned() });
     }
-    fs::canonicalize(root).map_err(|source| ProjectStorageError::Io {
+    dunce::canonicalize(root).map_err(|source| ProjectStorageError::Io {
         action: "canonicalize project root",
         path: root.to_owned(),
         source,
@@ -767,6 +768,34 @@ mod tests {
             Some(storage.root()),
             "registry preserves the canonical root after restart"
         );
+        remove_test_root(&project_root);
+        remove_test_root(&registry_root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn registry_load_strips_legacy_verbatim_prefix() {
+        let project_root = test_root("registry-verbatim-project");
+        let registry_root = test_root("registry-verbatim-app");
+        let registry_path = registry_root.join("projects.json");
+        let storage =
+            ProjectStorage::create(&project_root, project("verbatim-project")).expect("project");
+        let verbatim_root = fs::canonicalize(storage.root()).expect("verbatim root");
+        assert!(verbatim_root.to_string_lossy().starts_with(r"\\?\"));
+        let document = ProjectRegistryDocument {
+            schema_version: PROJECT_REGISTRY_SCHEMA_VERSION,
+            projects: vec![ProjectRegistryEntry {
+                project_id: "verbatim-project".to_owned(),
+                canonical_root_path: verbatim_root,
+                display_name: "Legacy".to_owned(),
+                last_opened_unix_seconds: 0,
+            }],
+        };
+        ProjectStorage::write_json_atomically(&registry_path, &document).expect("write registry");
+
+        let registry = ProjectRegistry::load(&registry_path).expect("load registry");
+
+        assert_eq!(registry.root_for("verbatim-project"), Some(storage.root()));
         remove_test_root(&project_root);
         remove_test_root(&registry_root);
     }

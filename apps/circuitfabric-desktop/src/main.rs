@@ -753,18 +753,11 @@ fn main() {
             id: &'static str,
             state: &Entity<InputState>,
         ) -> impl IntoElement {
-            div().v_flex().gap_1().child(div().text_sm().child(label)).child(
-                div()
-                    .id(id)
-                    .w_full()
-                    .h_8()
-                    .px_2()
-                    .flex()
-                    .items_center()
-                    .border_1()
-                    .border_color(rgb(0x00cb_d5e1))
-                    .child(Input::new(state)),
-            )
+            div()
+                .v_flex()
+                .gap_1()
+                .child(div().text_sm().child(label))
+                .child(div().id(id).w_full().child(Input::new(state)))
         }
 
         fn open_project_form(&mut self, cx: &mut Context<Self>) {
@@ -1238,6 +1231,7 @@ fn main() {
                 .child(
                     div()
                         .relative()
+                        .occlude()
                         .w(px(560.))
                         .v_flex()
                         .gap_4()
@@ -1580,14 +1574,7 @@ fn main() {
                                 .child(
                                     div()
                                         .id("project-search")
-                                        .h(px(34.))
-                                        .px_2()
-                                        .flex()
-                                        .items_center()
-                                        .border_1()
-                                        .border_color(rgb(BORDER))
-                                        .rounded_md()
-                                        .bg(rgb(CARD_BG))
+                                        .w_full()
                                         .child(Input::new(&self.project_search)),
                                 )
                                 .child(
@@ -2183,6 +2170,7 @@ fn main() {
                 .child(
                     div()
                         .relative()
+                        .occlude()
                         .w(px(560.))
                         .v_flex()
                         .overflow_hidden()

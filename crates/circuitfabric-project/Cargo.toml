@@ -9,6 +9,7 @@ license.workspace = true
 [dependencies]
 circuitfabric-contracts.workspace = true
 circuitfabric-document.workspace = true
+dunce.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
