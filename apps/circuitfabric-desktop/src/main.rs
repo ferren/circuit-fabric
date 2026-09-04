@@ -708,7 +708,8 @@ fn main() {
                 Self::input(window, String::new(), "Optional design workspace description", cx);
             let new_project_root =
                 Self::input(window, String::new(), "Choose an existing empty folder", cx);
-            let new_tool_id = Self::input(window, String::new(), "evidence-search", cx);
+            let new_tool_id =
+                Self::input(window, String::new(), "evidence-search, bom-export …", cx);
             for input in
                 [&project_search, &evidence_query, &new_project_id, &new_project_root, &new_tool_id]
             {
@@ -1054,11 +1055,26 @@ fn main() {
             }
         }
 
-        /// Authorizes one skill or MCP server in the selected scope, persisting immediately.
+        /// Splits a tool-authorization input into IDs: commas (ASCII, full-width, and
+        /// ideographic), semicolons, or whitespace separate items, and empty segments drop out.
+        /// IDs themselves may never contain whitespace, so the split is unambiguous.
+        fn parse_tool_ids(raw: &str) -> Vec<String> {
+            raw.split(|character: char| {
+                matches!(character, ',' | '，' | '、' | ';') || character.is_whitespace()
+            })
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(ToOwned::to_owned)
+            .collect()
+        }
+
+        /// Authorizes one or more skills / MCP servers in the selected scope, persisting
+        /// immediately. Several IDs can be pasted at once; each becomes its own list row.
         fn authorize_tool(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-            let id = self.new_tool_id.read(cx).value().trim().to_owned();
-            if id.is_empty() || id.chars().any(char::is_whitespace) {
-                "未授权：ID 不能为空且不能包含空白字符。".clone_into(&mut self.status);
+            let requested = Self::parse_tool_ids(&self.new_tool_id.read(cx).value());
+            if requested.is_empty() {
+                "未授权：请输入至少一个 ID（多项之间用逗号或空格分隔）。"
+                    .clone_into(&mut self.status);
                 cx.notify();
                 return;
             }
@@ -1068,14 +1084,28 @@ fn main() {
                 ToolScope::Global => {
                     let previous = self.tool_authorizations.clone();
                     let list = Self::global_tool_list_mut(&mut self.tool_authorizations, kind);
-                    if list.iter().any(|existing| existing == &id) {
-                        self.status = format!("`{id}` 已是全局授权的{kind_label}。");
+                    let mut authorized: Vec<String> = Vec::new();
+                    let mut skipped = 0_usize;
+                    for id in requested {
+                        if list.contains(&id) {
+                            skipped += 1;
+                        } else {
+                            list.push(id.clone());
+                            authorized.push(id);
+                        }
+                    }
+                    if authorized.is_empty() {
+                        self.status = format!("未新增：所填{kind_label}均已授权（全局作用域）。");
                         cx.notify();
                         return;
                     }
-                    list.push(id.clone());
                     list.sort();
                     list.dedup();
+                    let skipped_note = if skipped == 0 {
+                        String::new()
+                    } else {
+                        format!("（另跳过已授权的 {skipped} 项）")
+                    };
                     let settings = self.runtime_settings_from_form(cx);
                     match settings.save(&self.settings_path) {
                         Ok(()) => {
@@ -1083,7 +1113,9 @@ fn main() {
                             self.new_tool_id
                                 .update(cx, |state, cx| state.set_value("", window, cx));
                             self.status = format!(
-                                "已授权{kind_label} `{id}`（全局作用域），已写入 {}。",
+                                "已授权 {} 项{kind_label}（全局作用域）：{}{skipped_note}。已写入 {}。",
+                                authorized.len(),
+                                authorized.join("、"),
                                 self.settings_path.display()
                             );
                         }
@@ -1113,22 +1145,39 @@ fn main() {
                             &mut configuration.enabled_mcp_server_ids
                         }
                     };
-                    if list.iter().any(|existing| existing == &id) {
-                        self.status =
-                            format!("`{id}` 已是项目 `{project_id}` 授权的{kind_label}。");
+                    let mut authorized: Vec<String> = Vec::new();
+                    let mut skipped = 0_usize;
+                    for id in requested {
+                        if list.contains(&id) {
+                            skipped += 1;
+                        } else {
+                            list.push(id.clone());
+                            authorized.push(id);
+                        }
+                    }
+                    if authorized.is_empty() {
+                        self.status = format!(
+                            "未新增：所填{kind_label}均已授权（项目 `{project_id}` 作用域）。"
+                        );
                         cx.notify();
                         return;
                     }
-                    list.push(id.clone());
                     list.sort();
                     list.dedup();
+                    let skipped_note = if skipped == 0 {
+                        String::new()
+                    } else {
+                        format!("（另跳过已授权的 {skipped} 项）")
+                    };
                     match self.workspace.set_configuration(&project_id, configuration.clone()) {
                         Ok(()) => match storage.save_configuration(&configuration) {
                             Ok(()) => {
                                 self.new_tool_id
                                     .update(cx, |state, cx| state.set_value("", window, cx));
                                 self.status = format!(
-                                    "已授权{kind_label} `{id}`（项目 `{project_id}` 作用域），已写入 {}。",
+                                    "已授权 {} 项{kind_label}（项目 `{project_id}` 作用域）：{}{skipped_note}。已写入 {}。",
+                                    authorized.len(),
+                                    authorized.join("、"),
                                     storage.configuration_path().display()
                                 );
                             }
@@ -2073,6 +2122,27 @@ fn main() {
             let is_starting = matches!(self.codex_status, RuntimeLifecycleStatus::Starting);
             let starter = entity.clone();
             let stopper = entity;
+            // The endpoint launches with the default provider — the same one
+            // `runtime_settings_from_form` normalizes to — so surface that link here.
+            let launch_provider = self
+                .providers
+                .iter()
+                .find(|provider| provider.id.read(cx).value() == self.default_provider_id)
+                .or_else(|| self.providers.first());
+            let launch_provider_summary = match launch_provider {
+                Some(provider) => format!(
+                    "`{}`（{} · {}）",
+                    provider.id.read(cx).value(),
+                    provider.name.read(cx).value(),
+                    provider.model.read(cx).value()
+                ),
+                None => language
+                    .choose(
+                        "尚未配置（请先添加 Provider）",
+                        "none configured yet (add a provider first)",
+                    )
+                    .to_owned(),
+            };
             div()
                 .flex_1()
                 .min_w(px(0.))
@@ -2160,10 +2230,20 @@ fn main() {
                                 ),
                         )
                         .child(
+                            div().text_xs().text_color(rgb(TEXT_SECONDARY)).child(format!(
+                                "{}{}",
+                                language.choose(
+                                    "启动使用默认 Provider：",
+                                    "Launch uses the default provider: "
+                                ),
+                                launch_provider_summary,
+                            )),
+                        )
+                        .child(
                             div().text_xs().text_color(rgb(TEXT_MUTED)).child(
                                 language.choose(
-                                    "启动会先保存当前设置，然后以子进程运行 Codex App Server；运行状态不持久化，退出 CircuitFabric 时进程会随之终止。停止只终止进程，不修改已保存的设置。",
-                                    "Start saves the current settings first, then runs the Codex App Server as a child process; the running state is not persisted and ends with CircuitFabric. Stop terminates the process without changing saved settings.",
+                                    "启动会先保存当前设置，然后以子进程运行 Codex App Server；运行状态不持久化，退出 CircuitFabric 时进程会随之终止。停止只终止进程，不修改已保存的设置。切换 Provider：在 LLM Provider 详情中「设为默认」，再次启动即生效。",
+                                    "Start saves the current settings first, then runs the Codex App Server as a child process; the running state is not persisted and ends with CircuitFabric. Stop terminates the process without changing saved settings. To switch providers, set a default in the LLM provider detail and start again.",
                                 ),
                             ),
                         ),
@@ -2485,6 +2565,14 @@ fn main() {
                                 }),
                         ),
                 )
+                .child(
+                    div().text_xs().text_color(rgb(TEXT_MUTED)).child(
+                        language.choose(
+                            "「设为默认」后，Codex App Server 端点将使用此 Provider 启动（启动时读取，运行中的进程不受影响）。",
+                            "After \"Set as default\", the Codex App Server endpoint launches with this provider (read at start; a running process is unaffected).",
+                        ),
+                    ),
+                )
         }
 
         #[allow(clippy::too_many_lines)]
@@ -2766,6 +2854,15 @@ fn main() {
                                             });
                                         }),
                                 ),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(TEXT_MUTED))
+                                .child(language.choose(
+                                    "可以一次粘贴多个 ID（逗号或空格分隔）：每一项都会成为清单中的一行，可单独撤销。",
+                                    "Paste several IDs at once (comma- or space-separated): each becomes its own list row with an individual revoke.",
+                                )),
                         )
                         .child(
                             div()
