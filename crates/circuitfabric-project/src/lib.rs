@@ -14,8 +14,8 @@ use thiserror::Error;
 mod storage;
 
 pub use storage::{
-    PROJECT_STORAGE_SCHEMA_VERSION, ProjectLayoutDiagnostics, ProjectManifest, ProjectRegistry,
-    ProjectStorage, ProjectStorageError,
+    PROJECT_REGISTRY_SCHEMA_VERSION, PROJECT_STORAGE_SCHEMA_VERSION, ProjectLayoutDiagnostics,
+    ProjectManifest, ProjectRegistry, ProjectRegistryEntry, ProjectStorage, ProjectStorageError,
 };
 
 #[derive(Debug, Error, Eq, PartialEq)]

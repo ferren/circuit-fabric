@@ -18,6 +18,8 @@ use crate::ProjectConfiguration;
 
 /// Version of the persisted workspace manifest and its companion metadata files.
 pub const PROJECT_STORAGE_SCHEMA_VERSION: u32 = 1;
+/// Version of the application-level project registry document.
+pub const PROJECT_REGISTRY_SCHEMA_VERSION: u32 = 1;
 
 const CIRCUITFABRIC_DIRECTORY: &str = ".circuitfabric";
 const MANIFEST_FILE: &str = "project.json";
@@ -131,6 +133,16 @@ pub enum ProjectStorageError {
     ProjectIdAlreadyRegistered { project_id: ProjectId, root: PathBuf },
     #[error("project root `{root}` is already registered for project `{project_id}`")]
     RootAlreadyRegistered { root: PathBuf, project_id: ProjectId },
+    #[error("project `{project_id}` is not registered")]
+    ProjectNotRegistered { project_id: ProjectId },
+    #[error("cannot read project registry `{path}`: {source}")]
+    ReadRegistry { path: PathBuf, source: io::Error },
+    #[error("cannot parse project registry `{path}`: {source}")]
+    ParseRegistry { path: PathBuf, source: serde_json::Error },
+    #[error(
+        "project registry `{path}` uses unsupported schema version {found}; expected {expected}"
+    )]
+    UnsupportedRegistrySchema { path: PathBuf, found: u32, expected: u32 },
     #[error("failed to {action} `{path}`: {source}")]
     Io {
         action: &'static str,
@@ -352,17 +364,105 @@ impl ProjectStorage {
     }
 }
 
-/// In-memory application-level index of open project roots.
+/// A non-secret application-level record for a registered project root.
 ///
-/// Persistence of this registry is deliberately a subsequent concern. The registry's current
-/// role is to enforce one canonical root and one root binding per `ProjectId` for a running app.
+/// The project manifest inside the root remains authoritative. These records only let the
+/// desktop restore a list of known roots after a restart.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectRegistryEntry {
+    pub project_id: ProjectId,
+    pub canonical_root_path: PathBuf,
+    pub display_name: String,
+    pub last_opened_unix_seconds: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectRegistryDocument {
+    schema_version: u32,
+    projects: Vec<ProjectRegistryEntry>,
+}
+
+/// Persistable application-level index of project roots.
+///
+/// It enforces one canonical root and one root binding per `ProjectId`, while keeping runtime
+/// connection settings and secrets out of this project-scoped data model.
 #[derive(Debug, Default)]
 pub struct ProjectRegistry {
     roots_by_project_id: BTreeMap<ProjectId, PathBuf>,
     project_ids_by_root: BTreeMap<PathBuf, ProjectId>,
+    entries_by_project_id: BTreeMap<ProjectId, ProjectRegistryEntry>,
 }
 
 impl ProjectRegistry {
+    /// Loads a project registry document.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the registry cannot be read, parsed, or has an unsupported schema.
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, ProjectStorageError> {
+        let path = path.as_ref();
+        let raw = fs::read_to_string(path).map_err(|source| ProjectStorageError::ReadRegistry {
+            path: path.to_owned(),
+            source,
+        })?;
+        let document = serde_json::from_str::<ProjectRegistryDocument>(&raw).map_err(|source| {
+            ProjectStorageError::ParseRegistry { path: path.to_owned(), source }
+        })?;
+        if document.schema_version != PROJECT_REGISTRY_SCHEMA_VERSION {
+            return Err(ProjectStorageError::UnsupportedRegistrySchema {
+                path: path.to_owned(),
+                found: document.schema_version,
+                expected: PROJECT_REGISTRY_SCHEMA_VERSION,
+            });
+        }
+
+        let mut registry = Self::default();
+        for entry in document.projects {
+            registry.register_entry(entry)?;
+        }
+        Ok(registry)
+    }
+
+    /// Loads an existing registry or starts a new empty one if its file is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns errors other than a missing registry file.
+    pub fn load_or_default(path: impl AsRef<Path>) -> Result<Self, ProjectStorageError> {
+        match Self::load(path.as_ref()) {
+            Ok(registry) => Ok(registry),
+            Err(ProjectStorageError::ReadRegistry { source, .. })
+                if source.kind() == io::ErrorKind::NotFound =>
+            {
+                Ok(Self::default())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Saves the registry atomically at an application-level path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry directory or file cannot be written.
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<(), ProjectStorageError> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|source| ProjectStorageError::Io {
+                action: "create project registry directory",
+                path: parent.to_owned(),
+                source,
+            })?;
+        }
+        let document = ProjectRegistryDocument {
+            schema_version: PROJECT_REGISTRY_SCHEMA_VERSION,
+            projects: self.entries().cloned().collect(),
+        };
+        ProjectStorage::write_json_atomically(path, &document)
+    }
+
     /// Opens a root and records its canonical project identity in this registry.
     ///
     /// # Errors
@@ -383,28 +483,66 @@ impl ProjectRegistry {
     ///
     /// Returns an error if the project ID or canonical root is already registered.
     pub fn register(&mut self, storage: &ProjectStorage) -> Result<(), ProjectStorageError> {
-        let project_id = storage.manifest().project.id.clone();
-        if let Some(root) = self.roots_by_project_id.get(&project_id) {
-            return Err(ProjectStorageError::ProjectIdAlreadyRegistered {
-                project_id,
-                root: root.clone(),
-            });
-        }
-        if let Some(project_id) = self.project_ids_by_root.get(storage.root()) {
-            return Err(ProjectStorageError::RootAlreadyRegistered {
-                root: storage.root().to_owned(),
-                project_id: project_id.clone(),
-            });
-        }
-        self.roots_by_project_id.insert(project_id.clone(), storage.root().to_owned());
-        self.project_ids_by_root.insert(storage.root().to_owned(), project_id);
-        Ok(())
+        self.register_entry(ProjectRegistryEntry {
+            project_id: storage.manifest().project.id.clone(),
+            canonical_root_path: storage.root().to_owned(),
+            display_name: storage.manifest().project.name.clone(),
+            last_opened_unix_seconds: now_unix_seconds(),
+        })
     }
 
     #[must_use]
     pub fn root_for(&self, project_id: &str) -> Option<&Path> {
         self.roots_by_project_id.get(project_id).map(PathBuf::as_path)
     }
+
+    #[must_use]
+    pub fn entry_for(&self, project_id: &str) -> Option<&ProjectRegistryEntry> {
+        self.entries_by_project_id.get(project_id)
+    }
+
+    pub fn entries(&self) -> impl Iterator<Item = &ProjectRegistryEntry> {
+        self.entries_by_project_id.values()
+    }
+
+    /// Records a successful project open without changing its root binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the project ID is absent from the registry.
+    pub fn mark_opened(&mut self, project_id: &str) -> Result<(), ProjectStorageError> {
+        let Some(entry) = self.entries_by_project_id.get_mut(project_id) else {
+            return Err(ProjectStorageError::ProjectNotRegistered {
+                project_id: project_id.to_owned(),
+            });
+        };
+        entry.last_opened_unix_seconds = now_unix_seconds();
+        Ok(())
+    }
+
+    fn register_entry(&mut self, entry: ProjectRegistryEntry) -> Result<(), ProjectStorageError> {
+        let project_id = entry.project_id.clone();
+        if let Some(root) = self.roots_by_project_id.get(&project_id) {
+            return Err(ProjectStorageError::ProjectIdAlreadyRegistered {
+                project_id,
+                root: root.clone(),
+            });
+        }
+        if let Some(project_id) = self.project_ids_by_root.get(&entry.canonical_root_path) {
+            return Err(ProjectStorageError::RootAlreadyRegistered {
+                root: entry.canonical_root_path.clone(),
+                project_id: project_id.clone(),
+            });
+        }
+        self.roots_by_project_id.insert(project_id.clone(), entry.canonical_root_path.clone());
+        self.project_ids_by_root.insert(entry.canonical_root_path.clone(), project_id.clone());
+        self.entries_by_project_id.insert(project_id, entry);
+        Ok(())
+    }
+}
+
+fn now_unix_seconds() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
 fn canonical_existing_directory(root: &Path) -> Result<PathBuf, ProjectStorageError> {
@@ -606,5 +744,30 @@ mod tests {
         assert_eq!(registry.root_for("shared-id"), Some(first.root()));
         remove_test_root(&first_root);
         remove_test_root(&second_root);
+    }
+
+    #[test]
+    fn registry_persists_canonical_roots_for_restart_recovery() {
+        let project_root = test_root("registry-persist-project");
+        let registry_root = test_root("registry-persist-app");
+        let registry_path = registry_root.join("projects.json");
+        let storage =
+            ProjectStorage::create(&project_root, project("persistent-project")).expect("project");
+        let mut registry = ProjectRegistry::default();
+
+        registry.register(&storage).expect("register project");
+        registry.save(&registry_path).expect("save registry");
+        let reopened = ProjectRegistry::load(&registry_path).expect("reload registry");
+
+        let entry = reopened.entry_for("persistent-project").expect("registered entry");
+        assert_eq!(entry.canonical_root_path, storage.root());
+        assert_eq!(entry.display_name, "Project persistent-project");
+        assert_eq!(
+            reopened.root_for("persistent-project"),
+            Some(storage.root()),
+            "registry preserves the canonical root after restart"
+        );
+        remove_test_root(&project_root);
+        remove_test_root(&registry_root);
     }
 }

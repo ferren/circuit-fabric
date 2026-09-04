@@ -287,11 +287,14 @@ fn main() {
 #[cfg(feature = "native-ui")]
 #[allow(clippy::too_many_lines)]
 fn main() {
-    use std::sync::Arc;
+    use std::{
+        path::{Path, PathBuf},
+        sync::Arc,
+    };
 
     use circuitfabric_codex_runtime::{LlmProviderSettings, RuntimeSettings};
     use circuitfabric_contracts::Project;
-    use circuitfabric_project::ProjectWorkspace;
+    use circuitfabric_project::{ProjectRegistry, ProjectStorage, ProjectWorkspace};
     use gpui::{
         AppContext, Context, Entity, FontWeight, Image, ImageFormat, InteractiveElement,
         IntoElement, KeystrokeEvent, ParentElement, Render, StatefulInteractiveElement, Styled,
@@ -304,6 +307,7 @@ fn main() {
         input::{Input, InputEvent, InputState},
         scroll::ScrollableElement as _,
     };
+    use rfd::FileDialog;
 
     const APP_LOGO: &[u8] =
         include_bytes!("../../../assets/branding/circuitfabric-logo-v3-framed-transparent.png");
@@ -403,6 +407,8 @@ fn main() {
         command_search: Entity<InputState>,
         command_selected: usize,
         workspace: ProjectWorkspace,
+        project_registry: ProjectRegistry,
+        project_registry_path: PathBuf,
         selected_project: Option<ProjectId>,
         project_search: Entity<InputState>,
         project_filter: ProjectFilter,
@@ -411,9 +417,50 @@ fn main() {
         new_project_id: Entity<InputState>,
         new_project_name: Entity<InputState>,
         new_project_description: Entity<InputState>,
+        new_project_root: Entity<InputState>,
     }
 
     impl ControlPlaneView {
+        fn project_registry_path(settings_path: &Path) -> PathBuf {
+            settings_path.with_file_name("projects.json")
+        }
+
+        fn restore_project_workspace(
+            registry_path: &Path,
+        ) -> (ProjectRegistry, ProjectWorkspace, Vec<String>) {
+            let registry = match ProjectRegistry::load_or_default(registry_path) {
+                Ok(registry) => registry,
+                Err(error) => {
+                    return (
+                        ProjectRegistry::default(),
+                        ProjectWorkspace::default(),
+                        vec![format!("项目注册表未加载：{error}")],
+                    );
+                }
+            };
+            let mut workspace = ProjectWorkspace::default();
+            let mut diagnostics = Vec::new();
+            for entry in registry.entries() {
+                match ProjectStorage::open(&entry.canonical_root_path) {
+                    Ok(storage) if storage.manifest().project.id == entry.project_id => {
+                        if let Err(error) =
+                            workspace.create_project(storage.manifest().project.clone())
+                        {
+                            diagnostics.push(format!("未恢复项目 `{}`：{error}", entry.project_id));
+                        }
+                    }
+                    Ok(_) => diagnostics.push(format!(
+                        "项目 `{}` 的根目录身份已变化，未自动打开。",
+                        entry.project_id
+                    )),
+                    Err(error) => {
+                        diagnostics.push(format!("项目 `{}` 无法打开：{error}", entry.project_id));
+                    }
+                }
+            }
+            (registry, workspace, diagnostics)
+        }
+
         fn input(
             window: &mut Window,
             value: String,
@@ -465,6 +512,9 @@ fn main() {
         fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
             let settings_path = RuntimeSettings::default_path();
             let settings = RuntimeSettings::load_or_default(&settings_path).unwrap_or_default();
+            let project_registry_path = Self::project_registry_path(&settings_path);
+            let (project_registry, workspace, project_restore_diagnostics) =
+                Self::restore_project_workspace(&project_registry_path);
             let providers = settings
                 .providers
                 .iter()
@@ -495,7 +545,9 @@ fn main() {
             let new_project_name = Self::input(window, String::new(), "Power supply", cx);
             let new_project_description =
                 Self::input(window, String::new(), "Optional design workspace description", cx);
-            for input in [&project_search, &new_project_id] {
+            let new_project_root =
+                Self::input(window, String::new(), "Choose an existing empty folder", cx);
+            for input in [&project_search, &new_project_id, &new_project_root] {
                 cx.subscribe(input, |_, _, event, cx| {
                     if let InputEvent::Change = event {
                         cx.notify();
@@ -503,6 +555,11 @@ fn main() {
                 })
                 .detach();
             }
+            let status = if project_restore_diagnostics.is_empty() {
+                "项目列表已恢复；全局运行时设置尚未修改。".to_owned()
+            } else {
+                format!("项目恢复提示：{}", project_restore_diagnostics.join("；"))
+            };
             Self {
                 logo: Arc::new(Image::from_bytes(ImageFormat::Png, APP_LOGO.to_vec())),
                 sidebar_mark: Arc::new(Image::from_bytes(ImageFormat::Png, SIDEBAR_MARK.to_vec())),
@@ -525,11 +582,13 @@ fn main() {
                 screen: ControlPlaneScreen::Overview,
                 language: UiLanguage::SimplifiedChinese,
                 settings_path,
-                status: "尚未保存。Provider 只保存 API Key 环境变量名，不会保存密钥值。".to_owned(),
+                status,
                 command_palette_open: false,
                 command_search,
                 command_selected: 0,
-                workspace: ProjectWorkspace::default(),
+                workspace,
+                project_registry,
+                project_registry_path,
                 selected_project: None,
                 project_search,
                 project_filter: ProjectFilter::All,
@@ -538,6 +597,7 @@ fn main() {
                 new_project_id,
                 new_project_name,
                 new_project_description,
+                new_project_root,
             }
         }
 
@@ -709,12 +769,106 @@ fn main() {
 
         fn open_project_form(&mut self, cx: &mut Context<Self>) {
             self.project_form_open = true;
-            self.status = "填写项目 ID、名称和可选描述；ID 在当前工作区必须唯一。".to_owned();
+            "选择一个已有文件夹，再确认创建受管理的项目目录。".clone_into(&mut self.status);
             cx.notify();
         }
 
+        fn choose_project_root(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+            if let Some(root) = FileDialog::new().set_title("选择项目根文件夹").pick_folder()
+            {
+                self.new_project_root.update(cx, |state, cx| {
+                    state.set_value(root.display().to_string(), window, cx);
+                });
+                self.status =
+                    format!("已选择项目根文件夹：{}。创建前不会修改该文件夹。", root.display());
+            }
+            cx.notify();
+        }
+
+        fn persist_project_registry(&self) -> Result<(), String> {
+            self.project_registry
+                .save(&self.project_registry_path)
+                .map_err(|error| error.to_string())
+        }
+
         fn select_project(&mut self, project_id: ProjectId, cx: &mut Context<Self>) {
+            if let Err(error) = self.project_registry.mark_opened(&project_id) {
+                self.status = format!("项目已打开，但未能记录最近活动：{error}");
+            } else if let Err(error) = self.persist_project_registry() {
+                self.status = format!("项目已打开，但未能保存项目注册表：{error}");
+            }
             self.selected_project = Some(project_id);
+            self.project_tab = ProjectDetailTab::Overview;
+            cx.notify();
+        }
+
+        fn open_existing_project(&mut self, cx: &mut Context<Self>) {
+            let Some(root) =
+                FileDialog::new().set_title("打开已有 CircuitFabric 项目").pick_folder()
+            else {
+                return;
+            };
+            let storage = match ProjectStorage::open(&root) {
+                Ok(storage) => storage,
+                Err(error) => {
+                    self.status = format!("未打开项目：{error}");
+                    cx.notify();
+                    return;
+                }
+            };
+            let diagnostics = storage.diagnose_layout();
+            if !diagnostics.is_healthy() {
+                self.status = format!(
+                    "项目未注册：目录布局不完整或不安全（缺失：{}；不安全：{}）。",
+                    diagnostics
+                        .missing_entries
+                        .iter()
+                        .map(|entry| entry.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join("、"),
+                    diagnostics
+                        .unsafe_entries
+                        .iter()
+                        .map(|entry| entry.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join("、"),
+                );
+                cx.notify();
+                return;
+            }
+
+            let project = storage.manifest().project.clone();
+            if let Some(registered_root) = self.project_registry.root_for(&project.id) {
+                if registered_root != storage.root() {
+                    self.status = format!(
+                        "未打开项目：项目 ID `{}` 已绑定到 {}。",
+                        project.id,
+                        registered_root.display()
+                    );
+                    cx.notify();
+                    return;
+                }
+            } else if let Err(error) = self.project_registry.register(&storage) {
+                self.status = format!("未注册已有项目：{error}");
+                cx.notify();
+                return;
+            }
+            if self.workspace.project(&project.id).is_none()
+                && let Err(error) = self.workspace.create_project(project.clone())
+            {
+                self.status = format!("未打开项目：{error}");
+                cx.notify();
+                return;
+            }
+            if let Err(error) = self.project_registry.mark_opened(&project.id) {
+                self.status = format!("项目已打开，但未能记录最近活动：{error}");
+            } else if let Err(error) = self.persist_project_registry() {
+                self.status = format!("项目已打开，但未能保存项目注册表：{error}");
+            } else {
+                self.status =
+                    format!("已打开项目 `{}`：{}。", project.id, storage.root().display());
+            }
+            self.selected_project = Some(project.id);
             self.project_tab = ProjectDetailTab::Overview;
             cx.notify();
         }
@@ -723,25 +877,63 @@ fn main() {
             let id = self.new_project_id.read(cx).value().trim().to_owned();
             let name = self.new_project_name.read(cx).value().trim().to_owned();
             let description = self.new_project_description.read(cx).value().trim().to_owned();
+            let root = self.new_project_root.read(cx).value().trim().to_owned();
+            if root.is_empty() {
+                "未创建项目：请先选择项目根文件夹。".clone_into(&mut self.status);
+                cx.notify();
+                return;
+            }
+            if self.workspace.project(&id).is_some() {
+                self.status = format!("未创建项目：项目 ID `{id}` 已被使用。");
+                cx.notify();
+                return;
+            }
             let project = Project {
                 id: id.clone(),
                 name,
                 description: (!description.is_empty()).then_some(description),
             };
 
-            match self.workspace.create_project(project) {
-                Ok(()) => {
-                    self.selected_project = Some(id.clone());
-                    self.project_tab = ProjectDetailTab::Overview;
-                    self.project_form_open = false;
-                    self.new_project_id.update(cx, |state, cx| state.set_value("", window, cx));
-                    self.new_project_name.update(cx, |state, cx| state.set_value("", window, cx));
-                    self.new_project_description
-                        .update(cx, |state, cx| state.set_value("", window, cx));
-                    self.status = format!(
-                        "已创建项目 `{id}`。项目配置保持为空，直到在项目级配置中显式添加。"
-                    );
-                }
+            match ProjectStorage::create(&root, project.clone()) {
+                Ok(storage) => match self.project_registry.register(&storage) {
+                    Ok(()) => match self.workspace.create_project(project) {
+                        Ok(()) => {
+                            let persistence_error = self.persist_project_registry().err();
+                            self.selected_project = Some(id.clone());
+                            self.project_tab = ProjectDetailTab::Overview;
+                            self.project_form_open = false;
+                            self.new_project_id
+                                .update(cx, |state, cx| state.set_value("", window, cx));
+                            self.new_project_name
+                                .update(cx, |state, cx| state.set_value("", window, cx));
+                            self.new_project_description
+                                .update(cx, |state, cx| state.set_value("", window, cx));
+                            self.new_project_root
+                                .update(cx, |state, cx| state.set_value("", window, cx));
+                            self.status = match persistence_error {
+                                Some(error) => format!(
+                                    "项目文件已创建于 {}，但项目注册表未保存：{error}。",
+                                    storage.root().display()
+                                ),
+                                None => {
+                                    format!("已创建项目 `{id}`：{}。", storage.root().display())
+                                }
+                            };
+                        }
+                        Err(error) => {
+                            self.status = format!(
+                                "项目文件已创建于 {}，但未能加入当前工作区：{error}。",
+                                storage.root().display()
+                            );
+                        }
+                    },
+                    Err(error) => {
+                        self.status = format!(
+                            "项目文件已创建于 {}，但未能注册：{error}。文件未被删除。",
+                            storage.root().display()
+                        );
+                    }
+                },
                 Err(error) => self.status = format!("未创建项目：{error}"),
             }
             cx.notify();
@@ -1006,6 +1198,21 @@ fn main() {
             };
             let creator = entity.clone();
             let closer = entity.clone();
+            let root_chooser = entity.clone();
+            let selected_root = self.new_project_root.read(cx).value().trim().to_owned();
+            let creation_preview = if selected_root.is_empty() {
+                language
+                    .choose(
+                        "请选择一个已有文件夹；在确认创建前，不会写入任何文件。",
+                        "Choose an existing folder; no files are written until confirmation.",
+                    )
+                    .to_owned()
+            } else {
+                format!(
+                    "{}\n  .circuitfabric/、sessions/、documents/、logic/、schematics/",
+                    language.choose("将在以下根目录创建：", "Will create under:"),
+                ) + &format!("\n  {selected_root}")
+            };
 
             div()
                 .absolute()
@@ -1074,6 +1281,59 @@ fn main() {
                         ))
                         .child(
                             div()
+                                .v_flex()
+                                .gap_1()
+                                .child(
+                                    div().text_sm().font_weight(FontWeight::MEDIUM).child(
+                                        language.choose("项目根文件夹", "Project root folder"),
+                                    ),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .h(px(36.))
+                                                .px_2()
+                                                .flex_1()
+                                                .flex()
+                                                .items_center()
+                                                .rounded_md()
+                                                .border_1()
+                                                .border_color(rgb(BORDER))
+                                                .bg(rgb(CARD_BG))
+                                                .child(
+                                                    InputBase::new("new-project-root")
+                                                        .flex_1()
+                                                        .h_full()
+                                                        .flex()
+                                                        .items_center()
+                                                        .child(self.new_project_root.clone()),
+                                                ),
+                                        )
+                                        .child(
+                                            Button::new("choose-project-root")
+                                                .label(
+                                                    language.choose("选择文件夹", "Choose folder"),
+                                                )
+                                                .on_click(move |_, window, cx| {
+                                                    root_chooser.update(cx, |view, cx| {
+                                                        view.choose_project_root(window, cx);
+                                                    });
+                                                }),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .whitespace_normal()
+                                .text_xs()
+                                .text_color(rgb(TEXT_MUTED))
+                                .child(creation_preview),
+                        )
+                        .child(
+                            div()
                                 .flex()
                                 .items_center()
                                 .justify_between()
@@ -1087,7 +1347,7 @@ fn main() {
                                 .child(
                                     Button::new("create-project")
                                         .primary()
-                                        .label(language.choose("创建项目", "Create project"))
+                                        .label(language.choose("确认并创建", "Confirm and create"))
                                         .on_click(move |_, window, cx| {
                                             creator.update(cx, |view, cx| {
                                                 view.create_project(window, cx);
@@ -1150,6 +1410,10 @@ fn main() {
                 let description = project.description.unwrap_or_else(|| {
                     language.choose("尚未添加项目描述", "No project description yet").to_owned()
                 });
+                let root = self.project_registry.root_for(&project.id).map_or_else(
+                    || language.choose("根目录未注册", "Root not registered").to_owned(),
+                    |path| path.display().to_string(),
+                );
                 cards = cards.child(
                     div()
                         .id(format!("project-card-{}", project.id))
@@ -1191,6 +1455,7 @@ fn main() {
                                 ),
                         )
                         .child(div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(description))
+                        .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(root))
                         .child(
                             div()
                                 .flex()
@@ -1243,6 +1508,7 @@ fn main() {
             };
 
             let open_form = entity.clone();
+            let open_existing = entity.clone();
             let all_filter = entity.clone();
             let setup_filter = entity.clone();
             div()
@@ -1277,12 +1543,26 @@ fn main() {
                                 ),
                         )
                         .child(
-                            Button::new("open-project-form")
-                                .primary()
-                                .label(language.choose("新建项目", "New project"))
-                                .on_click(move |_, _, cx| {
-                                    open_form.update(cx, ControlPlaneView::open_project_form);
-                                }),
+                            div()
+                                .flex()
+                                .gap_2()
+                                .child(
+                                    Button::new("open-existing-project")
+                                        .label(language.choose("打开已有项目", "Open existing"))
+                                        .on_click(move |_, _, cx| {
+                                            open_existing.update(cx, |view, cx| {
+                                                view.open_existing_project(cx);
+                                            });
+                                        }),
+                                )
+                                .child(
+                                    Button::new("open-project-form")
+                                        .primary()
+                                        .label(language.choose("新建项目", "New project"))
+                                        .on_click(move |_, _, cx| {
+                                            open_form.update(cx, ControlPlaneView::open_project_form);
+                                        }),
+                                ),
                         ),
                 )
                 .child(
@@ -1360,6 +1640,10 @@ fn main() {
             let language = self.language;
             let selected_tab = self.project_tab;
             let configuration = self.workspace.configuration(&project.id).cloned();
+            let project_root = self.project_registry.root_for(&project.id).map_or_else(
+                || language.choose("根目录未注册", "Root not registered").to_owned(),
+                |path| path.display().to_string(),
+            );
             let mut tabs = div().flex().gap_1().flex_wrap();
             for tab in ProjectDetailTab::ALL {
                 let chooser = entity.clone();
@@ -1389,6 +1673,21 @@ fn main() {
                                     .to_owned()
                             }),
                         ),
+                    )
+                    .child(
+                        div()
+                            .p_3()
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .bg(rgb(SURFACE_BG))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_MUTED))
+                                    .child(language.choose("项目根目录", "Project root")),
+                            )
+                            .child(div().text_sm().text_color(rgb(TEXT_PRIMARY)).child(project_root)),
                     )
                     .child(
                         div()
