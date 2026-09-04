@@ -8,7 +8,15 @@ use std::collections::BTreeMap;
 
 use circuitfabric_contracts::{DocumentKind, DocumentRecord, EvidencePackage, Project, ProjectId};
 use circuitfabric_document::{DocumentError, DocumentService};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+mod storage;
+
+pub use storage::{
+    PROJECT_STORAGE_SCHEMA_VERSION, ProjectLayoutDiagnostics, ProjectManifest, ProjectRegistry,
+    ProjectStorage, ProjectStorageError,
+};
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum ProjectError {
@@ -29,7 +37,7 @@ pub enum ProjectError {
 /// Runtime connection details and provider credentials belong to the application-wide runtime
 /// settings. This contract contains only the allow-lists and instructions that can change from
 /// one design workspace to another.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProjectConfiguration {
     pub agent_instructions: Option<String>,
     pub enabled_skill_ids: Vec<String>,
