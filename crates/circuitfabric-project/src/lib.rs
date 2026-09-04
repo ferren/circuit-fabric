@@ -18,7 +18,7 @@ mod sessions;
 mod storage;
 
 pub use documents::{
-    DocumentCategory, ProjectDocument, classify_document_kind, is_text_extractable,
+    DocumentCategory, DocumentImport, ProjectDocument, classify_document_kind, is_text_extractable,
 };
 pub use sessions::{
     SESSION_MARKDOWN_SCHEMA_VERSION, SessionActor, SessionEvent, SessionEventKind, SessionListing,
@@ -164,7 +164,8 @@ impl ProjectWorkspace {
     /// registers its extractable text for evidence retrieval.
     ///
     /// The managed copy and its index record are written by [`ProjectStorage`]; provenance is
-    /// the original absolute path of the source file.
+    /// the original absolute path of the source file. Re-importing the same file returns the
+    /// existing record with `created: false` instead of adding a new one.
     ///
     /// # Errors
     ///
@@ -175,12 +176,12 @@ impl ProjectWorkspace {
         storage: &ProjectStorage,
         source: impl AsRef<Path>,
         category: DocumentCategory,
-    ) -> Result<ProjectDocument, ProjectError> {
+    ) -> Result<DocumentImport, ProjectError> {
         self.require_project(project_id)?;
         let source_locator = source.as_ref().display().to_string();
-        let document = storage.import_document(&source, category, source_locator)?;
-        self.register_indexed_text(project_id, storage, &document);
-        Ok(document)
+        let imported = storage.import_document(&source, category, source_locator)?;
+        self.register_indexed_text(project_id, storage, &imported.document);
+        Ok(imported)
     }
 
     /// Rehydrates evidence retrieval from a project's persisted, authorized documents.
@@ -364,12 +365,21 @@ mod tests {
 
         let document = workspace
             .import_project_document("power-supply", &storage, &source, DocumentCategory::Datasheet)
-            .expect("import");
+            .expect("import")
+            .document;
         assert_eq!(document.document_kind, DocumentKind::Markdown);
         let evidence =
             workspace.retrieve_document_evidence("power-supply", "capacitor").expect("retrieve");
         assert_eq!(evidence.fragments.len(), 1);
         assert_eq!(evidence.fragments[0].document_id, document.id);
+
+        // Re-importing the very same file must not add a second record.
+        let again = workspace
+            .import_project_document("power-supply", &storage, &source, DocumentCategory::Datasheet)
+            .expect("re-import");
+        assert!(!again.created);
+        assert_eq!(again.document, document);
+        assert_eq!(storage.list_documents().expect("list").len(), 1);
 
         // Simulate an application restart: a fresh workspace hydrates from the persisted index.
         let mut restarted = ProjectWorkspace::default();
@@ -406,7 +416,8 @@ mod tests {
 
         let document = workspace
             .import_project_document("binary", &storage, &source, DocumentCategory::Datasheet)
-            .expect("import");
+            .expect("import")
+            .document;
 
         assert_eq!(document.document_kind, DocumentKind::Pdf);
         assert_eq!(workspace.hydrate_project_documents("binary", &storage).expect("hydrate"), 0);

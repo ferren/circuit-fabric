@@ -318,8 +318,6 @@ fn main() {
         input::{Input, InputEvent, InputState},
         scroll::ScrollableElement as _,
     };
-    use rfd::FileDialog;
-
     const APP_LOGO: &[u8] =
         include_bytes!("../../../assets/branding/circuitfabric-logo-v3-framed-transparent.png");
     const SIDEBAR_MARK: &[u8] =
@@ -840,16 +838,30 @@ fn main() {
             cx.notify();
         }
 
-        fn choose_project_root(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-            if let Some(root) = FileDialog::new().set_title("选择项目根文件夹").pick_folder()
-            {
-                self.new_project_root.update(cx, |state, cx| {
-                    state.set_value(root.display().to_string(), window, cx);
-                });
-                self.status =
-                    format!("已选择项目根文件夹：{}。创建前不会修改该文件夹。", root.display());
-            }
-            cx.notify();
+        fn choose_project_root(&mut self, window: &Window, cx: &mut Context<Self>) {
+            let dialog =
+                rfd::AsyncFileDialog::new().set_title("选择项目根文件夹").set_parent(window);
+            cx.spawn_in(window, async move |view, cx| {
+                let Some(file_handle) = dialog.pick_folder().await else {
+                    return;
+                };
+                let root = file_handle.path().to_path_buf();
+                cx.update(|window, cx| {
+                    view.update(cx, |view, cx| {
+                        view.new_project_root.update(cx, |state, cx| {
+                            state.set_value(root.display().to_string(), window, cx);
+                        });
+                        view.status = format!(
+                            "已选择项目根文件夹：{}。创建前不会修改该文件夹。",
+                            root.display()
+                        );
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .ok();
+            })
+            .detach();
         }
 
         fn persist_project_registry(&self) -> Result<(), String> {
@@ -886,44 +898,80 @@ fn main() {
             Ok(())
         }
 
-        fn import_project_document(&mut self, category: DocumentCategory, cx: &mut Context<Self>) {
+        fn import_project_document(
+            &mut self,
+            category: DocumentCategory,
+            window: &Window,
+            cx: &mut Context<Self>,
+        ) {
             let Some(project_id) = self.selected_project.clone() else {
                 return;
             };
-            let Some(storage) = self.project_storages.get(&project_id) else {
+            if !self.project_storages.contains_key(&project_id) {
                 self.status = "未导入：项目根目录未打开。".to_owned();
                 cx.notify();
                 return;
-            };
+            }
             let dialog_title = match category {
                 DocumentCategory::Datasheet => "导入 Datasheet",
                 DocumentCategory::ReferenceDesign => "导入参考设计",
             };
-            let Some(source) = FileDialog::new().set_title(dialog_title).pick_file() else {
-                return;
-            };
-            match self.workspace.import_project_document(&project_id, storage, &source, category) {
-                Ok(document) => {
-                    let searchable = is_text_extractable(&document.document_kind);
-                    if let Err(error) = self.refresh_project_data(&project_id) {
-                        self.status = format!("文档已导入，但列表未刷新：{error}");
-                    } else {
-                        self.status = format!(
-                            "已导入 `{}`（{}，{}…）{}。",
-                            document.original_file_name,
-                            document.id,
-                            &document.content_hash[..23],
-                            if searchable {
-                                "，文本可证据检索"
-                            } else {
-                                "，暂不参与文本检索"
-                            },
-                        );
-                    }
-                }
-                Err(error) => self.status = format!("未导入文档：{error}"),
-            }
-            cx.notify();
+            let dialog = rfd::AsyncFileDialog::new().set_title(dialog_title).set_parent(window);
+            cx.spawn_in(window, async move |view, cx| {
+                let Some(file_handle) = dialog.pick_file().await else {
+                    return;
+                };
+                let source = file_handle.path().to_path_buf();
+                cx.update(|_window, cx| {
+                    view.update(cx, |view, cx| {
+                        let Some(storage) = view.project_storages.get(&project_id).cloned() else {
+                            view.status = "未导入：项目根目录未打开。".to_owned();
+                            cx.notify();
+                            return;
+                        };
+                        match view.workspace.import_project_document(
+                            &project_id,
+                            &storage,
+                            &source,
+                            category,
+                        ) {
+                            Ok(imported) => {
+                                let document = &imported.document;
+                                if !imported.created {
+                                    view.status = format!(
+                                        "`{}` 已导入过（{}，类别 {}），未新增记录。",
+                                        document.original_file_name,
+                                        document.id,
+                                        document.category.label(),
+                                    );
+                                } else {
+                                    let searchable = is_text_extractable(&document.document_kind);
+                                    if let Err(error) = view.refresh_project_data(&project_id) {
+                                        view.status = format!("文档已导入，但列表未刷新：{error}");
+                                    } else {
+                                        view.status = format!(
+                                            "已导入 `{}`（{}，{}…）{}。",
+                                            document.original_file_name,
+                                            document.id,
+                                            &document.content_hash[..23],
+                                            if searchable {
+                                                "，文本可证据检索"
+                                            } else {
+                                                "，暂不参与文本检索"
+                                            },
+                                        );
+                                    }
+                                }
+                            }
+                            Err(error) => view.status = format!("未导入文档：{error}"),
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .ok();
+            })
+            .detach();
         }
 
         fn open_session_replay(&mut self, session_id: String, cx: &mut Context<Self>) {
@@ -949,80 +997,91 @@ fn main() {
             cx.notify();
         }
 
-        fn open_existing_project(&mut self, cx: &mut Context<Self>) {
-            let Some(root) =
-                FileDialog::new().set_title("打开已有 CircuitFabric 项目").pick_folder()
-            else {
-                return;
-            };
-            let storage = match ProjectStorage::open(&root) {
-                Ok(storage) => storage,
-                Err(error) => {
-                    self.status = format!("未打开项目：{error}");
-                    cx.notify();
+        fn open_existing_project(&mut self, window: &Window, cx: &mut Context<Self>) {
+            let dialog = rfd::AsyncFileDialog::new()
+                .set_title("打开已有 CircuitFabric 项目")
+                .set_parent(window);
+            cx.spawn_in(window, async move |view, cx| {
+                let Some(file_handle) = dialog.pick_folder().await else {
                     return;
-                }
-            };
-            let diagnostics = storage.diagnose_layout();
-            if !diagnostics.is_healthy() {
-                self.status = format!(
-                    "项目未注册：目录布局不完整或不安全（缺失：{}；不安全：{}）。",
-                    diagnostics
-                        .missing_entries
-                        .iter()
-                        .map(|entry| entry.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join("、"),
-                    diagnostics
-                        .unsafe_entries
-                        .iter()
-                        .map(|entry| entry.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join("、"),
-                );
-                cx.notify();
-                return;
-            }
+                };
+                let root = file_handle.path().to_path_buf();
+                cx.update(|_window, cx| {
+                    view.update(cx, |view, cx| {
+                        let storage = match ProjectStorage::open(&root) {
+                            Ok(storage) => storage,
+                            Err(error) => {
+                                view.status = format!("未打开项目：{error}");
+                                cx.notify();
+                                return;
+                            }
+                        };
+                        let diagnostics = storage.diagnose_layout();
+                        if !diagnostics.is_healthy() {
+                            view.status = format!(
+                                "项目未注册：目录布局不完整或不安全（缺失：{}；不安全：{}）。",
+                                diagnostics
+                                    .missing_entries
+                                    .iter()
+                                    .map(|entry| entry.display().to_string())
+                                    .collect::<Vec<_>>()
+                                    .join("、"),
+                                diagnostics
+                                    .unsafe_entries
+                                    .iter()
+                                    .map(|entry| entry.display().to_string())
+                                    .collect::<Vec<_>>()
+                                    .join("、"),
+                            );
+                            cx.notify();
+                            return;
+                        }
 
-            let project = storage.manifest().project.clone();
-            let opened_root = storage.root().display().to_string();
-            if let Some(registered_root) = self.project_registry.root_for(&project.id) {
-                if registered_root != storage.root() {
-                    self.status = format!(
-                        "未打开项目：项目 ID `{}` 已绑定到 {}。",
-                        project.id,
-                        registered_root.display()
-                    );
-                    cx.notify();
-                    return;
-                }
-            } else if let Err(error) = self.project_registry.register(&storage) {
-                self.status = format!("未注册已有项目：{error}");
-                cx.notify();
-                return;
-            }
-            if self.workspace.project(&project.id).is_none() {
-                if let Err(error) = Self::attach_project_storage(
-                    &mut self.workspace,
-                    &mut self.project_storages,
-                    &mut self.project_data,
-                    storage,
-                ) {
-                    self.status = format!("未打开项目：{error}");
-                    cx.notify();
-                    return;
-                }
-            }
-            if let Err(error) = self.project_registry.mark_opened(&project.id) {
-                self.status = format!("项目已打开，但未能记录最近活动：{error}");
-            } else if let Err(error) = self.persist_project_registry() {
-                self.status = format!("项目已打开，但未能保存项目注册表：{error}");
-            } else {
-                self.status = format!("已打开项目 `{}`：{opened_root}。", project.id);
-            }
-            self.selected_project = Some(project.id);
-            self.project_tab = ProjectDetailTab::Overview;
-            cx.notify();
+                        let project = storage.manifest().project.clone();
+                        let opened_root = storage.root().display().to_string();
+                        if let Some(registered_root) = view.project_registry.root_for(&project.id) {
+                            if registered_root != storage.root() {
+                                view.status = format!(
+                                    "未打开项目：项目 ID `{}` 已绑定到 {}。",
+                                    project.id,
+                                    registered_root.display()
+                                );
+                                cx.notify();
+                                return;
+                            }
+                        } else if let Err(error) = view.project_registry.register(&storage) {
+                            view.status = format!("未注册已有项目：{error}");
+                            cx.notify();
+                            return;
+                        }
+                        if view.workspace.project(&project.id).is_none() {
+                            if let Err(error) = Self::attach_project_storage(
+                                &mut view.workspace,
+                                &mut view.project_storages,
+                                &mut view.project_data,
+                                storage,
+                            ) {
+                                view.status = format!("未打开项目：{error}");
+                                cx.notify();
+                                return;
+                            }
+                        }
+                        if let Err(error) = view.project_registry.mark_opened(&project.id) {
+                            view.status = format!("项目已打开，但未能记录最近活动：{error}");
+                        } else if let Err(error) = view.persist_project_registry() {
+                            view.status = format!("项目已打开，但未能保存项目注册表：{error}");
+                        } else {
+                            view.status = format!("已打开项目 `{}`：{opened_root}。", project.id);
+                        }
+                        view.selected_project = Some(project.id);
+                        view.project_tab = ProjectDetailTab::Overview;
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .ok();
+            })
+            .detach();
         }
 
         fn create_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1727,9 +1786,9 @@ fn main() {
                                 .child(
                                     Button::new("open-existing-project")
                                         .label(language.choose("打开已有项目", "Open existing"))
-                                        .on_click(move |_, _, cx| {
+                                        .on_click(move |_, window, cx| {
                                             open_existing.update(cx, |view, cx| {
-                                                view.open_existing_project(cx);
+                                                view.open_existing_project(window, cx);
                                             });
                                         }),
                                 )
@@ -2046,10 +2105,11 @@ fn main() {
                             let importer = entity.clone();
                             Button::new("import-datasheet")
                                 .label(language.choose("导入 Datasheet", "Import datasheet"))
-                                .on_click(move |_, _, cx| {
+                                .on_click(move |_, window, cx| {
                                     importer.update(cx, |view, cx| {
                                         view.import_project_document(
                                             DocumentCategory::Datasheet,
+                                            window,
                                             cx,
                                         );
                                     });
@@ -2060,10 +2120,11 @@ fn main() {
                             Button::new("import-reference-design")
                                 .primary()
                                 .label(language.choose("导入参考设计", "Import reference design"))
-                                .on_click(move |_, _, cx| {
+                                .on_click(move |_, window, cx| {
                                     importer.update(cx, |view, cx| {
                                         view.import_project_document(
                                             DocumentCategory::ReferenceDesign,
+                                            window,
                                             cx,
                                         );
                                     });

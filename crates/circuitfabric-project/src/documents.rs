@@ -117,12 +117,23 @@ pub const fn is_text_extractable(kind: &DocumentKind) -> bool {
     )
 }
 
+/// The outcome of one document import.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DocumentImport {
+    /// The index record of the imported document.
+    pub document: ProjectDocument,
+    /// `false` when the very same source file was already indexed; nothing was written.
+    pub created: bool,
+}
+
 impl crate::ProjectStorage {
     /// Imports a user-selected file as an authorized, managed copy in this project root.
     ///
     /// The bytes are hashed with SHA-256 and stored under `documents/<category>/` with a
-    /// content-addressed file name. Identical content is stored once; every import still gets
-    /// its own index record with its own source locator and authorization.
+    /// content-addressed file name. Re-importing the same source file is idempotent: the
+    /// existing record is returned with `created: false` and no new record appears. Distinct
+    /// sources with identical content share the managed copy but keep separate records with
+    /// their own source locator and authorization.
     ///
     /// # Errors
     ///
@@ -133,8 +144,9 @@ impl crate::ProjectStorage {
         source: impl AsRef<Path>,
         category: DocumentCategory,
         source_locator: impl Into<String>,
-    ) -> Result<ProjectDocument, ProjectStorageError> {
+    ) -> Result<DocumentImport, ProjectStorageError> {
         let source = source.as_ref();
+        let source_locator = source_locator.into();
         let original_file_name = source
             .file_name()
             .and_then(|name| name.to_str())
@@ -152,6 +164,14 @@ impl crate::ProjectStorage {
         let content_hash = format!("sha256:{digest}");
 
         let mut index = self.load_document_index()?;
+        if let Some(existing) = index.documents.iter().find(|document| {
+            document.content_hash == content_hash
+                && (document.source_locator == source_locator
+                    || sources_match(&document.source_locator, source))
+        }) {
+            self.verify_managed_copy(&existing.relative_path, &content_hash)?;
+            return Ok(DocumentImport { document: existing.clone(), created: false });
+        }
         let existing_copy = index
             .documents
             .iter()
@@ -196,13 +216,13 @@ impl crate::ProjectStorage {
             content_hash,
             byte_size: bytes.len() as u64,
             document_kind,
-            source_locator: source_locator.into(),
+            source_locator,
             authorized: true,
             imported_at_unix_seconds: now_unix_seconds(),
         };
         index.documents.push(document.clone());
         self.save_document_index(&index)?;
-        Ok(document)
+        Ok(DocumentImport { document, created: true })
     }
 
     /// Reads the persisted document index.
@@ -287,6 +307,21 @@ impl crate::ProjectStorage {
     }
 }
 
+/// Whether a stored source locator refers to the same origin file being imported now.
+///
+/// Paths are compared exactly first, then via canonicalization so case or separator differences
+/// for one and the same file still match.
+fn sources_match(locator: &str, source: &Path) -> bool {
+    let locator_path = Path::new(locator);
+    if locator_path == source {
+        return true;
+    }
+    matches!(
+        (dunce::canonicalize(locator_path), dunce::canonicalize(source)),
+        (Ok(locator_canonical), Ok(source_canonical)) if locator_canonical == source_canonical
+    )
+}
+
 fn managed_extension(original_file_name: &str) -> String {
     let extension = Path::new(original_file_name)
         .extension()
@@ -337,9 +372,11 @@ mod tests {
         let storage = ProjectStorage::create(&root, project("import")).expect("create project");
         let source = write_source(&root, "lm317.md", "# LM317\nUse a 1uF capacitor.\n");
 
-        let document = storage
+        let imported = storage
             .import_document(&source, DocumentCategory::Datasheet, source.display().to_string())
             .expect("import document");
+        assert!(imported.created, "a first import creates its record");
+        let document = imported.document;
 
         assert_eq!(document.category, DocumentCategory::Datasheet);
         assert_eq!(document.original_file_name, "lm317.md");
@@ -365,9 +402,33 @@ mod tests {
     }
 
     #[test]
-    fn identical_content_is_deduplicated_but_keeps_distinct_records() {
-        let root = test_root("dedupe");
-        let storage = ProjectStorage::create(&root, project("dedupe")).expect("create project");
+    fn re_importing_the_same_file_adds_no_record() {
+        let root = test_root("dedupe-same-file");
+        let storage =
+            ProjectStorage::create(&root, project("dedupe-same-file")).expect("create project");
+        let source = write_source(&root, "a.md", "same bytes");
+
+        let first = storage
+            .import_document(&source, DocumentCategory::Datasheet, source.display().to_string())
+            .expect("first import");
+        let again = storage
+            .import_document(&source, DocumentCategory::Datasheet, source.display().to_string())
+            .expect("re-import is accepted");
+
+        assert!(first.created);
+        assert!(!again.created, "the same source file is not re-recorded");
+        assert_eq!(again.document, first.document);
+        assert_eq!(storage.list_documents().expect("list").len(), 1);
+        let datasheets = storage.root().join("documents/datasheets");
+        assert_eq!(fs::read_dir(datasheets).expect("list datasheets").count(), 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn identical_content_from_another_source_keeps_a_distinct_record() {
+        let root = test_root("dedupe-other-source");
+        let storage =
+            ProjectStorage::create(&root, project("dedupe-other-source")).expect("create project");
         let first_source = write_source(&root, "a.md", "same bytes");
         let second_source = write_source(&root, "b.md", "same bytes");
 
@@ -386,10 +447,12 @@ mod tests {
             )
             .expect("second import");
 
-        assert_eq!(first.relative_path, second.relative_path);
-        assert_ne!(first.id, second.id);
-        assert_eq!(second.category, DocumentCategory::ReferenceDesign);
-        assert_eq!(second.original_file_name, "b.md");
+        assert!(first.created);
+        assert!(second.created, "a different source is its own document record");
+        assert_eq!(first.document.relative_path, second.document.relative_path);
+        assert_ne!(first.document.id, second.document.id);
+        assert_eq!(second.document.category, DocumentCategory::ReferenceDesign);
+        assert_eq!(second.document.original_file_name, "b.md");
         assert_eq!(storage.list_documents().expect("list").len(), 2);
         let datasheets = storage.root().join("documents/datasheets");
         assert_eq!(fs::read_dir(datasheets).expect("list datasheets").count(), 1);
@@ -409,7 +472,8 @@ mod tests {
         let source = write_source(&root, "c.md", "content");
         let document = storage
             .import_document(&source, DocumentCategory::Datasheet, source.display().to_string())
-            .expect("import");
+            .expect("import")
+            .document;
         let absolute = storage.root().join(&document.relative_path);
         fs::write(&absolute, "tampered").expect("tamper with the managed copy");
         let error = storage
