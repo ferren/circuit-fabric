@@ -974,6 +974,130 @@ fn main() {
     }
 
     impl ControlPlaneView {
+        fn render_project_form(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+            let entity = cx.entity().clone();
+            let language = self.language;
+            let (id_feedback, feedback_color) = self.project_id_feedback(cx);
+            let field = |label: &'static str, id: &'static str, state: Entity<InputState>| {
+                div()
+                    .v_flex()
+                    .gap_1()
+                    .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(label))
+                    .child(
+                        div()
+                            .h(px(36.))
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .bg(rgb(CARD_BG))
+                            .child(
+                                InputBase::new(id)
+                                    .flex_1()
+                                    .h_full()
+                                    .flex()
+                                    .items_center()
+                                    .child(state),
+                            ),
+                    )
+                    .into_any_element()
+            };
+            let creator = entity.clone();
+            let closer = entity.clone();
+
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .p_6()
+                .child(
+                    div()
+                        .id("project-form-backdrop")
+                        .absolute()
+                        .inset_0()
+                        .bg(rgba(0x000f_172a_b3))
+                        .occlude()
+                        .on_click(move |_, _, cx| {
+                            closer.update(cx, |view, cx| {
+                                view.project_form_open = false;
+                                cx.notify();
+                            });
+                        }),
+                )
+                .child(
+                    div()
+                        .relative()
+                        .w(px(560.))
+                        .v_flex()
+                        .gap_4()
+                        .p_5()
+                        .rounded_xl()
+                        .border_1()
+                        .border_color(rgb(ACCENT_SOFT))
+                        .bg(rgb(SURFACE_BG))
+                        .shadow_lg()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .text_lg()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(TEXT_PRIMARY))
+                                        .child(language.choose("新建项目", "New project")),
+                                )
+                                .child(
+                                    Button::new("close-project-form")
+                                        .ghost()
+                                        .label(language.choose("取消", "Cancel"))
+                                        .on_click(move |_, _, cx| {
+                                            entity.update(cx, |view, cx| {
+                                                view.project_form_open = false;
+                                                cx.notify();
+                                            });
+                                        }),
+                                ),
+                        )
+                        .child(field("Project ID", "new-project-id", self.new_project_id.clone()))
+                        .child(div().text_xs().text_color(rgb(feedback_color)).child(id_feedback))
+                        .child(field("Name", "new-project-name", self.new_project_name.clone()))
+                        .child(field(
+                            "Description",
+                            "new-project-description",
+                            self.new_project_description.clone(),
+                        ))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap_3()
+                                .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(
+                                    language.choose(
+                                        "项目级设置不会修改全局运行时设置。",
+                                        "Project settings never modify global runtime settings.",
+                                    ),
+                                ))
+                                .child(
+                                    Button::new("create-project")
+                                        .primary()
+                                        .label(language.choose("创建项目", "Create project"))
+                                        .on_click(move |_, window, cx| {
+                                            creator.update(cx, |view, cx| {
+                                                view.create_project(window, cx);
+                                            });
+                                        }),
+                                ),
+                        ),
+                )
+        }
+
         #[allow(clippy::too_many_lines)]
         fn render_projects_page(
             &mut self,
@@ -982,6 +1106,8 @@ fn main() {
         ) -> impl IntoElement {
             let entity = cx.entity().clone();
             let language = self.language;
+            let project_form =
+                self.project_form_open.then(|| self.render_project_form(cx).into_any_element());
             let query = self.project_search.read(cx).value().trim().to_lowercase();
             let projects = self
                 .workspace
@@ -992,8 +1118,6 @@ fn main() {
                 .collect::<Vec<_>>();
             let selected_project =
                 self.selected_project.as_deref().and_then(|id| self.workspace.project(id)).cloned();
-            let (id_feedback, feedback_color) = self.project_id_feedback(cx);
-
             let mut cards = div().v_flex().gap_2();
             if projects.is_empty() {
                 cards = cards.child(
@@ -1118,78 +1242,13 @@ fn main() {
                     .into_any_element()
             };
 
-            let form = self.project_form_open.then(|| {
-                let creator = entity.clone();
-                let closer = entity.clone();
-                div()
-                    .v_flex()
-                    .gap_3()
-                    .p_4()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(rgb(ACCENT_SOFT))
-                    .bg(rgb(0x00f0_f9ff))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_base()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(language.choose("新建项目", "New project")),
-                            )
-                            .child(
-                                Button::new("close-project-form")
-                                    .ghost()
-                                    .label(language.choose("取消", "Cancel"))
-                                    .on_click(move |_, _, cx| {
-                                        closer.update(cx, |view, cx| {
-                                            view.project_form_open = false;
-                                            cx.notify();
-                                        });
-                                    }),
-                            ),
-                    )
-                    .child(Self::field("Project ID", "new-project-id", &self.new_project_id))
-                    .child(div().text_xs().text_color(rgb(feedback_color)).child(id_feedback))
-                    .child(Self::field("Name", "new-project-name", &self.new_project_name))
-                    .child(Self::field(
-                        "Description",
-                        "new-project-description",
-                        &self.new_project_description,
-                    ))
-                    .child(
-                        div()
-                            .flex()
-                            .gap_2()
-                            .child(
-                                Button::new("create-project")
-                                    .primary()
-                                    .label(language.choose("创建项目", "Create project"))
-                                    .on_click(move |_, window, cx| {
-                                        creator.update(cx, |view, cx| {
-                                            view.create_project(window, cx);
-                                        });
-                                    }),
-                            )
-                            .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(
-                                language.choose(
-                                    "项目级设置不会修改全局运行时设置。",
-                                    "Project settings never modify global runtime settings.",
-                                ),
-                            )),
-                    )
-                    .into_any_element()
-            });
-
             let open_form = entity.clone();
             let all_filter = entity.clone();
             let setup_filter = entity.clone();
             div()
                 .size_full()
                 .min_w(px(880.))
+                .relative()
                 .v_flex()
                 .gap_4()
                 .p_6()
@@ -1226,7 +1285,6 @@ fn main() {
                                 }),
                         ),
                 )
-                .when_some(form, ParentElement::child)
                 .child(
                     div()
                         .flex_1()
@@ -1289,6 +1347,7 @@ fn main() {
                         .child(detail),
                 )
                 .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(self.status.clone()))
+                .when_some(project_form, ParentElement::child)
         }
 
         #[allow(clippy::too_many_lines)]
