@@ -1744,7 +1744,13 @@ fn main() {
                         .child(language.choose("密钥边界", "Key boundary")),
                 )
                 .child(
-                    div().text_xs().text_color(rgb(TEXT_SECONDARY)).child(language.choose(zh, en)),
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .whitespace_normal()
+                        .text_xs()
+                        .text_color(rgb(TEXT_SECONDARY))
+                        .child(language.choose(zh, en)),
                 )
         }
 
@@ -1825,7 +1831,7 @@ fn main() {
                         .text_color(rgb(badge_foreground))
                         .child(Self::tool_kind_label(kind, language)),
                 )
-                .child(div().text_sm().child(owned_id.clone()))
+                .child(div().flex_1().min_w(px(0.)).truncate().text_sm().child(owned_id.clone()))
                 .child(
                     div()
                         .ml_auto()
@@ -2097,7 +2103,6 @@ fn main() {
             let add_provider = entity.clone();
             div()
                 .size_full()
-                .min_w(px(880.))
                 .relative()
                 .v_flex()
                 .gap_4()
@@ -2107,8 +2112,11 @@ fn main() {
                         .flex()
                         .items_center()
                         .justify_between()
+                        .gap_3()
                         .child(
                             div()
+                                .flex_1()
+                                .min_w(px(0.))
                                 .v_flex()
                                 .gap_1()
                                 .child(
@@ -2231,6 +2239,8 @@ fn main() {
                         .gap_3()
                         .child(
                             div()
+                                .flex_1()
+                                .min_w(px(0.))
                                 .v_flex()
                                 .gap_1()
                                 .child(
@@ -2745,6 +2755,8 @@ fn main() {
                         .gap_3()
                         .child(
                             div()
+                                .flex_1()
+                                .min_w(px(0.))
                                 .v_flex()
                                 .gap_1()
                                 .child(
@@ -2782,6 +2794,7 @@ fn main() {
                         .child(
                             div()
                                 .flex()
+                                .flex_wrap()
                                 .gap_3()
                                 .child(Self::labeled_field(
                                     "Provider ID",
@@ -2799,6 +2812,7 @@ fn main() {
                         .child(
                             div()
                                 .flex()
+                                .flex_wrap()
                                 .gap_3()
                                 .child(Self::labeled_field(
                                     "LLM Base URL",
@@ -2946,12 +2960,12 @@ fn main() {
                         .flex()
                         .flex_wrap()
                         .gap_2()
-                        .child(format!(
+                        .child(div().flex_1().min_w(px(0.)).whitespace_normal().child(format!(
                             "技能 {} · {} · {}",
                             skill.id,
                             if skill.enabled { "启用" } else { "停用" },
                             skill.path.display()
-                        ))
+                        )))
                         .child(
                             Button::new(format!("skill-grant-{id}"))
                                 .label("授权到所选作用域")
@@ -3025,12 +3039,12 @@ fn main() {
                         .flex()
                         .flex_wrap()
                         .gap_2()
-                        .child(format!(
+                        .child(div().flex_1().min_w(px(0.)).whitespace_normal().child(format!(
                             "MCP {} · {} · {}",
                             server.id,
                             if server.enabled { "启用" } else { "停用" },
                             server.command
-                        ))
+                        )))
                         .child(
                             Button::new(format!("mcp-grant-{id}"))
                                 .label("授权到所选作用域")
@@ -3842,8 +3856,11 @@ fn main() {
                                 .flex()
                                 .items_center()
                                 .justify_between()
+                                .gap_2()
                                 .child(
                                     div()
+                                        .flex_1()
+                                        .min_w(px(0.))
                                         .text_base()
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .text_color(rgb(TEXT_PRIMARY))
@@ -3851,6 +3868,8 @@ fn main() {
                                 )
                                 .child(
                                     div()
+                                        .min_w(px(0.))
+                                        .truncate()
                                         .px_2()
                                         .py_0p5()
                                         .rounded_sm()
@@ -3865,6 +3884,7 @@ fn main() {
                         .child(
                             div()
                                 .flex()
+                                .flex_wrap()
                                 .gap_3()
                                 .text_xs()
                                 .text_color(rgb(TEXT_MUTED))
@@ -3919,7 +3939,6 @@ fn main() {
             let setup_filter = entity.clone();
             div()
                 .size_full()
-                .min_w(px(880.))
                 .relative()
                 .v_flex()
                 .gap_4()
@@ -3929,8 +3948,11 @@ fn main() {
                         .flex()
                         .items_center()
                         .justify_between()
+                        .gap_3()
                         .child(
                             div()
+                                .flex_1()
+                                .min_w(px(0.))
                                 .v_flex()
                                 .gap_1()
                                 .child(
@@ -4106,6 +4128,7 @@ fn main() {
                     .child(
                         div()
                             .flex()
+                            .flex_wrap()
                             .gap_3()
                             .child(Self::project_metric(
                                 document_count.to_string(),
@@ -4196,6 +4219,8 @@ fn main() {
                         .gap_3()
                         .child(
                             div()
+                                .flex_1()
+                                .min_w(px(0.))
                                 .v_flex()
                                 .gap_1()
                                 .child(
@@ -4234,6 +4259,7 @@ fn main() {
         fn project_metric(value: String, label: &'static str) -> impl IntoElement {
             div()
                 .flex_1()
+                .min_w(px(0.))
                 .v_flex()
                 .gap_1()
                 .p_3()
@@ -4345,6 +4371,9 @@ fn main() {
                                 .gap_2()
                                 .child(
                                     div()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .whitespace_normal()
                                         .text_sm()
                                         .font_weight(FontWeight::MEDIUM)
                                         .child(document.original_file_name.clone()),
@@ -4506,14 +4535,18 @@ fn main() {
                             .flex()
                             .items_center()
                             .justify_between()
+                            .gap_2()
                             .child(
                                 div()
+                                    .flex_1()
+                                    .min_w(px(0.))
                                     .v_flex()
                                     .gap_1()
                                     .child(
                                         div()
                                             .text_base()
                                             .font_weight(FontWeight::SEMIBOLD)
+                                            .whitespace_normal()
                                             .child(metadata.session_id.clone()),
                                     )
                                     .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(
@@ -4547,12 +4580,17 @@ fn main() {
                             .gap_2()
                             .text_xs()
                             .text_color(rgb(TEXT_SECONDARY))
-                            .child(format!(
+                            .child(div().flex_1().min_w(px(0.)).whitespace_normal().child(format!(
                                 "{} input / {} output tokens",
                                 metadata.usage.input_tokens, metadata.usage.output_tokens
-                            ))
+                            )))
                             .when(!metadata.citations.is_empty(), |this| {
-                                this.child(format!(" · 引用 {}", metadata.citations.join("、")))
+                                this.child(
+                                    div()
+                                        .min_w(px(0.))
+                                        .whitespace_normal()
+                                        .child(format!("引用 {}", metadata.citations.join("、"))),
+                                )
                             }),
                     )
                     .child(
@@ -4649,6 +4687,9 @@ fn main() {
                                 .gap_2()
                                 .child(
                                     div()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .truncate()
                                         .text_sm()
                                         .font_weight(FontWeight::MEDIUM)
                                         .child(metadata.session_id.clone()),
@@ -4726,9 +4767,10 @@ fn main() {
 
         fn section_page(language: UiLanguage, screen: ControlPlaneScreen) -> impl IntoElement {
             let (title, description, next_step) = language.page_copy(screen);
-            div().size_full().min_w(px(720.)).v_flex().justify_center().items_center().p_8().child(
+            div().size_full().v_flex().justify_center().items_center().p_8().child(
                 div()
-                    .w(px(680.))
+                    .w_full()
+                    .max_w(px(680.))
                     .v_flex()
                     .gap_4()
                     .p_6()
@@ -4774,7 +4816,13 @@ fn main() {
                                     .child("TODO"),
                             )
                             .child(
-                                div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(next_step),
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .whitespace_normal()
+                                    .text_sm()
+                                    .text_color(rgb(TEXT_SECONDARY))
+                                    .child(next_step),
                             ),
                     ),
             )
@@ -4785,6 +4833,7 @@ fn main() {
             let metric = |value: &'static str, label: &'static str, color: u32| {
                 div()
                     .flex_1()
+                    .min_w(px(0.))
                     .v_flex()
                     .gap_2()
                     .p_4()
@@ -4808,6 +4857,7 @@ fn main() {
             let panel = |title: &'static str, body: &'static str| {
                 div()
                     .flex_1()
+                    .min_w(px(0.))
                     .v_flex()
                     .gap_3()
                     .p_5()
@@ -4828,7 +4878,6 @@ fn main() {
 
             div()
                 .size_full()
-                .min_w(px(760.))
                 .v_flex()
                 .gap_5()
                 .p_6()
@@ -5346,6 +5395,8 @@ fn main() {
                                 .border_color(rgb(BORDER))
                                 .child(
                                     div()
+                                        .flex_1()
+                                        .min_w(px(0.))
                                         .v_flex()
                                         .gap_0p5()
                                         .child(
@@ -5357,6 +5408,8 @@ fn main() {
                                         )
                                         .child(
                                             div()
+                                                .min_w(px(0.))
+                                                .truncate()
                                                 .text_xs()
                                                 .text_color(rgb(TEXT_MUTED))
                                                 .child(selected_project_label),
@@ -5413,11 +5466,14 @@ fn main() {
                                 ),
                         )
                         .child(
-                            // Scrollable content
+                            // Scrollable content. Vertical-only scrolling keeps
+                            // the page width locked to the viewport, so text
+                            // nodes receive a definite wrap width and reflow
+                            // instead of stretching the workspace sideways.
                             div()
                                 .flex_1()
                                 .min_w(px(0.))
-                                .overflow_scrollbar()
+                                .overflow_y_scrollbar()
                                 .id("main-content-scroll")
                                 .bg(rgb(SURFACE_BG))
                                 .child(page),
