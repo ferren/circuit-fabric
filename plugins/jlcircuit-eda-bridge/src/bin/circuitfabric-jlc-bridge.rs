@@ -18,7 +18,11 @@ use std::{
     path::PathBuf,
 };
 
-use circuitfabric_codex_runtime::{CodexAppServerClient, RuntimeSettings};
+use circuitfabric_codex_runtime::{
+    RuntimeSettings,
+    execution::{AgentKind, Cancellation, run_task},
+};
+use circuitfabric_project::{ProjectRegistry, ProjectStorage};
 use serde_json::{Value, json};
 
 const BRIDGE_PROTOCOL_VERSION: u64 = 1;
@@ -38,7 +42,7 @@ fn main() -> Result<(), String> {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                if let Err(error) = serve_connection(stream, &settings) {
+                if let Err(error) = serve_connection(stream, &config_path) {
                     eprintln!("bridge client disconnected: {error}");
                 }
             }
@@ -48,13 +52,11 @@ fn main() -> Result<(), String> {
     Ok(())
 }
 
-fn serve_connection(mut stream: TcpStream, settings: &RuntimeSettings) -> Result<(), String> {
+#[allow(clippy::too_many_lines)]
+fn serve_connection(mut stream: TcpStream, config_path: &std::path::Path) -> Result<(), String> {
     websocket_handshake(&mut stream)?;
-    let provider = settings.default_provider().ok_or_else(|| {
-        format!("default provider is not configured: {}", settings.default_provider_id)
-    })?;
-    let mut client: Option<CodexAppServerClient> = None;
     let mut threads = BTreeMap::<String, String>::new();
+    let mut previous_snapshot = None;
     let mut project_id: Option<String> = None;
 
     while let Some(raw) = read_text_frame(&mut stream)? {
@@ -66,6 +68,14 @@ fn serve_connection(mut stream: TcpStream, settings: &RuntimeSettings) -> Result
                     .and_then(Value::as_str)
                     .filter(|value| !value.trim().is_empty())
                     .ok_or_else(|| "hello requires a projectId".to_owned())?;
+                if project_id.as_deref() != Some(requested_project) {
+                    threads.clear();
+                }
+                let registry = ProjectRegistry::load(config_path.with_file_name("projects.json"))
+                    .map_err(|e| e.to_string())?;
+                if registry.root_for(requested_project).is_none() {
+                    return Err("项目未注册，拒绝连接".to_owned());
+                }
                 project_id = Some(requested_project.to_owned());
                 send_json(
                     &mut stream,
@@ -89,22 +99,21 @@ fn serve_connection(mut stream: TcpStream, settings: &RuntimeSettings) -> Result
                     .and_then(Value::as_str)
                     .filter(|value| !value.trim().is_empty())
                     .ok_or_else(|| "chat requires text".to_owned())?;
-                if client.is_none() {
-                    let mut app_server = CodexAppServerClient::launch(&settings.codex, provider)
-                        .map_err(|error| error.to_string())?;
-                    app_server.initialize().map_err(|error| error.to_string())?;
-                    client = Some(app_server);
-                }
-                let app_server = client.as_mut().expect("client was initialized above");
-                let thread_id = if let Some(thread_id) = threads.get(session_id) {
-                    thread_id.clone()
-                } else {
-                    let thread_id = app_server
-                        .start_thread(Some(&provider.model))
-                        .map_err(|error| error.to_string())?;
-                    threads.insert(session_id.to_owned(), thread_id.clone());
-                    thread_id
-                };
+                let settings =
+                    RuntimeSettings::load_or_default(config_path).map_err(|e| e.to_string())?;
+                let registry = ProjectRegistry::load(config_path.with_file_name("projects.json"))
+                    .map_err(|e| e.to_string())?;
+                let root = registry.root_for(project_id).ok_or_else(|| "项目未注册".to_owned())?;
+                let storage = ProjectStorage::open(root).map_err(|e| e.to_string())?;
+                let configuration = storage.load_configuration().map_err(|e| e.to_string())?;
+                let mut grants = settings.tools.clone();
+                grants.authorized_skill_ids.extend(configuration.enabled_skill_ids);
+                grants.authorized_mcp_server_ids.extend(configuration.enabled_mcp_server_ids);
+                grants.authorized_skill_ids.sort();
+                grants.authorized_skill_ids.dedup();
+                grants.authorized_mcp_server_ids.sort();
+                grants.authorized_mcp_server_ids.dedup();
+                let thread_id = format!("{project_id}:{session_id}");
                 send_json(
                     &mut stream,
                     json!({
@@ -115,16 +124,58 @@ fn serve_connection(mut stream: TcpStream, settings: &RuntimeSettings) -> Result
                     "You are assisting inside JLC EDA for CircuitFabric project `{project_id}`. \
                      Treat any EDA operation as a proposal unless the user explicitly requests a confirmed write.\n\n{text}"
                 );
-                app_server
-                    .run_turn(&thread_id, &prompt, |delta| {
-                        let _ = send_json(
+                let prompt =
+                    format!("{}\n{prompt}", configuration.agent_instructions.unwrap_or_default());
+                let cancel = Cancellation::default();
+                let done = std::sync::atomic::AtomicBool::new(false);
+                let project_path = storage.configuration_path();
+                let configuration_files = [config_path.to_owned(), project_path];
+                let snapshots = configuration_files
+                    .iter()
+                    .map(std::fs::read)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| e.to_string())?;
+                if previous_snapshot.as_ref() != Some(&snapshots) {
+                    threads.clear();
+                }
+                previous_snapshot = Some(snapshots.clone());
+                let previous = threads.get(&thread_id).cloned().unwrap_or_default();
+                let prompt = format!("{previous}\n\nUser: {prompt}");
+                if prompt.len() > 256 * 1024 {
+                    return Err("会话上下文过长，请新建会话".to_owned());
+                }
+                let result = std::thread::scope(|scope| {
+                    scope.spawn(|| {
+                        while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                            if configuration_files.iter().zip(&snapshots).any(|(path, original)| {
+                                std::fs::read(path).ok().as_ref() != Some(original)
+                            }) {
+                                cancel.cancel();
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                        }
+                    });
+                    let result = run_task(&settings, AgentKind::Codex, &grants, &prompt, &cancel);
+                    done.store(true, std::sync::atomic::Ordering::SeqCst);
+                    result
+                });
+                match result {
+                    Ok(output) => {
+                        threads.insert(thread_id, format!("{prompt}\n\nAssistant: {output}"));
+                        send_json(
                             &mut stream,
-                            json!({
-                                "type": "chat_delta", "sessionId": session_id, "delta": delta,
-                            }),
-                        );
-                    })
-                    .map_err(|error| error.to_string())?;
+                            json!({"type":"chat_delta","sessionId":session_id,"delta":output}),
+                        )?;
+                    }
+                    Err(error) => {
+                        send_json(
+                            &mut stream,
+                            json!({"type":"error","sessionId":session_id,"message":error.to_string()}),
+                        )?;
+                        continue;
+                    }
+                }
                 send_json(
                     &mut stream,
                     json!({ "type": "chat_completed", "sessionId": session_id }),

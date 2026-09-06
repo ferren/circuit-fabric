@@ -11,5 +11,8 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+win32job = "2"
+
 [lints]
 workspace = true

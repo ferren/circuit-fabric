@@ -5,10 +5,13 @@
 //! from the desktop or bridge process.
 
 use std::{
+    collections::VecDeque,
     env, fs,
     io::{BufRead, BufReader, BufWriter, Write},
     path::{Path, PathBuf},
-    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
+    process::{Child, ChildStdin, Command, Stdio},
+    sync::mpsc::{self, Receiver},
+    time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
@@ -19,6 +22,9 @@ pub const DEFAULT_BRIDGE_ADDRESS: &str = "127.0.0.1:49630";
 pub const DEFAULT_CODEX_COMMAND: &str = "codex";
 pub const DEFAULT_API_KEY_ENV: &str = "OPENAI_API_KEY";
 pub const DEFAULT_PROVIDER_ID: &str = "zai";
+
+pub mod execution;
+pub mod tools;
 
 /// An OpenAI-compatible model provider configured by the desktop control plane.
 ///
@@ -161,6 +167,10 @@ pub struct RuntimeSettings {
     pub bridge: BridgeSettings,
     #[serde(default)]
     pub tools: ToolAuthorizationSettings,
+    #[serde(default)]
+    pub catalog: tools::ToolCatalog,
+    #[serde(default)]
+    pub adapters: execution::AdapterSettings,
 }
 
 impl Default for RuntimeSettings {
@@ -171,6 +181,8 @@ impl Default for RuntimeSettings {
             providers: vec![LlmProviderSettings::default()],
             bridge: BridgeSettings::default(),
             tools: ToolAuthorizationSettings::default(),
+            catalog: tools::ToolCatalog::default(),
+            adapters: execution::AdapterSettings::default(),
         }
     }
 }
@@ -221,7 +233,7 @@ impl RuntimeSettings {
                 "Codex working directory must not be empty".to_owned(),
             ));
         }
-        if self.codex.api_key_environment_variable.trim().is_empty() {
+        if !tools::valid_env_name(&self.codex.api_key_environment_variable) {
             return Err(RuntimeError::InvalidSettings(
                 "API key environment-variable name must not be empty".to_owned(),
             ));
@@ -238,6 +250,8 @@ impl RuntimeSettings {
         }
         self.validate_providers()?;
         self.tools.validate()?;
+        self.catalog.validate()?;
+        self.adapters.validate(self)?;
         Ok(())
     }
 
@@ -282,6 +296,14 @@ impl RuntimeSettings {
                     "provider `{}` requires a name, base URL, model, and API key environment variable",
                     provider.id
                 )));
+            }
+            if !tools::valid_env_name(&provider.api_key_environment_variable)
+                || provider
+                    .vision_api_key_environment_variable
+                    .as_ref()
+                    .is_some_and(|name| !tools::valid_env_name(name))
+            {
+                return Err(RuntimeError::InvalidSettings("API Key 必须填写环境变量名".to_owned()));
             }
             if !provider.base_url.starts_with("http://")
                 && !provider.base_url.starts_with("https://")
@@ -371,7 +393,11 @@ impl RuntimeSettings {
         match fs::read_to_string(path) {
             Ok(raw) => serde_json::from_str::<Self>(&raw)
                 .map(Self::migrate_legacy_provider)
-                .map_err(|source| RuntimeError::ParseSettings { path: path.to_owned(), source }),
+                .map_err(|source| RuntimeError::ParseSettings { path: path.to_owned(), source })
+                .and_then(|settings| {
+                    settings.validate()?;
+                    Ok(settings)
+                }),
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(source) => Err(RuntimeError::ReadSettings { path: path.to_owned(), source }),
         }
@@ -392,17 +418,30 @@ impl RuntimeSettings {
                 source,
             })?;
         }
-        fs::write(path, raw)
-            .map_err(|source| RuntimeError::WriteSettings { path: path.to_owned(), source })
+        let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+        let result = (|| {
+            let mut file = fs::File::create(&temporary)?;
+            file.write_all(&raw)?;
+            file.sync_all()?;
+            fs::rename(&temporary, path)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result.map_err(|source| RuntimeError::WriteSettings { path: path.to_owned(), source })
     }
 }
 
 /// A synchronous client for the documented JSONL transport of `codex app-server`.
+#[derive(Debug)]
 pub struct CodexAppServerClient {
     child: Child,
+    ownership: Option<execution::ProcessOwnership>,
     input: BufWriter<ChildStdin>,
-    output: BufReader<ChildStdout>,
+    output: Receiver<Result<Value, String>>,
+    pending: VecDeque<Value>,
     next_request_id: u64,
+    cancel: execution::Cancellation,
 }
 
 impl CodexAppServerClient {
@@ -416,20 +455,47 @@ impl CodexAppServerClient {
         settings: &CodexAppServerSettings,
         provider: &LlmProviderSettings,
     ) -> Result<Self, RuntimeError> {
-        let mut child = app_server_command(settings, provider)
+        Self::launch_command(
+            app_server_command(settings, provider),
+            &settings.command,
+            execution::Cancellation::default(),
+        )
+    }
+
+    pub(crate) fn launch_command(
+        mut command: Command,
+        name: &str,
+        cancel: execution::Cancellation,
+    ) -> Result<Self, RuntimeError> {
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::null())
             .spawn()
-            .map_err(|source| RuntimeError::Launch { command: settings.command.clone(), source })?;
+            .map_err(|source| RuntimeError::Launch { command: name.to_owned(), source })?;
+        let ownership = execution::ProcessOwnership::attach(&mut child)?;
         let input = child.stdin.take().ok_or(RuntimeError::MissingStream { stream: "stdin" })?;
         let output = child.stdout.take().ok_or(RuntimeError::MissingStream { stream: "stdout" })?;
 
+        let (sender, output_messages) = mpsc::sync_channel(256);
+        std::thread::spawn(move || {
+            for line in BufReader::new(output).lines() {
+                let message = line.map_err(|_| "读取运行时输出失败".to_owned()).and_then(|line| {
+                    serde_json::from_str(&line).map_err(|_| "运行时返回无效 JSON".to_owned())
+                });
+                if sender.send(message).is_err() {
+                    break;
+                }
+            }
+        });
         Ok(Self {
             child,
+            ownership: Some(ownership),
             input: BufWriter::new(input),
-            output: BufReader::new(output),
+            output: output_messages,
+            pending: VecDeque::new(),
             next_request_id: 1,
+            cancel,
         })
     }
 
@@ -480,28 +546,58 @@ impl CodexAppServerClient {
         &mut self,
         thread_id: &str,
         prompt: &str,
+        on_delta: F,
+    ) -> Result<(), RuntimeError>
+    where
+        F: FnMut(&str),
+    {
+        self.run_turn_with_input(thread_id, &[json!({"type":"text","text":prompt})], on_delta)
+    }
+
+    /// Run a turn with explicit text and image input items.
+    /// # Errors
+    /// Returns transport errors, cancellations and failed turn statuses.
+    pub fn run_turn_with_input<F>(
+        &mut self,
+        thread_id: &str,
+        input: &[Value],
         mut on_delta: F,
     ) -> Result<(), RuntimeError>
     where
         F: FnMut(&str),
     {
-        self.request(
+        let started = self.request(
             "turn/start",
             &json!({
                 "threadId": thread_id,
-                "input": [{ "type": "text", "text": prompt }],
+                "input": input,
             }),
         )?;
-
+        let turn_id = started
+            .pointer("/turn/id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| tools::invalid("运行时未返回任务标识"))?
+            .to_owned();
+        let deadline = Instant::now() + Duration::from_secs(180);
         loop {
-            let message = self.read_message("turn/completed")?;
+            let message = self.read_message("turn/completed", deadline)?;
             if message.get("method").and_then(Value::as_str) == Some("item/agentMessage/delta")
                 && let Some(delta) = message.pointer("/params/delta").and_then(Value::as_str)
             {
                 on_delta(delta);
             }
-            if message.get("method").and_then(Value::as_str) == Some("turn/completed") {
-                return Ok(());
+            if message.get("method").and_then(Value::as_str) == Some("turn/completed")
+                && message.pointer("/params/threadId").and_then(Value::as_str) == Some(thread_id)
+                && message.pointer("/params/turn/id").and_then(Value::as_str)
+                    == Some(turn_id.as_str())
+            {
+                return match message.pointer("/params/turn/status").and_then(Value::as_str) {
+                    Some("completed") => Ok(()),
+                    _ => Err(RuntimeError::Rpc {
+                        method: "turn/start".to_owned(),
+                        message: "任务失败或已取消；请检查模型及服务连接".to_owned(),
+                    }),
+                };
             }
         }
     }
@@ -510,15 +606,27 @@ impl CodexAppServerClient {
         let id = self.next_request_id;
         self.next_request_id += 1;
         self.send(&json!({ "method": method, "id": id, "params": params }))?;
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            let message = self.read_message(method)?;
+            let message =
+                self.receive(method, deadline.saturating_duration_since(Instant::now()))?;
+            if self.reject_server_request(&message)? {
+                continue;
+            }
             if message.get("id").and_then(Value::as_u64) != Some(id) {
+                if self.pending.len() >= 256 {
+                    return Err(RuntimeError::InvalidSettings("运行时通知队列已满".to_owned()));
+                }
+                self.pending.push_back(message);
                 continue;
             }
             if let Some(error) = message.get("error") {
                 return Err(RuntimeError::Rpc {
                     method: method.to_owned(),
-                    message: error.to_string(),
+                    message: format!(
+                        "请求被拒绝（代码 {}）",
+                        error.get("code").unwrap_or(&Value::Null)
+                    ),
                 });
             }
             return Ok(message.get("result").cloned().unwrap_or(Value::Null));
@@ -536,12 +644,57 @@ impl CodexAppServerClient {
         Ok(())
     }
 
-    fn read_message(&mut self, method: &str) -> Result<Value, RuntimeError> {
-        let mut line = String::new();
-        if self.output.read_line(&mut line)? == 0 {
-            return Err(RuntimeError::Closed { method: method.to_owned() });
+    fn read_message(&mut self, method: &str, deadline: Instant) -> Result<Value, RuntimeError> {
+        loop {
+            if Instant::now() >= deadline || self.cancel.0.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(tools::invalid("任务已取消或超时"));
+            }
+            let message = match self.pending.pop_front() {
+                Some(message) => message,
+                None => self.receive(method, deadline.saturating_duration_since(Instant::now()))?,
+            };
+            if !self.reject_server_request(&message)? {
+                return Ok(message);
+            }
         }
-        serde_json::from_str(&line).map_err(RuntimeError::ProtocolJson)
+    }
+
+    fn receive(&self, method: &str, timeout: Duration) -> Result<Value, RuntimeError> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.cancel.0.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(RuntimeError::Rpc {
+                    method: method.to_owned(),
+                    message: "任务已取消".to_owned(),
+                });
+            }
+            match self.output.recv_timeout(
+                Duration::from_millis(50).min(deadline.saturating_duration_since(Instant::now())),
+            ) {
+                Ok(value) => {
+                    return value.map_err(|message| RuntimeError::Rpc {
+                        method: method.to_owned(),
+                        message,
+                    });
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) if Instant::now() < deadline => {}
+                Err(_) => {
+                    return Err(RuntimeError::Rpc {
+                        method: method.to_owned(),
+                        message: "运行时连接关闭或响应超时".to_owned(),
+                    });
+                }
+            }
+        }
+    }
+
+    fn reject_server_request(&mut self, message: &Value) -> Result<bool, RuntimeError> {
+        if let (Some(id), Some(_)) = (message.get("id"), message.get("method")) {
+            self.send(&json!({"id":id,"error":{"code":-32601,"message":"Interactive approval is unavailable; request denied"}}))?;
+            return Ok(true);
+        }
+        Ok(false)
     }
 }
 
@@ -552,11 +705,11 @@ fn toml_string(value: &str) -> String {
 /// Builds the `codex app-server` command line shared by the JSON-RPC client and the supervised
 /// lifecycle handle: the provider, model, base URL, and environment-variable name are forwarded
 /// as `--config` overrides, so no API key value ever appears on a command line.
-fn app_server_command(
+pub(crate) fn app_server_command(
     settings: &CodexAppServerSettings,
     provider: &LlmProviderSettings,
 ) -> Command {
-    let mut command = Command::new(&settings.command);
+    let mut command = tools::executable(&settings.command);
     command
         .arg("app-server")
         .arg("--stdio")
@@ -592,14 +745,14 @@ fn app_server_command(
 /// [`CodexAppServerClient`], whether spawned here or by a bridge.
 #[derive(Debug)]
 pub struct CodexAppServerHandle {
-    child: Child,
+    client: CodexAppServerClient,
 }
 
 impl CodexAppServerHandle {
     /// Starts the configured App Server as a keep-alive child process.
     ///
-    /// stdout and stderr are discarded because the control plane does not speak JSON-RPC to this
-    /// instance; a bridge always launches its own conversation process from the same settings.
+    /// Readiness requires the JSON-RPC initialization handshake. Task execution creates a
+    /// separate isolated session with its own current authorization snapshot.
     ///
     /// # Errors
     ///
@@ -608,25 +761,21 @@ impl CodexAppServerHandle {
         settings: &CodexAppServerSettings,
         provider: &LlmProviderSettings,
     ) -> Result<Self, RuntimeError> {
-        let child = app_server_command(settings, provider)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|source| RuntimeError::Launch { command: settings.command.clone(), source })?;
-        Ok(Self { child })
+        let mut client = CodexAppServerClient::launch(settings, provider)?;
+        client.initialize()?;
+        Ok(Self { client })
     }
 
     /// Process identifier of the supervised App Server.
     #[must_use]
     pub fn pid(&self) -> u32 {
-        self.child.id()
+        self.client.child.id()
     }
 
     /// Non-blocking exit poll: `None` while the process is still running, `Some` with its final
     /// status once it has terminated.
     pub fn try_exit(&mut self) -> Option<std::process::ExitStatus> {
-        self.child.try_wait().ok().flatten()
+        self.client.child.try_wait().ok().flatten()
     }
 
     /// Terminates the supervised process. Already-exited processes are reaped and reported as
@@ -636,11 +785,9 @@ impl CodexAppServerHandle {
     ///
     /// Returns an error when the process cannot be killed or reaped.
     pub fn stop(&mut self) -> Result<(), RuntimeError> {
-        if self.try_exit().is_some() {
-            return Ok(());
-        }
-        self.child.kill().map_err(RuntimeError::Stop)?;
-        self.child.wait().map_err(RuntimeError::Stop)?;
+        self.client.ownership.take();
+        execution::stop_child(&mut self.client.child);
+        self.client.child.wait().map_err(RuntimeError::Stop)?;
         Ok(())
     }
 }
@@ -653,8 +800,8 @@ impl Drop for CodexAppServerHandle {
 
 impl Drop for CodexAppServerClient {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.ownership.take();
+        execution::stop_child(&mut self.child);
     }
 }
 

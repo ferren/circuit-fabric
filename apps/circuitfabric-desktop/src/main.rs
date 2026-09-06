@@ -378,16 +378,15 @@ fn main() {
             }
         }
 
-        const fn is_placeholder(self) -> bool {
-            matches!(self, Self::ClaudeCode | Self::Dsh)
-        }
-
         const fn summary(self, language: UiLanguage) -> &'static str {
             match self {
                 Self::CodexAppServer => language
                     .choose("本地子进程 · stdio JSON-RPC", "Local child process · stdio JSON-RPC"),
-                Self::ClaudeCode | Self::Dsh => {
-                    language.choose("占位适配器 · 规划中", "Placeholder adapter · planned")
+                Self::ClaudeCode => {
+                    language.choose("本地任务 · JSON 输出", "Local task · JSON output")
+                }
+                Self::Dsh => {
+                    language.choose("DeepSeek Harness · headless", "DeepSeek Harness · headless")
                 }
             }
         }
@@ -532,6 +531,26 @@ fn main() {
         new_tool_id: Entity<InputState>,
         new_tool_kind: ToolAuthorizationKind,
         new_tool_scope: ToolScope,
+        catalog: circuitfabric_codex_runtime::tools::ToolCatalog,
+        catalog_id: Entity<InputState>,
+        catalog_source: Entity<InputState>,
+        catalog_args: Entity<InputState>,
+        catalog_env: Entity<InputState>,
+        adapters: circuitfabric_codex_runtime::execution::AdapterSettings,
+        adapter_command: Entity<InputState>,
+        adapter_provider: Entity<InputState>,
+        task_prompt: Entity<InputState>,
+        task_image: Entity<InputState>,
+        task_result: String,
+        task_cancel: Option<circuitfabric_codex_runtime::execution::Cancellation>,
+    }
+
+    impl Drop for ControlPlaneView {
+        fn drop(&mut self) {
+            if let Some(cancel) = &self.task_cancel {
+                cancel.cancel();
+            }
+        }
     }
 
     impl ControlPlaneView {
@@ -666,7 +685,9 @@ fn main() {
 
         fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
             let settings_path = RuntimeSettings::default_path();
-            let settings = RuntimeSettings::load_or_default(&settings_path).unwrap_or_default();
+            let loaded = RuntimeSettings::load_or_default(&settings_path);
+            let load_error = loaded.as_ref().err().map(ToString::to_string);
+            let settings = loaded.unwrap_or_default();
             let project_registry_path = Self::project_registry_path(&settings_path);
             let (
                 project_registry,
@@ -710,6 +731,17 @@ fn main() {
                 Self::input(window, String::new(), "Choose an existing empty folder", cx);
             let new_tool_id =
                 Self::input(window, String::new(), "evidence-search, bom-export …", cx);
+            let catalog_id = Self::input(window, String::new(), "server-id", cx);
+            let catalog_source =
+                Self::input(window, String::new(), "SKILL.md 路径 / MCP 可执行文件", cx);
+            let catalog_args = Self::input(window, "[]".to_owned(), "参数 JSON 数组", cx);
+            let catalog_env = Self::input(window, String::new(), "MCP_API_KEY", cx);
+            let adapter_command =
+                Self::input(window, settings.adapters.claude_command.clone(), "可执行文件", cx);
+            let adapter_provider = Self::input(window, String::new(), "留空使用默认 Provider", cx);
+            let task_prompt = Self::input(window, String::new(), "输入任务以验证真实模型调用", cx);
+            let task_image =
+                Self::input(window, String::new(), "可选图片路径；使用 Vision 服务", cx);
             for input in
                 [&project_search, &evidence_query, &new_project_id, &new_project_root, &new_tool_id]
             {
@@ -720,7 +752,9 @@ fn main() {
                 })
                 .detach();
             }
-            let status = if project_restore_diagnostics.is_empty() {
+            let status = if let Some(error) = load_error {
+                format!("运行时配置读取失败，请修复配置后重新打开：{error}")
+            } else if project_restore_diagnostics.is_empty() {
                 "项目列表已恢复；全局运行时设置尚未修改。".to_owned()
             } else {
                 format!("项目恢复提示：{}", project_restore_diagnostics.join("；"))
@@ -771,6 +805,18 @@ fn main() {
                 codex_status: RuntimeLifecycleStatus::Stopped,
                 tool_authorizations: settings.tools,
                 new_tool_id,
+                catalog: settings.catalog,
+                catalog_id,
+                catalog_source,
+                catalog_args,
+                catalog_env,
+                adapters: settings.adapters,
+                adapter_command,
+                adapter_provider,
+                task_prompt,
+                task_image,
+                task_result: String::new(),
+                task_cancel: None,
                 new_tool_kind: ToolAuthorizationKind::Skill,
                 new_tool_scope: ToolScope::Global,
             }
@@ -909,6 +955,8 @@ fn main() {
             settings.providers = providers;
             settings.bridge.listen_address = self.bridge_address.read(cx).value().to_string();
             settings.tools = self.tool_authorizations.clone();
+            settings.catalog = self.catalog.clone();
+            settings.adapters = self.adapters.clone();
             settings
         }
 
@@ -944,7 +992,11 @@ fn main() {
                 return;
             }
             let settings = self.runtime_settings_from_form(cx);
-            let Some(provider) = settings.default_provider().cloned() else {
+            let Some(provider) = circuitfabric_codex_runtime::execution::selected_provider(
+                &settings,
+                circuitfabric_codex_runtime::execution::AgentKind::Codex,
+            )
+            .cloned() else {
                 "未启动：请先配置默认 Provider。".clone_into(&mut self.status);
                 cx.notify();
                 return;
@@ -955,63 +1007,42 @@ fn main() {
                 return;
             }
             self.default_provider_id.clone_from(&settings.default_provider_id);
-            match CodexAppServerHandle::launch(&settings.codex, &provider) {
-                Ok(mut handle) => {
-                    self.codex_status = RuntimeLifecycleStatus::Starting;
-                    self.status = format!(
-                        "正在启动 Codex App Server（Provider `{}`）…设置已写入 {}。",
-                        provider.id,
-                        self.settings_path.display()
-                    );
-                    let confirmation = cx.background_spawn(async move {
-                        for _ in 0..24 {
-                            std::thread::sleep(std::time::Duration::from_millis(50));
-                            if let Some(exit) = handle.try_exit() {
-                                return Err(format!("进程立即退出（{exit}）"));
+            self.codex_status = RuntimeLifecycleStatus::Starting;
+            self.status = format!("Codex App Server: {} / {}", provider.id, provider.model);
+            let launch = cx.background_spawn(async move {
+                CodexAppServerHandle::launch(&settings.codex, &provider)
+                    .map_err(|error| error.to_string())
+            });
+            cx.spawn_in(window, async move |view, cx| {
+                let result = launch.await;
+                cx.update(|_, cx| {
+                    view.update(cx, |view, cx| {
+                        match result {
+                            Ok(handle) => {
+                                let pid = handle.pid();
+                                view.codex_process = Some(handle);
+                                view.codex_status = RuntimeLifecycleStatus::Running { pid };
+                            }
+                            Err(reason) => {
+                                view.codex_status =
+                                    RuntimeLifecycleStatus::Failed { reason: reason.clone() };
+                                view.status = reason;
                             }
                         }
-                        Ok(handle)
-                    });
-                    cx.spawn_in(window, async move |view, cx| {
-                        let confirmation = confirmation.await;
-                        cx.update(|_window, cx| {
-                            view.update(cx, |view, cx| {
-                                match confirmation {
-                                    Ok(handle) => {
-                                        let pid = handle.pid();
-                                        view.codex_process = Some(handle);
-                                        view.codex_status = RuntimeLifecycleStatus::Running {
-                                            pid,
-                                        };
-                                        view.status = format!(
-                                            "Codex App Server 已启动（PID {pid}）。运行状态不持久化：退出 CircuitFabric 时进程随之终止。"
-                                        );
-                                    }
-                                    Err(reason) => {
-                                        view.codex_status = RuntimeLifecycleStatus::Failed {
-                                            reason: reason.clone(),
-                                        };
-                                        view.status = format!("未启动：{reason}");
-                                    }
-                                }
-                                cx.notify();
-                            })
-                            .ok();
-                        })
-                        .ok();
+                        cx.notify();
                     })
-                    .detach();
-                }
-                Err(error) => {
-                    self.codex_status =
-                        RuntimeLifecycleStatus::Failed { reason: error.to_string() };
-                    self.status = format!("未启动：{error}");
-                    cx.notify();
-                }
-            }
+                    .ok();
+                })
+                .ok();
+            })
+            .detach();
+            cx.notify();
         }
 
         fn stop_codex_runtime(&mut self, cx: &mut Context<Self>) {
+            if let Some(cancel) = &self.task_cancel {
+                cancel.cancel();
+            }
             if matches!(self.codex_status, RuntimeLifecycleStatus::Starting) {
                 "未停止：Codex App Server 正在启动，请稍候。".clone_into(&mut self.status);
                 cx.notify();
@@ -1079,6 +1110,19 @@ fn main() {
                 return;
             }
             let kind = self.new_tool_kind;
+            if requested.iter().any(|id| match kind {
+                ToolAuthorizationKind::Skill => {
+                    !self.catalog.skills.iter().any(|s| &s.id == id && s.enabled)
+                }
+                ToolAuthorizationKind::McpServer => {
+                    !self.catalog.mcp_servers.iter().any(|s| &s.id == id && s.enabled)
+                }
+            }) {
+                "未授权：请先导入技能或保存 MCP 定义，并启用所选条目。"
+                    .clone_into(&mut self.status);
+                cx.notify();
+                return;
+            }
             let kind_label = Self::tool_kind_label(kind, self.language);
             match self.new_tool_scope {
                 ToolScope::Global => {
@@ -1169,8 +1213,11 @@ fn main() {
                     } else {
                         format!("（另跳过已授权的 {skipped} 项）")
                     };
-                    match self.workspace.set_configuration(&project_id, configuration.clone()) {
-                        Ok(()) => match storage.save_configuration(&configuration) {
+                    match storage.save_configuration(&configuration) {
+                        Ok(()) => match self
+                            .workspace
+                            .set_configuration(&project_id, configuration.clone())
+                        {
                             Ok(()) => {
                                 self.new_tool_id
                                     .update(cx, |state, cx| state.set_value("", window, cx));
@@ -1182,7 +1229,9 @@ fn main() {
                                 );
                             }
                             Err(error) => {
-                                self.status = format!("已更新内存配置，但未写入项目文件：{error}");
+                                self.status = format!(
+                                    "文件已保存，但项目内存未刷新；请重新打开项目：{error}"
+                                );
                             }
                         },
                         Err(error) => self.status = format!("未授权：{error}"),
@@ -1200,6 +1249,9 @@ fn main() {
             id: &str,
             cx: &mut Context<Self>,
         ) {
+            if let Some(cancel) = &self.task_cancel {
+                cancel.cancel();
+            }
             let kind_label = Self::tool_kind_label(kind, self.language);
             match scope {
                 ToolScope::Global => {
@@ -1241,8 +1293,11 @@ fn main() {
                         }
                     };
                     list.retain(|existing| existing.as_str() != id);
-                    match self.workspace.set_configuration(&project_id, configuration.clone()) {
-                        Ok(()) => match storage.save_configuration(&configuration) {
+                    match storage.save_configuration(&configuration) {
+                        Ok(()) => match self
+                            .workspace
+                            .set_configuration(&project_id, configuration.clone())
+                        {
                             Ok(()) => {
                                 self.status = format!(
                                     "已撤销{kind_label} `{id}` 在项目 `{project_id}` 中的授权，已写入 {}。",
@@ -1250,7 +1305,9 @@ fn main() {
                                 );
                             }
                             Err(error) => {
-                                self.status = format!("已更新内存配置，但未写入项目文件：{error}");
+                                self.status = format!(
+                                    "文件已保存，但项目内存未刷新；请重新打开项目：{error}"
+                                );
                             }
                         },
                         Err(error) => self.status = format!("未撤销：{error}"),
@@ -1319,6 +1376,10 @@ fn main() {
         }
 
         fn select_project(&mut self, project_id: ProjectId, cx: &mut Context<Self>) {
+            if let Some(cancel) = &self.task_cancel {
+                cancel.cancel();
+            }
+            self.task_result.clear();
             if let Err(error) = self.project_registry.mark_opened(&project_id) {
                 self.status = format!("项目已打开，但未能记录最近活动：{error}");
             } else if let Err(error) = self.persist_project_registry() {
@@ -1643,18 +1704,6 @@ fn main() {
                 .child(label)
         }
 
-        fn todo_badge() -> impl IntoElement {
-            div()
-                .px_1p5()
-                .py_0p5()
-                .rounded_sm()
-                .text_xs()
-                .font_weight(FontWeight::MEDIUM)
-                .bg(rgb(0x00fe_f3c7))
-                .text_color(rgb(0x00b4_5309))
-                .child("TODO")
-        }
-
         /// The API-key boundary note shown wherever credentials are referenced.
         fn info_note(zh: &'static str, en: &'static str, language: UiLanguage) -> impl IntoElement {
             div()
@@ -1681,21 +1730,6 @@ fn main() {
                 .child(
                     div().text_xs().text_color(rgb(TEXT_SECONDARY)).child(language.choose(zh, en)),
                 )
-        }
-
-        /// A "planned, not implemented yet" note in the style of the section placeholders.
-        fn planned_note(text: &'static str) -> impl IntoElement {
-            div()
-                .flex()
-                .items_start()
-                .gap_2p5()
-                .p_3()
-                .rounded_lg()
-                .border_1()
-                .border_color(rgb(BORDER))
-                .bg(rgb(SURFACE_BG))
-                .child(Self::todo_badge())
-                .child(div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(text))
         }
 
         fn labeled_field(
@@ -1832,9 +1866,28 @@ fn main() {
                         .bg(rgb(if selected { 0x00f0_f9ff } else { CARD_BG }))
                         .cursor_pointer()
                         .hover(|this| this.border_color(rgb(ACCENT_SOFT)))
-                        .on_click(move |_, _, cx| {
+                        .on_click(move |_, window, cx| {
                             selector.update(cx, |view, cx| {
                                 view.agents_selection = AgentsSelection::Runtime(adapter);
+                                let (command, provider) = match adapter {
+                                    RuntimeAdapter::ClaudeCode => (
+                                        &view.adapters.claude_command,
+                                        &view.adapters.claude_provider_id,
+                                    ),
+                                    RuntimeAdapter::Dsh => {
+                                        (&view.adapters.dsh_command, &view.adapters.dsh_provider_id)
+                                    }
+                                    RuntimeAdapter::CodexAppServer => (
+                                        &view.adapters.claude_command,
+                                        &view.adapters.codex_provider_id,
+                                    ),
+                                };
+                                let command = command.clone();
+                                let provider = provider.clone();
+                                view.adapter_command
+                                    .update(cx, |input, cx| input.set_value(command, window, cx));
+                                view.adapter_provider
+                                    .update(cx, |input, cx| input.set_value(provider, window, cx));
                                 cx.notify();
                             });
                         })
@@ -1856,24 +1909,17 @@ fn main() {
                                         })
                                         .child(adapter.label()),
                                 )
-                                .child(
-                                    div()
-                                        .ml_auto()
-                                        .flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .when(adapter.is_placeholder(), |row| {
-                                            row.child(Self::todo_badge())
-                                        })
-                                        .when(is_codex, |row| {
-                                            row.child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(rgb(TEXT_MUTED))
-                                                    .child(status_label.clone()),
-                                            )
-                                        }),
-                                ),
+                                .child(div().ml_auto().flex().items_center().gap_2().when(
+                                    is_codex,
+                                    |row| {
+                                        row.child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(TEXT_MUTED))
+                                                .child(status_label.clone()),
+                                        )
+                                    },
+                                )),
                         )
                         .child(
                             div()
@@ -2025,7 +2071,7 @@ fn main() {
                     self.render_codex_runtime_detail(cx).into_any_element()
                 }
                 AgentsSelection::Runtime(adapter) => {
-                    Self::render_placeholder_adapter_detail(adapter, language).into_any_element()
+                    self.render_adapter_detail(adapter, cx).into_any_element()
                 }
                 AgentsSelection::Provider => self.render_provider_detail(cx).into_any_element(),
                 AgentsSelection::SkillsAndMcp => self.render_skills_detail(cx).into_any_element(),
@@ -2121,13 +2167,21 @@ fn main() {
             let is_running = self.codex_process.is_some();
             let is_starting = matches!(self.codex_status, RuntimeLifecycleStatus::Starting);
             let starter = entity.clone();
+            let binding_saver = entity.clone();
             let stopper = entity;
             // The endpoint launches with the default provider — the same one
             // `runtime_settings_from_form` normalizes to — so surface that link here.
             let launch_provider = self
                 .providers
                 .iter()
-                .find(|provider| provider.id.read(cx).value() == self.default_provider_id)
+                .find(|provider| {
+                    provider.id.read(cx).value()
+                        == *if self.adapters.codex_provider_id.is_empty() {
+                            &self.default_provider_id
+                        } else {
+                            &self.adapters.codex_provider_id
+                        }
+                })
                 .or_else(|| self.providers.first());
             let launch_provider_summary = match launch_provider {
                 Some(provider) => format!(
@@ -2222,7 +2276,7 @@ fn main() {
                                 )
                                 .child(
                                     Button::new("stop-codex-runtime")
-                                        .disabled(!is_running)
+                                        .disabled(!is_running && self.task_cancel.is_none())
                                         .label(language.choose("停止", "Stop"))
                                         .on_click(move |_, _, cx| {
                                             stopper.update(cx, ControlPlaneView::stop_codex_runtime);
@@ -2233,8 +2287,8 @@ fn main() {
                             div().text_xs().text_color(rgb(TEXT_SECONDARY)).child(format!(
                                 "{}{}",
                                 language.choose(
-                                    "启动使用默认 Provider：",
-                                    "Launch uses the default provider: "
+                                    "下次启动使用 Provider：",
+                                    "Next launch provider: "
                                 ),
                                 launch_provider_summary,
                             )),
@@ -2276,62 +2330,187 @@ fn main() {
                     "API keys are referenced by environment-variable name only (configured per LLM provider); CircuitFabric never stores or echoes a key value.",
                     language,
                 ))
+                .child(Self::labeled_field("Provider ID（留空使用默认项）", "codex-provider", None, &self.adapter_provider))
+                .child(Button::new("save-codex-binding").label("保存关联").on_click(move |_, _, cx| {
+                    binding_saver.update(cx, |view, cx| {
+                        let before = view.adapters.codex_provider_id.clone();
+                        view.adapters.codex_provider_id = view.adapter_provider.read(cx).value().to_string();
+                        match view.runtime_settings_from_form(cx).save(&view.settings_path) {
+                            Ok(()) => "已保存关联；新任务立即使用，连接检查进程须重启后生效".clone_into(&mut view.status),
+                            Err(error) => { view.adapters.codex_provider_id = before; view.status = format!("未保存：{error}"); }
+                        }
+                        cx.notify();
+                    });
+                }))
+                .child(self.render_task_controls(RuntimeAdapter::CodexAppServer, cx))
         }
 
-        fn render_placeholder_adapter_detail(
+        fn effective_grants(&self) -> ToolAuthorizationSettings {
+            let mut grants = self.tool_authorizations.clone();
+            if let Some(configuration) =
+                self.selected_project.as_ref().and_then(|id| self.workspace.configuration(id))
+            {
+                grants.authorized_skill_ids.extend(configuration.enabled_skill_ids.clone());
+                grants
+                    .authorized_mcp_server_ids
+                    .extend(configuration.enabled_mcp_server_ids.clone());
+            }
+            grants.authorized_skill_ids.sort();
+            grants.authorized_skill_ids.dedup();
+            grants.authorized_mcp_server_ids.sort();
+            grants.authorized_mcp_server_ids.dedup();
+            grants
+        }
+
+        fn run_agent_task(
+            &mut self,
             adapter: RuntimeAdapter,
-            language: UiLanguage,
-        ) -> impl IntoElement {
-            let (description, next_step) = match adapter {
-                RuntimeAdapter::ClaudeCode => (
-                    language.choose(
-                        "Claude Code 适配器将作为第二个 agent-runtime 接入，与 Codex App Server 共享相同的端点、生命周期、授权与审计边界。",
-                        "The Claude Code adapter will join as a second agent runtime, sharing the same endpoint, lifecycle, authorization, and audit boundaries as the Codex App Server.",
-                    ),
-                    language.choose(
-                        "TODO：接入 Claude Code 运行时端点、启动/停止生命周期与授权清单。",
-                        "TODO: Add the Claude Code runtime endpoint, start/stop lifecycle, and authorization list.",
-                    ),
-                ),
-                RuntimeAdapter::Dsh | RuntimeAdapter::CodexAppServer => (
-                    language.choose(
-                        "DSH 适配器处于规划阶段，将复用统一的运行时端点与授权模型，不会引入第二套配置界面。",
-                        "The DSH adapter is planned and will reuse the unified runtime endpoint and authorization model instead of a second configuration surface.",
-                    ),
-                    language.choose(
-                        "TODO：确定 DSH 传输方式并接入统一生命周期。",
-                        "TODO: Decide the DSH transport and adopt the unified lifecycle.",
-                    ),
-                ),
+            window: &mut Window,
+            cx: &mut Context<Self>,
+        ) {
+            use circuitfabric_codex_runtime::execution::{
+                AgentKind, Cancellation, run_task_with_image,
             };
+            if self.task_cancel.is_some() {
+                return;
+            }
+            let settings = self.runtime_settings_from_form(cx);
+            if let Err(error) = settings.save(&self.settings_path) {
+                self.status = format!("未执行：{error}");
+                cx.notify();
+                return;
+            }
+            let grants = self.effective_grants();
+            let mut prompt = self.task_prompt.read(cx).value().to_string();
+            let image_text = self.task_image.read(cx).value().to_string();
+            let image =
+                if adapter == RuntimeAdapter::CodexAppServer && !image_text.trim().is_empty() {
+                    Some(PathBuf::from(image_text))
+                } else {
+                    None
+                };
+            if let Some(instructions) = self
+                .selected_project
+                .as_ref()
+                .and_then(|id| self.workspace.configuration(id))
+                .and_then(|c| c.agent_instructions.as_ref())
+            {
+                prompt = format!("{instructions}\n\n{prompt}");
+            }
+            let kind = match adapter {
+                RuntimeAdapter::CodexAppServer => AgentKind::Codex,
+                RuntimeAdapter::ClaudeCode => AgentKind::Claude,
+                RuntimeAdapter::Dsh => AgentKind::Dsh,
+            };
+            let cancel = Cancellation::default();
+            self.task_cancel = Some(cancel.clone());
+            let project = self.selected_project.clone();
+            let provider =
+                circuitfabric_codex_runtime::execution::selected_provider(&settings, kind);
+            let snapshot = provider
+                .map_or_else(String::new, |p| format!("{} / {} / {}", p.id, p.model, p.base_url));
+            self.task_result = format!(
+                "正在调用 {}：{snapshot}。使用已保存快照；修改配置在下次任务生效。",
+                adapter.label()
+            );
+            let work = cx.background_spawn(async move {
+                run_task_with_image(&settings, kind, &grants, &prompt, image.as_deref(), &cancel)
+            });
+            cx.spawn_in(window, async move |view, cx| {
+                let result = work.await;
+                cx.update(|_, cx| {
+                    view.update(cx, |view, cx| {
+                        view.task_cancel = None;
+                        if view.selected_project == project {
+                            view.task_result = match result {
+                                Ok(output) => format!("任务完成（{snapshot}）\n{output}"),
+                                Err(error) => format!("任务未完成（{snapshot}）：{error}"),
+                            };
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .ok();
+            })
+            .detach();
+            cx.notify();
+        }
+
+        fn render_task_controls(
+            &mut self,
+            adapter: RuntimeAdapter,
+            cx: &mut Context<Self>,
+        ) -> impl IntoElement {
+            let runner = cx.entity().clone();
+            let stopper = runner.clone();
             div()
-                .flex_1()
-                .min_w(px(0.))
                 .v_flex()
-                .gap_4()
-                .p_5()
-                .rounded_xl()
-                .border_1()
-                .border_color(rgb(BORDER))
-                .bg(rgb(CARD_BG))
+                .gap_2()
+                .child(Self::labeled_field("任务", "runtime-task", None, &self.task_prompt))
+                .when(adapter == RuntimeAdapter::CodexAppServer, |panel| {
+                    panel.child(Self::labeled_field(
+                        "图片（可选）",
+                        "runtime-image",
+                        None,
+                        &self.task_image,
+                    ))
+                })
                 .child(
                     div()
                         .flex()
-                        .items_center()
                         .gap_2()
                         .child(
-                            div()
-                                .text_xl()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(adapter.label()),
+                            Button::new("run-agent-task")
+                                .label("执行任务")
+                                .primary()
+                                .disabled(self.task_cancel.is_some())
+                                .on_click(move |_, window, cx| {
+                                    runner.update(cx, |view, cx| {
+                                        view.run_agent_task(adapter, window, cx);
+                                    });
+                                }),
                         )
-                        .child(Self::todo_badge()),
+                        .child(
+                            Button::new("cancel-agent-task")
+                                .label("取消任务")
+                                .disabled(self.task_cancel.is_none())
+                                .on_click(move |_, _, cx| {
+                                    stopper.update(cx, |view, cx| {
+                                        if let Some(cancel) = &view.task_cancel {
+                                            cancel.cancel();
+                                        }
+                                        view.task_result = "正在取消并清理进程…".into();
+                                        cx.notify();
+                                    });
+                                }),
+                        ),
                 )
-                .child(div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(description))
-                .child(Self::planned_note(next_step))
+                .child(div().text_sm().child(self.task_result.clone()))
         }
 
-        #[allow(clippy::too_many_lines)]
+        fn render_adapter_detail(
+            &mut self,
+            adapter: RuntimeAdapter,
+            cx: &mut Context<Self>,
+        ) -> impl IntoElement {
+            let saver = cx.entity().clone();
+            div().flex_1().min_w(px(0.)).v_flex().gap_3().p_5().bg(rgb(CARD_BG)).rounded_xl()
+                .child(div().text_xl().child(adapter.label()))
+                .child("每次执行创建独立任务进程；完成、失败或取消后清理。Claude Code 使用 Anthropic Messages 协议。")
+                .child(Self::labeled_field("运行时命令", "adapter-command", None, &self.adapter_command))
+                .child(Self::labeled_field("Provider ID（留空使用默认项）", "adapter-provider", None, &self.adapter_provider))
+                .child(Button::new("save-adapter").label("保存关联").on_click(move |_, _, cx| { saver.update(cx, |view, cx| {
+                    let before = view.adapters.clone();
+                    let command = view.adapter_command.read(cx).value().to_string();
+                    let provider = view.adapter_provider.read(cx).value().to_string();
+                    match adapter { RuntimeAdapter::ClaudeCode => { view.adapters.claude_command = command; view.adapters.claude_provider_id = provider; }, RuntimeAdapter::Dsh => { view.adapters.dsh_command = command; view.adapters.dsh_provider_id = provider; }, RuntimeAdapter::CodexAppServer => {} }
+                    match view.runtime_settings_from_form(cx).save(&view.settings_path) { Ok(()) => view.status = "已保存运行时关联；下次任务生效".into(), Err(error) => { view.adapters = before; view.status = format!("未保存：{error}"); } }
+                    cx.notify();
+                }); }))
+                .child(self.render_task_controls(adapter, cx))
+        }
+
         fn render_provider_detail(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
             let entity = cx.entity().clone();
             let language = self.language;
@@ -2576,6 +2755,315 @@ fn main() {
         }
 
         #[allow(clippy::too_many_lines)]
+        fn render_catalog(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+            let entity = cx.entity().clone();
+            let skill_importer = entity.clone();
+            let mcp_saver = entity.clone();
+            let mut rows = div().v_flex().gap_2();
+            for skill in self.catalog.skills.clone() {
+                let remover = entity.clone();
+                let toggler = entity.clone();
+                let id = skill.id.clone();
+                let toggle_id = id.clone();
+                let authorizer = entity.clone();
+                let grant_id = id.clone();
+                let previewer = entity.clone();
+                let preview_id = id.clone();
+                rows = rows.child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .child(format!(
+                            "技能 {} · {} · {}",
+                            skill.id,
+                            if skill.enabled { "启用" } else { "停用" },
+                            skill.path.display()
+                        ))
+                        .child(
+                            Button::new(format!("skill-grant-{id}"))
+                                .label("授权到所选作用域")
+                                .on_click(move |_, window, cx| {
+                                    authorizer.update(cx, |view, cx| {
+                                        view.new_tool_kind = ToolAuthorizationKind::Skill;
+                                        view.new_tool_id.update(cx, |input, cx| {
+                                            input.set_value(grant_id.clone(), window, cx)
+                                        });
+                                        view.authorize_tool(window, cx);
+                                    });
+                                }),
+                        )
+                        .child(Button::new(format!("skill-preview-{id}")).label("详情").on_click(
+                            move |_, _, cx| {
+                                previewer.update(cx, |view, cx| {
+                                    view.status = match view.catalog.skill_instructions(
+                                        &ToolAuthorizationSettings {
+                                            authorized_skill_ids: vec![preview_id.clone()],
+                                            authorized_mcp_server_ids: vec![],
+                                        },
+                                    ) {
+                                        Ok(text) => text,
+                                        Err(error) => format!("无法读取技能：{error}"),
+                                    };
+                                    cx.notify();
+                                });
+                            },
+                        ))
+                        .child(
+                            Button::new(format!("skill-toggle-{id}")).label("启用/停用").on_click(
+                                move |_, _, cx| {
+                                    toggler.update(cx, |view, cx| {
+                                        let previous = view.catalog.clone();
+                                        if let Some(s) = view
+                                            .catalog
+                                            .skills
+                                            .iter_mut()
+                                            .find(|s| s.id == toggle_id)
+                                        {
+                                            s.enabled = !s.enabled;
+                                        }
+                                        view.persist_catalog(previous, cx);
+                                    });
+                                },
+                            ),
+                        )
+                        .child(Button::new(format!("skill-delete-{id}")).label("删除").on_click(
+                            move |_, _, cx| {
+                                remover.update(cx, |view, cx| {
+                                    let previous = view.catalog.clone();
+                                    view.catalog.skills.retain(|s| s.id != id);
+                                    view.persist_catalog(previous, cx);
+                                });
+                            },
+                        )),
+                );
+            }
+            for server in self.catalog.mcp_servers.clone() {
+                let remover = entity.clone();
+                let tester = entity.clone();
+                let editor = entity.clone();
+                let toggler = entity.clone();
+                let id = server.id.clone();
+                let test_id = id.clone();
+                let toggle_id = id.clone();
+                let authorizer = entity.clone();
+                let grant_id = id.clone();
+                rows = rows.child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .child(format!(
+                            "MCP {} · {} · {}",
+                            server.id,
+                            if server.enabled { "启用" } else { "停用" },
+                            server.command
+                        ))
+                        .child(
+                            Button::new(format!("mcp-grant-{id}"))
+                                .label("授权到所选作用域")
+                                .on_click(move |_, window, cx| {
+                                    authorizer.update(cx, |view, cx| {
+                                        view.new_tool_kind = ToolAuthorizationKind::McpServer;
+                                        view.new_tool_id.update(cx, |input, cx| {
+                                            input.set_value(grant_id.clone(), window, cx)
+                                        });
+                                        view.authorize_tool(window, cx);
+                                    });
+                                }),
+                        )
+                        .child(Button::new(format!("mcp-edit-{id}")).label("编辑").on_click(
+                            move |_, window, cx| {
+                                editor.update(cx, |view, cx| {
+                                    view.catalog_id.update(cx, |input, cx| {
+                                        input.set_value(server.id.clone(), window, cx);
+                                    });
+                                    view.catalog_source.update(cx, |input, cx| {
+                                        input.set_value(server.command.clone(), window, cx);
+                                    });
+                                    view.catalog_args.update(cx, |input, cx| {
+                                        input.set_value(
+                                            serde_json::to_string(&server.args).unwrap_or_default(),
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                    view.catalog_env.update(cx, |input, cx| {
+                                        input.set_value(
+                                            server.environment_variables.join(","),
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                    cx.notify();
+                                });
+                            },
+                        ))
+                        .child(Button::new(format!("mcp-toggle-{id}")).label("启用/停用").on_click(
+                            move |_, _, cx| {
+                                toggler.update(cx, |view, cx| {
+                                    let previous = view.catalog.clone();
+                                    if let Some(s) = view
+                                        .catalog
+                                        .mcp_servers
+                                        .iter_mut()
+                                        .find(|s| s.id == toggle_id)
+                                    {
+                                        s.enabled = !s.enabled;
+                                    }
+                                    view.persist_catalog(previous, cx);
+                                });
+                            },
+                        ))
+                        .child(
+                            Button::new(format!("mcp-test-{id}")).label("连接并发现工具").on_click(
+                                move |_, window, cx| {
+                                    tester.update(cx, |view, cx| {
+                                        let catalog = view.catalog.clone();
+                                        let grants = view.effective_grants();
+                                        let id = test_id.clone();
+                                        view.status = "正在连接 MCP…".into();
+                                        let work = cx.background_spawn(async move {
+                                            catalog
+                                                .list_tools(&id, &grants)
+                                                .map(|value| value.to_string())
+                                                .map_err(|e| e.to_string())
+                                        });
+                                        cx.spawn_in(window, async move |view, cx| {
+                                            let result = work.await;
+                                            cx.update(|_, cx| {
+                                                view.update(cx, |view, cx| {
+                                                    view.status = match result {
+                                                        Ok(tools) => {
+                                                            format!("MCP 已连接，工具：{tools}")
+                                                        }
+                                                        Err(error) => {
+                                                            format!("MCP 连接失败：{error}")
+                                                        }
+                                                    };
+                                                    cx.notify();
+                                                })
+                                                .ok();
+                                            })
+                                            .ok();
+                                        })
+                                        .detach();
+                                        cx.notify();
+                                    });
+                                },
+                            ),
+                        )
+                        .child(Button::new(format!("mcp-delete-{id}")).label("删除").on_click(
+                            move |_, _, cx| {
+                                remover.update(cx, |view, cx| {
+                                    let previous = view.catalog.clone();
+                                    view.catalog.mcp_servers.retain(|s| s.id != id);
+                                    view.persist_catalog(previous, cx);
+                                });
+                            },
+                        )),
+                );
+            }
+            div()
+                .v_flex()
+                .gap_2()
+                .child("技能与 MCP 定义（保存定义后，在下方选择作用域授权）")
+                .child(Self::labeled_field("MCP 标识", "catalog-id", None, &self.catalog_id))
+                .child(Self::labeled_field(
+                    "技能文件/目录路径，或 MCP 启动程序",
+                    "catalog-source",
+                    None,
+                    &self.catalog_source,
+                ))
+                .child(Self::labeled_field(
+                    "MCP 参数（JSON 数组）",
+                    "catalog-args",
+                    None,
+                    &self.catalog_args,
+                ))
+                .child(Self::labeled_field(
+                    "MCP 环境变量名（逗号分隔）",
+                    "catalog-env",
+                    None,
+                    &self.catalog_env,
+                ))
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(Button::new("import-skill").label("导入技能").on_click(
+                            move |_, _, cx| {
+                                skill_importer.update(cx, |view, cx| {
+                                    let previous = view.catalog.clone();
+                                    let path = PathBuf::from(
+                                        view.catalog_source.read(cx).value().to_string(),
+                                    );
+                                    match view.catalog.import_skill(&path) {
+                                        Ok(_) => view.persist_catalog(previous, cx),
+                                        Err(error) => {
+                                            view.status = format!("导入失败：{error}");
+                                            cx.notify();
+                                        }
+                                    }
+                                });
+                            },
+                        ))
+                        .child(Button::new("save-mcp").label("新增/保存 MCP").on_click(
+                            move |_, _, cx| {
+                                mcp_saver.update(cx, |view, cx| {
+                                    let Ok(args) = serde_json::from_str::<Vec<String>>(
+                                        &view.catalog_args.read(cx).value(),
+                                    ) else {
+                                        view.status = "参数必须是字符串 JSON 数组".into();
+                                        cx.notify();
+                                        return;
+                                    };
+                                    let previous = view.catalog.clone();
+                                    let id = view.catalog_id.read(cx).value().to_string();
+                                    view.catalog.mcp_servers.retain(|s| s.id != id);
+                                    view.catalog.mcp_servers.push(
+                                        circuitfabric_codex_runtime::tools::McpServerDefinition {
+                                            id,
+                                            command: view
+                                                .catalog_source
+                                                .read(cx)
+                                                .value()
+                                                .to_string(),
+                                            args,
+                                            environment_variables: Self::parse_tool_ids(
+                                                &view.catalog_env.read(cx).value(),
+                                            ),
+                                            enabled: true,
+                                        },
+                                    );
+                                    view.persist_catalog(previous, cx);
+                                });
+                            },
+                        )),
+                )
+                .child(rows)
+        }
+
+        fn persist_catalog(
+            &mut self,
+            previous: circuitfabric_codex_runtime::tools::ToolCatalog,
+            cx: &mut Context<Self>,
+        ) {
+            match self.runtime_settings_from_form(cx).save(&self.settings_path) {
+                Ok(()) => {
+                    if let Some(cancel) = &self.task_cancel {
+                        cancel.cancel();
+                    }
+                    self.status = "已保存定义；当前任务已请求取消，下次任务使用新配置".into();
+                }
+                Err(error) => {
+                    self.catalog = previous;
+                    self.status = format!("未保存：{error}");
+                }
+            }
+            cx.notify();
+        }
+
         fn render_skills_detail(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
             let entity = cx.entity().clone();
             let language = self.language;
@@ -2739,12 +3227,13 @@ fn main() {
                         .child(
                             div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(
                                 language.choose(
-                                    "运行时可加载的技能与 MCP 服务器以授权清单为准：全局作用域对所有项目生效，项目作用域只写入该项目的配置文件。",
+                                    "全局授权与当前项目授权取并集；从一个作用域撤销，不会删除另一作用域的授权。停用定义对所有作用域生效。",
                                     "Runtimes may only load authorized skills and MCP servers: the global scope applies to every project, the project scope writes to that project's own configuration file.",
                                 ),
                             ),
                         ),
                 )
+                .child(self.render_catalog(cx))
                 .child(
                     div()
                         .v_flex()
