@@ -26,6 +26,24 @@ pub enum Capability {
     BridgeContext,
 }
 
+impl Capability {
+    /// Wire identifier for this capability, identical to its kebab-case serialization.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Inspect => "inspect",
+            Self::Preview => "preview",
+            Self::Apply => "apply",
+            Self::Readback => "readback",
+            Self::Rollback => "rollback",
+            Self::Drc => "drc",
+            Self::VisualCapture => "visual-capture",
+            Self::BridgeChat => "bridge-chat",
+            Self::BridgeContext => "bridge-context",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BridgeUiManifest {
     pub entrypoint: String,
@@ -90,5 +108,24 @@ mod tests {
         };
 
         assert_eq!(manifest.api_version, "circuitfabric-plugin/v1");
+    }
+
+    #[test]
+    fn capability_names_match_their_wire_serialization() {
+        let capabilities = [
+            Capability::Inspect,
+            Capability::Preview,
+            Capability::Apply,
+            Capability::Readback,
+            Capability::Rollback,
+            Capability::Drc,
+            Capability::VisualCapture,
+            Capability::BridgeChat,
+            Capability::BridgeContext,
+        ];
+        for capability in capabilities {
+            let serialized = serde_json::to_value(&capability).expect("capability serializes");
+            assert_eq!(serialized, serde_json::Value::String(capability.as_str().to_owned()));
+        }
     }
 }

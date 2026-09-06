@@ -971,6 +971,7 @@ dependencies = [
  "gpui-base",
  "gpui-component",
  "gpui_platform",
+ "jlcircuit-eda-bridge",
  "raw-window-handle",
  "rfd",
  "serde_json",
@@ -992,6 +993,7 @@ version = "0.1.0"
 dependencies = [
  "circuitfabric-contracts",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

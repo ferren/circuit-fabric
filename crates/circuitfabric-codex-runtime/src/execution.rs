@@ -574,7 +574,11 @@ impl Drop for RunEnvironment {
     }
 }
 
-pub(crate) fn stop_child(child: &mut Child) {
+/// Terminates a supervised child together with any process tree it created.
+///
+/// This is the sanctioned kill path for supervised local processes: it never
+/// turns an already-exited process into an error.
+pub fn stop_child(child: &mut Child) {
     if child.try_wait().ok().flatten().is_some() {
         return;
     }
@@ -592,13 +596,19 @@ pub(crate) fn stop_child(child: &mut Child) {
 
 /// The OS closes this job even if the application exits without running destructors.
 #[derive(Debug)]
-pub(crate) struct ProcessOwnership {
+pub struct ProcessOwnership {
     #[cfg(windows)]
     _job: win32job::Job,
 }
 
 impl ProcessOwnership {
-    pub(crate) fn attach(child: &mut Child) -> Result<Self, RuntimeError> {
+    /// Places the child in a kill-on-close job so it cannot outlive the supervisor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error (after stopping the child) when the OS job boundary
+    /// cannot be established.
+    pub fn attach(child: &mut Child) -> Result<Self, RuntimeError> {
         #[cfg(windows)]
         {
             use std::os::windows::io::AsRawHandle;

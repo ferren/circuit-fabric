@@ -3,6 +3,9 @@
 //! This crate is intentionally independent from JLCircuit-Agent. It only establishes the
 //! `CircuitFabric` plugin contract; no `JLCircuit` SDK or copied bridge code is present here.
 
+pub mod probe;
+pub mod supervision;
+
 use circuitfabric_plugin_api::{
     BridgeSessionContext, BridgeSessionRequest, BridgeUiManifest, Capability, EdaBridge,
     PLUGIN_API_VERSION, PluginKind, PluginManifest,

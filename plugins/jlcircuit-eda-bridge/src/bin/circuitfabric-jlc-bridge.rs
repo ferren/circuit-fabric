@@ -22,6 +22,7 @@ use circuitfabric_codex_runtime::{
     RuntimeSettings,
     execution::{AgentKind, Cancellation, run_task},
 };
+use circuitfabric_plugin_api::EdaBridge as _;
 use circuitfabric_project::{ProjectRegistry, ProjectStorage};
 use serde_json::{Value, json};
 
@@ -182,6 +183,26 @@ fn serve_connection(mut stream: TcpStream, config_path: &std::path::Path) -> Res
                 )?;
             }
             Some("ping") => send_json(&mut stream, json!({ "type": "pong" }))?,
+            Some("status") => {
+                // Connection-test surface for the desktop control plane: reports the
+                // protocol version and the plugin manifest's declared capabilities.
+                let bridge_manifest = jlcircuit_eda_bridge::JlcircuitEdaBridge::default();
+                let manifest = bridge_manifest.manifest();
+                send_json(
+                    &mut stream,
+                    json!({
+                        "type": "status_ack",
+                        "protocolVersion": BRIDGE_PROTOCOL_VERSION,
+                        "bridge": "CircuitFabric",
+                        "pluginId": manifest.id.clone(),
+                        "capabilities": manifest
+                            .capabilities
+                            .iter()
+                            .map(|capability| json!(capability.as_str()))
+                            .collect::<Vec<_>>(),
+                    }),
+                )?;
+            }
             _ => send_json(
                 &mut stream,
                 json!({ "type": "error", "message": "unsupported bridge message" }),

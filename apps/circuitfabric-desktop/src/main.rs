@@ -178,7 +178,7 @@ impl UiLanguage {
             (Self::SimplifiedChinese, ControlPlaneScreen::EdaServices) => (
                 "EDA 服务",
                 "已连接 EDA 后端将展示能力、健康度、端点和回读状态。",
-                "TODO：加入 bridge 发现、健康上报和能力协商。",
+                "TODO：加入 EDA 后端/bridge 插件列表与最后回读结果上报。",
             ),
             (Self::SimplifiedChinese, ControlPlaneScreen::SessionsAndTasks) => (
                 "会话与任务",
@@ -223,7 +223,7 @@ impl UiLanguage {
             (Self::English, ControlPlaneScreen::EdaServices) => (
                 "EDA services",
                 "Connected EDA backends will show capabilities, health, endpoint, and readback status.",
-                "TODO: Add bridge discovery, health reporting, and capability negotiation.",
+                "TODO: Add the EDA backend/bridge plugin list and last-readback reporting.",
             ),
             (Self::English, ControlPlaneScreen::SessionsAndTasks) => (
                 "Sessions & tasks",
@@ -293,6 +293,7 @@ fn main() {
         collections::BTreeMap,
         path::{Path, PathBuf},
         sync::Arc,
+        time::{Duration, Instant},
     };
 
     use circuitfabric_codex_runtime::{
@@ -316,6 +317,10 @@ fn main() {
         button::{Button, ButtonVariants},
         input::{Input, InputEvent, InputState},
         scroll::ScrollableElement as _,
+    };
+    use jlcircuit_eda_bridge::{
+        probe::{self, BridgeStatusReport},
+        supervision::BridgeProcessHandle,
     };
     const SIDEBAR_MARK: &[u8] =
         include_bytes!("../../../assets/branding/circuitfabric-sidebar-mark.png");
@@ -447,6 +452,62 @@ fn main() {
         }
     }
 
+    /// Reachability of the bridge endpoint, from deliberate probes — never guessed.
+    /// Kept separate from [`RuntimeLifecycleStatus`]: the port may be owned by a
+    /// bridge this app did not start, and a supervised child may die while the
+    /// port is still briefly open.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum BridgeHealth {
+        /// No probe has completed yet; nothing is claimed either way.
+        Unknown,
+        /// The last probe could not connect: nothing is listening.
+        Unreachable { reason: String },
+        /// The last probe connected; `at` is when that succeeded.
+        Listening { at: Instant },
+    }
+
+    impl BridgeHealth {
+        const fn dot(&self) -> u32 {
+            match self {
+                Self::Unknown => 0x0094_a3b8,
+                Self::Unreachable { .. } => 0x00dc_2626,
+                Self::Listening { .. } => 0x0022_c55e,
+            }
+        }
+
+        fn label(&self, language: UiLanguage) -> String {
+            match self {
+                Self::Unknown => {
+                    language.choose("未知（尚未探测）", "Unknown (not probed yet)").to_owned()
+                }
+                Self::Unreachable { reason } => {
+                    format!("{}：{reason}", language.choose("离线", "Offline"))
+                }
+                Self::Listening { at } => format!(
+                    "{}（{} 前）",
+                    language.choose("在线", "Online"),
+                    elapsed_label(language, at.elapsed()),
+                ),
+            }
+        }
+    }
+
+    /// Outcome of the manual connection test: the protocol-level `status`
+    /// round-trip over the bridge WebSocket.
+    struct BridgeTestResult {
+        at: Instant,
+        outcome: Result<BridgeStatusReport, String>,
+    }
+
+    fn elapsed_label(language: UiLanguage, elapsed: Duration) -> String {
+        let seconds = elapsed.as_secs();
+        if seconds < 60 {
+            format!("{seconds}{}", language.choose(" 秒", "s"))
+        } else {
+            format!("{}{}", seconds / 60, language.choose(" 分钟", "m"))
+        }
+    }
+
     /// Where a skill or MCP-server authorization is stored.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum ToolScope {
@@ -507,6 +568,9 @@ fn main() {
         replay: SessionReplay,
     }
 
+    // One GPUI view struct accumulates the whole control plane's UI state; the
+    // independent booleans track one asynchronous in-flight action each.
+    #[allow(clippy::struct_excessive_bools)]
     struct ControlPlaneView {
         sidebar_mark: Arc<Image>,
         command: Entity<InputState>,
@@ -541,6 +605,13 @@ fn main() {
         agents_selection: AgentsSelection,
         codex_process: Option<CodexAppServerHandle>,
         codex_status: RuntimeLifecycleStatus,
+        bridge_process: Option<BridgeProcessHandle>,
+        bridge_status: RuntimeLifecycleStatus,
+        bridge_health: BridgeHealth,
+        bridge_probed_at: Option<Instant>,
+        bridge_probe_pending: bool,
+        bridge_test_pending: bool,
+        bridge_test: Option<BridgeTestResult>,
         tool_authorizations: ToolAuthorizationSettings,
         new_tool_id: Entity<InputState>,
         new_tool_kind: ToolAuthorizationKind,
@@ -818,6 +889,13 @@ fn main() {
                 agents_selection: AgentsSelection::Runtime(RuntimeAdapter::CodexAppServer),
                 codex_process: None,
                 codex_status: RuntimeLifecycleStatus::Stopped,
+                bridge_process: None,
+                bridge_status: RuntimeLifecycleStatus::Stopped,
+                bridge_health: BridgeHealth::Unknown,
+                bridge_probed_at: None,
+                bridge_probe_pending: false,
+                bridge_test_pending: false,
+                bridge_test: None,
                 tool_authorizations: settings.tools,
                 new_tool_id,
                 catalog: settings.catalog,
@@ -1100,6 +1178,230 @@ fn main() {
                     };
                 }
             }
+        }
+
+        /// Starts the `JLCircuit` EDA bridge as a supervised child process.
+        ///
+        /// The launch persists the current form first, so the bridge reads exactly
+        /// what was saved, then waits for the configured port to accept before
+        /// reporting running — an early exit is reported as a failure together
+        /// with the bridge's own stderr.
+        fn start_bridge_service(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+            if self.bridge_process.is_some()
+                || matches!(self.bridge_status, RuntimeLifecycleStatus::Starting)
+            {
+                "未启动：bridge 服务已在运行或正在启动。".clone_into(&mut self.status);
+                cx.notify();
+                return;
+            }
+            let settings = self.runtime_settings_from_form(cx);
+            if let Err(error) = settings.save(&self.settings_path) {
+                self.status = format!("未启动：设置未保存（{error}）。");
+                cx.notify();
+                return;
+            }
+            self.default_provider_id.clone_from(&settings.default_provider_id);
+            let config_path = self.settings_path.clone();
+            let address = settings.bridge.listen_address.clone();
+            let launch_address = address.clone();
+            self.bridge_status = RuntimeLifecycleStatus::Starting;
+            self.bridge_health = BridgeHealth::Unknown;
+            self.bridge_probed_at = None;
+            self.status = format!("bridge 正在启动：ws://{address}/bridge");
+            let launch = cx.background_spawn(async move {
+                BridgeProcessHandle::launch(&config_path).and_then(|mut handle| {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while Instant::now() < deadline {
+                        if let Some(exit) = handle.try_exit() {
+                            let diagnostics = handle.exit_diagnostics();
+                            let detail = if diagnostics.is_empty() {
+                                String::new()
+                            } else {
+                                format!("：{diagnostics}")
+                            };
+                            return Err(format!("bridge 进程已退出（{exit}）{detail}"));
+                        }
+                        if probe::tcp_reachable(&launch_address, Duration::from_millis(300)).is_ok()
+                        {
+                            return Ok(handle);
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    let _ = handle.stop();
+                    Err(format!("bridge 在 5 秒内未开始监听 {launch_address}"))
+                })
+            });
+            cx.spawn_in(window, async move |view, cx| {
+                let result = launch.await;
+                cx.update(|_, cx| {
+                    view.update(cx, |view, cx| {
+                        match result {
+                            Ok(handle) => {
+                                let pid = handle.pid();
+                                view.bridge_health = BridgeHealth::Listening { at: Instant::now() };
+                                view.bridge_process = Some(handle);
+                                view.bridge_status = RuntimeLifecycleStatus::Running { pid };
+                                view.status =
+                                    format!("bridge 已启动（PID {pid}）：ws://{address}/bridge");
+                            }
+                            Err(reason) => {
+                                view.bridge_status =
+                                    RuntimeLifecycleStatus::Failed { reason: reason.clone() };
+                                view.status = format!("bridge 启动失败：{reason}");
+                            }
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .ok();
+            })
+            .detach();
+            cx.notify();
+        }
+
+        /// Stops the bridge child process. A bridge this app did not start is
+        /// reported as such — its process is never touched.
+        fn stop_bridge_service(&mut self, cx: &mut Context<Self>) {
+            if matches!(self.bridge_status, RuntimeLifecycleStatus::Starting) {
+                "未停止：bridge 正在启动，请稍候。".clone_into(&mut self.status);
+                cx.notify();
+                return;
+            }
+            let Some(mut process) = self.bridge_process.take() else {
+                "bridge 服务当前不是由本应用启动的。".clone_into(&mut self.status);
+                cx.notify();
+                return;
+            };
+            let pid = process.pid();
+            match process.stop() {
+                Ok(()) => {
+                    self.bridge_status = RuntimeLifecycleStatus::Stopped;
+                    self.bridge_health = BridgeHealth::Unknown;
+                    self.bridge_probed_at = None;
+                    self.bridge_test = None;
+                    self.status = format!("已停止 bridge 服务（PID {pid}）。");
+                }
+                Err(error) => {
+                    self.bridge_status = RuntimeLifecycleStatus::Failed { reason: error.clone() };
+                    self.status = format!("停止 bridge 失败（PID {pid}）：{error}");
+                }
+            }
+            cx.notify();
+        }
+
+        /// Reconciles the bridge chip with the real process state: a bridge that
+        /// died on its own is reported as failed with its stderr, not left green.
+        fn refresh_bridge_lifecycle(&mut self) {
+            let exit = self.bridge_process.as_mut().and_then(BridgeProcessHandle::try_exit);
+            if let Some(exit) = exit {
+                let diagnostics = self
+                    .bridge_process
+                    .as_mut()
+                    .map(BridgeProcessHandle::exit_diagnostics)
+                    .unwrap_or_default();
+                self.bridge_process = None;
+                if exit.success() {
+                    self.bridge_status = RuntimeLifecycleStatus::Stopped;
+                } else {
+                    let detail = if diagnostics.is_empty() {
+                        String::new()
+                    } else {
+                        format!("：{diagnostics}")
+                    };
+                    self.bridge_status = RuntimeLifecycleStatus::Failed {
+                        reason: format!("bridge 进程已退出（{exit}）{detail}"),
+                    };
+                }
+            }
+        }
+
+        /// Runs the automatic reachability probe while the EDA services page is
+        /// visible, rate-limited to one TCP probe every 5 seconds. It never
+        /// opens the WebSocket: an attached EDA client must not be disturbed,
+        /// because the bridge serves one connection at a time.
+        fn maybe_probe_bridge_health(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+            if self.bridge_probe_pending
+                || self.bridge_probed_at.is_some_and(|at| at.elapsed() < Duration::from_secs(5))
+            {
+                return;
+            }
+            self.bridge_probe_pending = true;
+            self.bridge_probed_at = Some(Instant::now());
+            let address = self.bridge_address.read(cx).value().to_string();
+            let probe_task = cx.background_spawn(async move {
+                probe::tcp_reachable(&address, Duration::from_secs(2))
+            });
+            cx.spawn_in(window, async move |view, cx| {
+                let result = probe_task.await;
+                cx.update(|_, cx| {
+                    view.update(cx, |view, cx| {
+                        view.bridge_probe_pending = false;
+                        view.bridge_health = match result {
+                            Ok(()) => BridgeHealth::Listening { at: Instant::now() },
+                            Err(reason) => BridgeHealth::Unreachable { reason },
+                        };
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .ok();
+            })
+            .detach();
+        }
+
+        /// Manual connection test: the protocol-level `status` round-trip over
+        /// the bridge WebSocket. The bridge serves one client at a time, so the
+        /// test may time out while an EDA client is attached — that outcome is
+        /// reported as its own error, not as "offline".
+        fn test_bridge_connection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+            if self.bridge_test_pending {
+                return;
+            }
+            self.bridge_test_pending = true;
+            let address = self.bridge_address.read(cx).value().to_string();
+            let test_task = cx.background_spawn(async move {
+                probe::status(&address, Duration::from_secs(5)).map_err(|reason| {
+                    // A refused connection really is offline; anything else
+                    // (handshake timeout, malformed reply) keeps the current
+                    // health — the port may still be listening.
+                    let offline = probe::tcp_reachable(&address, Duration::from_secs(1)).is_err();
+                    (reason, offline)
+                })
+            });
+            cx.spawn_in(window, async move |view, cx| {
+                let result = test_task.await;
+                cx.update(|_, cx| {
+                    view.update(cx, |view, cx| {
+                        view.bridge_test_pending = false;
+                        let at = Instant::now();
+                        match result {
+                            Ok(report) => {
+                                let version = report.protocol_version;
+                                let bridge_name = report.bridge_name.clone();
+                                view.bridge_health = BridgeHealth::Listening { at };
+                                view.bridge_test =
+                                    Some(BridgeTestResult { at, outcome: Ok(report) });
+                                view.status =
+                                    format!("bridge 连接测试成功：协议 v{version} · {bridge_name}");
+                            }
+                            Err((reason, offline)) => {
+                                if offline {
+                                    view.bridge_health =
+                                        BridgeHealth::Unreachable { reason: reason.clone() };
+                                }
+                                view.bridge_test =
+                                    Some(BridgeTestResult { at, outcome: Err(reason) });
+                            }
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .ok();
+            })
+            .detach();
+            cx.notify();
         }
 
         /// Splits a tool-authorization input into IDs: commas (ASCII, full-width, and
@@ -2185,25 +2487,45 @@ fn main() {
 
         /// The EDA services page owns EDA-side transports: the `JLCircuit` bridge listen address
         /// lives here — not on the agent runtime endpoints — because the bridge serves the EDA
-        /// plugin, and is launched manually via `circuitfabric-jlc-bridge`, which reads the same
-        /// persisted runtime settings.
+        /// plugin. `CircuitFabric` starts and stops the `circuitfabric-jlc-bridge` process as a
+        /// supervised child, monitors its port, and offers a protocol-level connection test;
+        /// the EDA extension itself connects to `ws://<listen address>/bridge`.
         fn render_eda_services_page(
             &mut self,
-            _window: &mut Window,
+            window: &mut Window,
             cx: &mut Context<Self>,
         ) -> impl IntoElement {
+            self.maybe_probe_bridge_health(window, cx);
             let entity = cx.entity().clone();
             let language = self.language;
-            let bridge_saver = entity;
+            let bridge_saver = entity.clone();
+            let bridge_starter = entity.clone();
+            let bridge_stopper = entity.clone();
+            let bridge_tester = entity;
+            let status = self.bridge_status.clone();
+            let is_running = self.bridge_process.is_some();
+            let is_starting = matches!(self.bridge_status, RuntimeLifecycleStatus::Starting);
+            let is_test_pending = self.bridge_test_pending;
+            let address = self.bridge_address.read(cx).value().to_string();
+            let health = self.bridge_health.clone();
+            let externally_owned =
+                matches!(health, BridgeHealth::Listening { .. }) && !is_running && !is_starting;
+            let last_test = self
+                .bridge_test
+                .as_ref()
+                .map(|test| (elapsed_label(language, test.at.elapsed()), test.outcome.clone()));
+            let capabilities_reported =
+                last_test.as_ref().is_some_and(|(_, outcome)| outcome.is_ok());
             let mut planned_items = div().v_flex().gap_1p5();
             for item in [
-                language.choose("bridge 健康上报与心跳", "Bridge health reporting and heartbeat"),
                 language.choose(
-                    "能力协商（inspect / preview / apply / readback / drc…）",
-                    "Capability negotiation (inspect / preview / apply / readback / drc…)",
+                    "EDA 后端/bridge 插件列表（多后端注册与发现）",
+                    "EDA backend/bridge plugin list (multi-backend registry and discovery)",
                 ),
-                language.choose("连接测试与状态反馈", "Connection test and status feedback"),
-                language.choose("EDA 后端/bridge 插件列表", "EDA backend/bridge plugin list"),
+                language.choose(
+                    "bridge 会话与最后回读结果上报",
+                    "Bridge session and last-readback reporting",
+                ),
             ] {
                 planned_items = planned_items.child(
                     div()
@@ -2231,6 +2553,42 @@ fn main() {
                         ),
                 );
             }
+
+            // Capabilities are shown only when the bridge itself reported them
+            // in a successful connection test — never claimed on its behalf.
+            let mut capability_items = div().flex().flex_wrap().gap_1p5();
+            if let Some((_, Ok(report))) = &last_test {
+                for capability in &report.capabilities {
+                    capability_items = capability_items.child(
+                        div()
+                            .px_1p5()
+                            .py_0p5()
+                            .rounded_sm()
+                            .text_xs()
+                            .bg(rgb(0x00e0_f2fe))
+                            .text_color(rgb(0x000e_7490))
+                            .child(capability.clone()),
+                    );
+                }
+            }
+            let test_line = match &last_test {
+                None => language
+                    .choose("尚未执行连接测试。", "No connection test has been run yet.")
+                    .to_owned(),
+                Some((elapsed, Ok(report))) => format!(
+                    "{} · {elapsed}{} · {} · {} v{}",
+                    language.choose("已连接", "Connected"),
+                    language.choose(" 前", " ago"),
+                    report.bridge_name,
+                    language.choose("协议", "protocol"),
+                    report.protocol_version,
+                ),
+                Some((elapsed, Err(reason))) => format!(
+                    "{} · {elapsed}{} · {reason}",
+                    language.choose("连接失败", "Connection test failed"),
+                    language.choose(" 前", " ago"),
+                ),
+            };
 
             div()
                 .size_full()
@@ -2270,30 +2628,57 @@ fn main() {
                         .child(
                             div()
                                 .flex()
-                                .items_center()
-                                .gap_2()
+                                .items_start()
+                                .justify_between()
+                                .gap_3()
                                 .child(
                                     div()
-                                        .text_base()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .child("JLCircuit EDA bridge"),
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .text_base()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .child("JLCircuit EDA bridge"),
+                                        )
+                                        .child(
+                                            div()
+                                                .px_1p5()
+                                                .py_0p5()
+                                                .rounded_sm()
+                                                .text_xs()
+                                                .bg(rgb(0x00e0_f2fe))
+                                                .text_color(rgb(0x000e_7490))
+                                                .child(language.choose(
+                                                    "本地 WebSocket",
+                                                    "Local WebSocket",
+                                                )),
+                                        ),
                                 )
                                 .child(
                                     div()
-                                        .px_1p5()
-                                        .py_0p5()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .px_2()
+                                        .py_1()
                                         .rounded_sm()
-                                        .text_xs()
-                                        .bg(rgb(0x00e0_f2fe))
-                                        .text_color(rgb(0x000e_7490))
-                                        .child(language.choose("本地 WebSocket", "Local WebSocket")),
+                                        .bg(rgb(SURFACE_BG))
+                                        .child(status_dot(status.dot()))
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .child(status.label(language)),
+                                        ),
                                 ),
                         )
                         .child(
                             div().text_sm().text_color(rgb(TEXT_SECONDARY)).whitespace_normal().child(
-                                language.choose(
-                                    "JLCircuit 插件与本机 `circuitfabric-jlc-bridge` 进程之间的传输。bridge 由你手动启动，并读取这里保存的监听地址；CircuitFabric 不代为启动它。",
-                                    "Transport between the JLCircuit plugin and the local `circuitfabric-jlc-bridge` process. You start the bridge manually and it reads the listen address saved here; CircuitFabric does not start it for you.",
+                                language.choose_owned(
+                                    format!("JLCircuit 插件与本机 `circuitfabric-jlc-bridge` 进程之间的 WebSocket 传输。bridge 作为受监管的子进程在这里启动与停止，并读取这里保存的监听地址；EDA 插件连接 ws://{address}/bridge。"),
+                                    format!("The WebSocket transport between the JLCircuit plugin and the local `circuitfabric-jlc-bridge` process. The bridge is started and stopped here as a supervised child process and reads the listen address saved here; the EDA extension connects to ws://{address}/bridge."),
                                 ),
                             ),
                         )
@@ -2307,12 +2692,134 @@ fn main() {
                             &self.bridge_address,
                         ))
                         .child(
-                            Button::new("save-eda-bridge")
-                                .primary()
-                                .label(language.choose("保存设置", "Save settings"))
-                                .on_click(move |_, _, cx| {
-                                    bridge_saver.update(cx, ControlPlaneView::save_settings);
-                                }),
+                            div()
+                                .flex()
+                                .gap_2()
+                                .child(
+                                    Button::new("save-eda-bridge")
+                                        .primary()
+                                        .label(language.choose("保存设置", "Save settings"))
+                                        .on_click(move |_, _, cx| {
+                                            bridge_saver.update(cx, ControlPlaneView::save_settings);
+                                        }),
+                                )
+                                .child(
+                                    Button::new("start-eda-bridge")
+                                        .disabled(is_running || is_starting)
+                                        .label(language.choose("启动服务", "Start service"))
+                                        .on_click(move |_, window, cx| {
+                                            bridge_starter.update(cx, |view, cx| {
+                                                view.start_bridge_service(window, cx);
+                                            });
+                                        }),
+                                )
+                                .child(
+                                    Button::new("stop-eda-bridge")
+                                        .disabled(!is_running)
+                                        .label(language.choose("停止服务", "Stop service"))
+                                        .on_click(move |_, _, cx| {
+                                            bridge_stopper
+                                                .update(cx, ControlPlaneView::stop_bridge_service);
+                                        }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .v_flex()
+                                .gap_2()
+                                .p_4()
+                                .rounded_lg()
+                                .border_1()
+                                .border_color(rgb(BORDER))
+                                .bg(rgb(SURFACE_BG))
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(language.choose("服务监测", "Service monitoring")),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(status_dot(health.dot()))
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .whitespace_normal()
+                                                .child(health.label(language)),
+                                        ),
+                                )
+                                .when(externally_owned, |this| {
+                                    this.child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(TEXT_SECONDARY))
+                                            .whitespace_normal()
+                                            .child(language.choose(
+                                                "端口可达，但服务不是由本应用启动的（例如手动启动的 bridge）；「停止服务」只作用于本应用启动的进程。",
+                                                "The port answers, but the service was not started by this app (e.g. a manually launched bridge); Stop service only affects processes this app started.",
+                                            )),
+                                    )
+                                })
+                                .child(
+                                    div().flex().items_center().gap_2().child(
+                                        Button::new("test-eda-bridge")
+                                            .disabled(is_test_pending)
+                                            .label(if is_test_pending {
+                                                language.choose("测试中…", "Testing…")
+                                            } else {
+                                                language.choose("测试连接", "Test connection")
+                                            })
+                                            .on_click(move |_, window, cx| {
+                                                bridge_tester.update(cx, |view, cx| {
+                                                    view.test_bridge_connection(window, cx);
+                                                });
+                                            }),
+                                    ),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .whitespace_normal()
+                                        .child(test_line),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(TEXT_SECONDARY))
+                                        .whitespace_normal()
+                                        .child(language.choose(
+                                            "连接测试会临时占用 bridge 的唯一 WebSocket 连接；若 EDA 插件正连接中，测试可能超时，这不代表服务离线。",
+                                            "The connection test temporarily occupies the bridge's single WebSocket connection; if the EDA plugin is attached the test may time out, which does not mean the service is offline.",
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(TEXT_MUTED))
+                                        .child(language.choose(
+                                            "已上报能力（连接测试成功后显示）",
+                                            "Reported capabilities (shown after a successful connection test)",
+                                        )),
+                                )
+                                .when(capabilities_reported, |this| {
+                                    this.child(capability_items)
+                                })
+                                .when(!capabilities_reported, |this| {
+                                        this.child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(TEXT_MUTED))
+                                                .whitespace_normal()
+                                                .child(language.choose(
+                                                    "能力尚未上报，不展示为可执行。",
+                                                    "No capabilities reported yet; nothing is shown as executable.",
+                                                )),
+                                        )
+                                    },
+                                ),
                         ),
                 )
                 .child(
@@ -5313,6 +5820,7 @@ fn main() {
         #[allow(clippy::too_many_lines)]
         fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             self.refresh_codex_lifecycle();
+            self.refresh_bridge_lifecycle();
             let command_palette = if self.command_palette_open {
                 Some(self.render_command_palette(cx).into_any_element())
             } else {

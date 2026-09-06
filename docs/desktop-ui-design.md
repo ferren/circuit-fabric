@@ -195,9 +195,9 @@ Backend/bridge plugin list. Each card: kind, version, `capabilities` badges (`in
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-`[TODO]` heartbeat & health reporting, capability reporting, connection test.
+`[TODO]` EDA backend/bridge plugin list (multi-backend registry), bridge session & last-readback reporting.
 
-Implemented today: the page owns the JLCircuit bridge **listen address** (loopback-only, persisted into the runtime settings the manually-launched `circuitfabric-jlc-bridge` reads) — the bridge is an EDA-side transport, so its endpoint is configured here, never on the agent runtime endpoints.
+Implemented today: the page owns the whole JLCircuit bridge service. The **listen address** stays here (loopback-only, persisted into the runtime settings, applied on the next bridge start). The bridge runs as a **supervised child process** started and stopped from this page (status chip: starting / running · PID / stopped / failed, with the bridge's own stderr surfaced when it dies). **Monitoring** is layered honestly: an automatic TCP probe (every 5 s while the page is open) distinguishes offline / online / not-yet-probed without disturbing the bridge's single WebSocket client, and an explicit **connection test** performs the protocol-level `status` round-trip, reporting protocol version and the capabilities the bridge itself declares — capabilities are shown only after such a report, never claimed on the bridge's behalf. A port that answers while the process was not started by the app is labeled as externally owned.
 
 ### 5.6 Agents & Tools
 
