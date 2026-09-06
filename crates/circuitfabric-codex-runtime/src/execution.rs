@@ -107,6 +107,44 @@ pub fn run_task_with_image(
     image: Option<&std::path::Path>,
     cancel: &Cancellation,
 ) -> Result<String, RuntimeError> {
+    run_task_with_options(settings, kind, grants, prompt, image, None, cancel)
+}
+
+/// Run one task with an explicit working directory for the agent process.
+///
+/// The isolated temporary home (`CODEX_HOME` / `CLAUDE_CONFIG_DIR` / `DSH_HOME` and generated
+/// MCP configuration) is kept regardless; `working_directory` only becomes the process's
+/// current directory, which is how a project-scoped run points an agent at the project root.
+/// `None` runs in the isolated temporary directory.
+/// # Errors
+/// Rejects invalid settings, a missing working directory, unavailable keys, runtime errors and
+/// cancelled tasks.
+pub fn run_task_with_options(
+    settings: &RuntimeSettings,
+    kind: AgentKind,
+    grants: &ToolAuthorizationSettings,
+    prompt: &str,
+    image: Option<&std::path::Path>,
+    working_directory: Option<&std::path::Path>,
+    cancel: &Cancellation,
+) -> Result<String, RuntimeError> {
+    if let Some(directory) = working_directory
+        && !directory.is_dir()
+    {
+        return Err(invalid("工作目录不存在或不是文件夹"));
+    }
+    run_task_in(settings, kind, grants, prompt, image, working_directory, cancel)
+}
+
+fn run_task_in(
+    settings: &RuntimeSettings,
+    kind: AgentKind,
+    grants: &ToolAuthorizationSettings,
+    prompt: &str,
+    image: Option<&std::path::Path>,
+    working_directory: Option<&std::path::Path>,
+    cancel: &Cancellation,
+) -> Result<String, RuntimeError> {
     settings.validate()?;
     if cancel.0.load(Ordering::SeqCst) {
         return Err(invalid("任务已取消"));
@@ -154,29 +192,29 @@ pub fn run_task_with_image(
             }
         }
     }
-    let directory = RunDirectory::new()?;
+    let environment = RunEnvironment::new(working_directory)?;
     let input = format!("{instructions}\n\n{prompt}");
     if kind == AgentKind::Codex {
         let mut inputs = vec![serde_json::json!({"type":"text","text":input})];
         if let Some(path) = image {
             inputs.push(serde_json::json!({"type":"localImage","path":fs::canonicalize(path)?}));
         }
-        return run_codex(settings, &provider, &servers, &directory, grants, &inputs, cancel)
+        return run_codex(settings, &provider, &servers, &environment, grants, &inputs, cancel)
             .map(|output| redact(&output, &key, &servers));
     }
     let command = if kind == AgentKind::Claude {
-        claude_command(settings, &provider, &servers, &directory, &key)?
+        claude_command(settings, &provider, &servers, &environment.home, &key)?
     } else {
-        dsh_command(settings, &provider, &servers, &directory, &input)?
+        dsh_command(settings, &provider, &servers, &environment.home, &input)?
     };
-    execute_cli(command, &directory, input, kind, cancel, &key, &servers)
+    execute_cli(command, &environment, input, kind, cancel, &key, &servers)
 }
 
 fn run_codex(
     settings: &RuntimeSettings,
     provider: &crate::LlmProviderSettings,
     servers: &[&crate::tools::McpServerDefinition],
-    directory: &RunDirectory,
+    environment: &RunEnvironment,
     grants: &ToolAuthorizationSettings,
     input: &[serde_json::Value],
     cancel: &Cancellation,
@@ -184,8 +222,8 @@ fn run_codex(
     let mut command = crate::app_server_command(&settings.codex, provider);
     restrict_environment(&mut command, &provider.api_key_environment_variable, servers);
     command
-        .current_dir(&directory.0)
-        .env("CODEX_HOME", &directory.0)
+        .current_dir(&environment.current)
+        .env("CODEX_HOME", &environment.home)
         .args(["-c", "features.multi_agent=false"])
         .args([
             "-c",
@@ -246,7 +284,7 @@ fn claude_command(
     settings: &RuntimeSettings,
     provider: &crate::LlmProviderSettings,
     servers: &[&crate::tools::McpServerDefinition],
-    directory: &RunDirectory,
+    home: &std::path::Path,
     key: &str,
 ) -> Result<std::process::Command, RuntimeError> {
     let mut command = executable(&settings.adapters.claude_command);
@@ -264,7 +302,7 @@ fn claude_command(
             serde_json::json!({"command":server.command,"args":server.args,"env":refs}),
         );
     }
-    let path = directory.0.join("mcp.json");
+    let path = home.join("mcp.json");
     fs::write(&path, serde_json::to_vec(&serde_json::json!({"mcpServers":mcp}))?)?;
     command
         .args([
@@ -280,7 +318,7 @@ fn claude_command(
         .args(["--model", &provider.model])
         .arg("--mcp-config")
         .arg(path)
-        .env("CLAUDE_CONFIG_DIR", &directory.0)
+        .env("CLAUDE_CONFIG_DIR", home)
         .env(
             "ANTHROPIC_BASE_URL",
             provider
@@ -302,12 +340,12 @@ fn dsh_command(
     settings: &RuntimeSettings,
     provider: &crate::LlmProviderSettings,
     servers: &[&crate::tools::McpServerDefinition],
-    directory: &RunDirectory,
+    home: &std::path::Path,
     input: &str,
 ) -> Result<std::process::Command, RuntimeError> {
     let mut command = executable(&settings.adapters.dsh_command);
     restrict_environment(&mut command, &provider.api_key_environment_variable, servers);
-    let patch = directory.0.join("runtime.patch.yml");
+    let patch = home.join("runtime.patch.yml");
     let mut patches = vec![
         serde_json::json!({"id":"agent-default-model","config":{"provider":"deepseek-official","model":provider.model}}),
         serde_json::json!({"id":"llm-deepseek","config":{"baseURL":provider.base_url,"apiKeyEnv":provider.api_key_environment_variable,"thinking":"disabled","maxTokens":8192,"models":[{"id":provider.model}]}}),
@@ -366,14 +404,14 @@ fn dsh_command(
         .args(["--profile", "headless", "--patch"])
         .arg(&patch)
         .arg(input)
-        .env("DSH_HOME", directory.0.join("dsh"))
+        .env("DSH_HOME", home.join("dsh"))
         .env("DSH_TELEMETRY_DISABLED", "1");
     Ok(command)
 }
 
 fn execute_cli(
     mut command: std::process::Command,
-    directory: &RunDirectory,
+    environment: &RunEnvironment,
     input: String,
     kind: AgentKind,
     cancel: &Cancellation,
@@ -381,7 +419,7 @@ fn execute_cli(
     servers: &[&crate::tools::McpServerDefinition],
 ) -> Result<String, RuntimeError> {
     command
-        .current_dir(&directory.0)
+        .current_dir(&environment.current)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -499,10 +537,19 @@ fn restrict_environment(
 }
 
 static RUN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-struct RunDirectory(PathBuf);
-impl RunDirectory {
-    fn new() -> Result<Self, RuntimeError> {
-        let path = env::temp_dir().join(format!(
+
+/// Per-run filesystem scope: an isolated temporary configuration home plus the agent
+/// process's working directory (a scoped project root, or the home itself when unscoped).
+///
+/// Only the isolated home is ever removed on drop; a scoped current directory — for example a
+/// project root — always belongs to the user.
+struct RunEnvironment {
+    home: PathBuf,
+    current: PathBuf,
+}
+impl RunEnvironment {
+    fn new(working_directory: Option<&std::path::Path>) -> Result<Self, RuntimeError> {
+        let home = env::temp_dir().join(format!(
             "circuitfabric-run-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -511,14 +558,15 @@ impl RunDirectory {
                 .as_nanos(),
             RUN_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::create_dir(&path)?;
-        Ok(Self(path))
+        fs::create_dir(&home)?;
+        let current = working_directory.map_or_else(|| home.clone(), std::path::Path::to_path_buf);
+        Ok(Self { home, current })
     }
 }
-impl Drop for RunDirectory {
+impl Drop for RunEnvironment {
     fn drop(&mut self) {
         for _ in 0..20 {
-            if fs::remove_dir_all(&self.0).is_ok() || !self.0.exists() {
+            if fs::remove_dir_all(&self.home).is_ok() || !self.home.exists() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -616,9 +664,53 @@ mod tests {
     }
 
     #[test]
+    fn a_scoped_run_keeps_the_scoped_directory_and_cleans_only_its_home() {
+        let scope = RunEnvironment::new(None).unwrap();
+        let project_root = scope.home.clone();
+        let environment = RunEnvironment::new(Some(&project_root)).unwrap();
+
+        assert_eq!(environment.current, project_root);
+        assert_ne!(environment.home, project_root);
+        drop(environment);
+        assert!(project_root.exists(), "a scoped working directory is never cleaned up");
+    }
+
+    #[test]
+    fn a_missing_working_directory_is_rejected_before_launch() {
+        let cancel = Cancellation::default();
+        let missing = PathBuf::from("circuitfabric-no-such-working-directory");
+        for kind in [AgentKind::Codex, AgentKind::Claude, AgentKind::Dsh] {
+            let error = run_task_with_options(
+                &RuntimeSettings::default(),
+                kind,
+                &ToolAuthorizationSettings::default(),
+                "test",
+                None,
+                Some(&missing),
+                &cancel,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("工作目录不存在"));
+        }
+        // A real directory reaches the next guard (empty prompt) instead.
+        let existing = env::temp_dir();
+        let error = run_task_with_options(
+            &RuntimeSettings::default(),
+            AgentKind::Codex,
+            &ToolAuthorizationSettings::default(),
+            "   ",
+            None,
+            Some(&existing),
+            &cancel,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("任务不能为空"));
+    }
+
+    #[test]
     fn failed_save_preserves_last_valid_configuration() {
-        let directory = RunDirectory::new().unwrap();
-        let path = directory.0.join("runtime.json");
+        let environment = RunEnvironment::new(None).unwrap();
+        let path = environment.home.join("runtime.json");
         let mut settings = RuntimeSettings::default();
         settings.save(&path).unwrap();
         let before = fs::read(&path).unwrap();
@@ -630,7 +722,7 @@ mod tests {
             loaded.providers[0].api_key_environment_variable,
             RuntimeSettings::default().providers[0].api_key_environment_variable
         );
-        assert!(loaded.save(&directory.0).is_err());
-        assert!(!directory.0.with_extension(format!("{}.tmp", std::process::id())).exists());
+        assert!(loaded.save(&environment.home).is_err());
+        assert!(!environment.home.with_extension(format!("{}.tmp", std::process::id())).exists());
     }
 }

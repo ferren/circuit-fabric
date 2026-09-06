@@ -133,6 +133,7 @@ pub enum SessionEventKind {
     EvidenceCited { document_id: String, content_hash: String, locator: String },
     UsageRecorded { usage: SessionUsage },
     StatusChanged { from: SessionStatus, to: SessionStatus },
+    Note { text: String },
 }
 
 impl crate::ProjectStorage {
@@ -537,6 +538,9 @@ fn render_event(event: &SessionEvent) -> String {
         SessionEventKind::StatusChanged { from, to } => {
             format!("- **{timestamp}** · 状态 · {} → {}", from.as_str(), to.as_str())
         }
+        SessionEventKind::Note { text } => {
+            format!("- **{timestamp}** · 备注 · {}", single_line(text))
+        }
     }
 }
 
@@ -715,6 +719,15 @@ mod tests {
                 },
             )
             .expect("append citation");
+        storage
+            .append_session_event(
+                "session_first",
+                &SessionEvent {
+                    timestamp_unix_seconds: metadata.started_at_unix_seconds + 11,
+                    kind: SessionEventKind::Note { text: "任务失败：连接超时".to_owned() },
+                },
+            )
+            .expect("append note");
         let final_metadata = storage
             .complete_session(
                 "session_first",
@@ -746,6 +759,7 @@ mod tests {
         assert!(replay.body.contains("## 轮次与工具调用"));
         assert!(replay.body.contains("用户 · Add an input capacitor and keep it stable"));
         assert!(replay.body.contains("document=doc-abc hash=sha256:00"));
+        assert!(replay.body.contains("备注 · 任务失败：连接超时"));
         let raw = fs::read_to_string(
             reopened.root().join(SESSIONS_DIRECTORY).join(listing.sessions[0].file_name.clone()),
         )

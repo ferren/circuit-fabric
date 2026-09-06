@@ -77,7 +77,7 @@ impl ControlPlaneScreen {
 
     #[must_use]
     pub const fn is_todo(self) -> bool {
-        !matches!(self, Self::Overview | Self::AgentsAndMcp)
+        !matches!(self, Self::Overview | Self::Projects | Self::AgentsAndMcp)
     }
 }
 
@@ -165,11 +165,6 @@ impl UiLanguage {
         screen: ControlPlaneScreen,
     ) -> (&'static str, &'static str, &'static str) {
         match (self, screen) {
-            (Self::SimplifiedChinese, ControlPlaneScreen::Projects) => (
-                "项目",
-                "项目会把电路事实、文档、会话和配置收拢到同一个有作用域的工作区。",
-                "TODO：创建并持久化项目记录，然后加入可搜索的列表和详情标签页。",
-            ),
             (Self::SimplifiedChinese, ControlPlaneScreen::Documents) => (
                 "文档",
                 "已授权的设计证据会保留来源定位信息，供智能体进行可引用的检索。",
@@ -214,11 +209,6 @@ impl UiLanguage {
                 "设置",
                 "外观、语言、数据目录、凭据提供方和日志偏好会在这里配置。",
                 "TODO：加入主题选择和其余全局偏好。",
-            ),
-            (Self::English, ControlPlaneScreen::Projects) => (
-                "Projects",
-                "Project records will keep circuit facts, documents, sessions, and configuration in one scoped workspace.",
-                "TODO: Create and persist project records; then add a searchable list and detail tabs.",
             ),
             (Self::English, ControlPlaneScreen::Documents) => (
                 "Documents",
@@ -265,7 +255,12 @@ impl UiLanguage {
                 "Appearance, language, data directory, credential provider, and log preferences will live here.",
                 "TODO: Add theme selection and the remaining global preferences.",
             ),
-            (_, ControlPlaneScreen::Overview | ControlPlaneScreen::AgentsAndMcp) => unreachable!(),
+            (
+                _,
+                ControlPlaneScreen::Overview
+                | ControlPlaneScreen::Projects
+                | ControlPlaneScreen::AgentsAndMcp,
+            ) => unreachable!(),
         }
     }
 }
@@ -307,7 +302,8 @@ fn main() {
     use circuitfabric_contracts::Project;
     use circuitfabric_project::{
         DocumentCategory, ProjectDocument, ProjectRegistry, ProjectStorage, ProjectWorkspace,
-        SessionListing, SessionReplay, is_text_extractable, rfc3339,
+        SessionActor, SessionEvent, SessionEventKind, SessionListing, SessionReplay, SessionSeed,
+        SessionStatus, SessionUsage, is_text_extractable, rfc3339,
     };
     use gpui::{
         AppContext, Context, Entity, FontWeight, Image, ImageFormat, InteractiveElement,
@@ -347,6 +343,15 @@ fn main() {
         div().size(px(8.)).rounded_full().bg(rgb(color)).flex_none()
     }
 
+    /// Keeps session audit entries readable: at most 2000 characters, marked when truncated.
+    fn audit_excerpt(text: &str) -> String {
+        let mut excerpt: String = text.chars().take(2000).collect();
+        if excerpt.chars().count() < text.chars().count() {
+            excerpt.push('…');
+        }
+        excerpt
+    }
+
     struct ProviderFields {
         id: Entity<InputState>,
         name: Entity<InputState>,
@@ -375,6 +380,15 @@ fn main() {
                 Self::CodexAppServer => "Codex App Server",
                 Self::ClaudeCode => "Claude Code",
                 Self::Dsh => "DSH",
+            }
+        }
+
+        /// Stable session `backendId` for runs through this adapter.
+        const fn backend_id(self) -> &'static str {
+            match self {
+                Self::CodexAppServer => "codex",
+                Self::ClaudeCode => "claude-code",
+                Self::Dsh => "dsh",
             }
         }
 
@@ -543,6 +557,7 @@ fn main() {
         task_image: Entity<InputState>,
         task_result: String,
         task_cancel: Option<circuitfabric_codex_runtime::execution::Cancellation>,
+        project_agent_adapter: RuntimeAdapter,
     }
 
     impl Drop for ControlPlaneView {
@@ -817,6 +832,7 @@ fn main() {
                 task_image,
                 task_result: String::new(),
                 task_cancel: None,
+                project_agent_adapter: RuntimeAdapter::CodexAppServer,
                 new_tool_kind: ToolAuthorizationKind::Skill,
                 new_tool_scope: ToolScope::Global,
             }
@@ -2345,20 +2361,22 @@ fn main() {
                 .child(self.render_task_controls(RuntimeAdapter::CodexAppServer, cx))
         }
 
+        /// Global tool grants narrowed by the selected project's allowlist.
+        ///
+        /// A project can only restrict what the global runtime already authorized, never expand
+        /// it; without a project configuration the global grants apply unchanged.
         fn effective_grants(&self) -> ToolAuthorizationSettings {
             let mut grants = self.tool_authorizations.clone();
             if let Some(configuration) =
                 self.selected_project.as_ref().and_then(|id| self.workspace.configuration(id))
             {
-                grants.authorized_skill_ids.extend(configuration.enabled_skill_ids.clone());
+                grants
+                    .authorized_skill_ids
+                    .retain(|id| configuration.enabled_skill_ids.contains(id));
                 grants
                     .authorized_mcp_server_ids
-                    .extend(configuration.enabled_mcp_server_ids.clone());
+                    .retain(|id| configuration.enabled_mcp_server_ids.contains(id));
             }
-            grants.authorized_skill_ids.sort();
-            grants.authorized_skill_ids.dedup();
-            grants.authorized_mcp_server_ids.sort();
-            grants.authorized_mcp_server_ids.dedup();
             grants
         }
 
@@ -2369,7 +2387,7 @@ fn main() {
             cx: &mut Context<Self>,
         ) {
             use circuitfabric_codex_runtime::execution::{
-                AgentKind, Cancellation, run_task_with_image,
+                AgentKind, Cancellation, run_task_with_options,
             };
             if self.task_cancel.is_some() {
                 return;
@@ -2381,7 +2399,7 @@ fn main() {
                 return;
             }
             let grants = self.effective_grants();
-            let mut prompt = self.task_prompt.read(cx).value().to_string();
+            let user_prompt = self.task_prompt.read(cx).value().to_string();
             let image_text = self.task_image.read(cx).value().to_string();
             let image =
                 if adapter == RuntimeAdapter::CodexAppServer && !image_text.trim().is_empty() {
@@ -2389,6 +2407,7 @@ fn main() {
                 } else {
                     None
                 };
+            let mut prompt = user_prompt.clone();
             if let Some(instructions) = self
                 .selected_project
                 .as_ref()
@@ -2405,16 +2424,52 @@ fn main() {
             let cancel = Cancellation::default();
             self.task_cancel = Some(cancel.clone());
             let project = self.selected_project.clone();
+            // Project scope: the agent process works in the project root, and the run is
+            // audited as a session record inside that project.
+            let project_scope = project
+                .as_ref()
+                .and_then(|id| self.project_storages.get(id))
+                .map(|storage| (storage.clone(), storage.root().to_path_buf()));
             let provider =
                 circuitfabric_codex_runtime::execution::selected_provider(&settings, kind);
+            let profile_id = provider.map_or_else(|| "default".to_owned(), |p| p.id.clone());
             let snapshot = provider
                 .map_or_else(String::new, |p| format!("{} / {} / {}", p.id, p.model, p.base_url));
             self.task_result = format!(
                 "正在调用 {}：{snapshot}。使用已保存快照；修改配置在下次任务生效。",
                 adapter.label()
             );
+            let session = project_scope.as_ref().and_then(|(storage, _)| {
+                let session_id = format!(
+                    "session_{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos()
+                );
+                match storage.start_session(SessionSeed {
+                    session_id: session_id.clone(),
+                    runtime_profile_id: profile_id.clone(),
+                    backend_id: Some(adapter.backend_id().to_owned()),
+                }) {
+                    Ok(_) => Some((storage.clone(), session_id)),
+                    Err(error) => {
+                        self.status = format!("任务继续执行，但项目会话记录创建失败：{error}");
+                        None
+                    }
+                }
+            });
+            let project_root = project_scope.as_ref().map(|(_, root)| root.clone());
             let work = cx.background_spawn(async move {
-                run_task_with_image(&settings, kind, &grants, &prompt, image.as_deref(), &cancel)
+                run_task_with_options(
+                    &settings,
+                    kind,
+                    &grants,
+                    &prompt,
+                    image.as_deref(),
+                    project_root.as_deref(),
+                    &cancel,
+                )
             });
             cx.spawn_in(window, async move |view, cx| {
                 let result = work.await;
@@ -2422,10 +2477,18 @@ fn main() {
                     view.update(cx, |view, cx| {
                         view.task_cancel = None;
                         if view.selected_project == project {
-                            view.task_result = match result {
+                            view.task_result = match &result {
                                 Ok(output) => format!("任务完成（{snapshot}）\n{output}"),
                                 Err(error) => format!("任务未完成（{snapshot}）：{error}"),
                             };
+                        }
+                        if let Some((storage, session_id)) = session {
+                            view.record_agent_session(&storage, &session_id, &user_prompt, &result);
+                        }
+                        if let Some(project) = &project
+                            && let Err(error) = view.refresh_project_data(project)
+                        {
+                            view.status = format!("项目会话列表未刷新：{error}");
                         }
                         cx.notify();
                     })
@@ -2437,6 +2500,52 @@ fn main() {
             cx.notify();
         }
 
+        /// Writes one finished agent run into its project's session audit record.
+        fn record_agent_session(
+            &mut self,
+            storage: &ProjectStorage,
+            session_id: &str,
+            user_prompt: &str,
+            result: &Result<String, circuitfabric_codex_runtime::RuntimeError>,
+        ) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let mut append = |event: &SessionEvent| {
+                if let Err(error) = storage.append_session_event(session_id, event) {
+                    self.status = format!("项目会话记录未写入：{error}");
+                }
+            };
+            append(&SessionEvent {
+                timestamp_unix_seconds: now,
+                kind: SessionEventKind::Turn {
+                    actor: SessionActor::User,
+                    message: audit_excerpt(user_prompt),
+                },
+            });
+            match result {
+                Ok(output) => append(&SessionEvent {
+                    timestamp_unix_seconds: now,
+                    kind: SessionEventKind::Turn {
+                        actor: SessionActor::Agent,
+                        message: audit_excerpt(output),
+                    },
+                }),
+                Err(error) => append(&SessionEvent {
+                    timestamp_unix_seconds: now,
+                    kind: SessionEventKind::Note { text: format!("任务失败：{error}") },
+                }),
+            }
+            let status =
+                if result.is_ok() { SessionStatus::Completed } else { SessionStatus::Failed };
+            if let Err(error) =
+                storage.complete_session(session_id, SessionUsage::default(), Vec::new(), status)
+            {
+                self.status = format!("项目会话记录未完成：{error}");
+            }
+        }
+
         fn render_task_controls(
             &mut self,
             adapter: RuntimeAdapter,
@@ -2444,9 +2553,18 @@ fn main() {
         ) -> impl IntoElement {
             let runner = cx.entity().clone();
             let stopper = runner.clone();
+            let working_directory_note = self
+                .selected_project
+                .as_ref()
+                .zip(self.selected_project.as_ref().and_then(|id| self.project_storages.get(id)))
+                .map_or_else(
+                    || "工作目录：隔离临时目录（未选择项目）".to_owned(),
+                    |(_, storage)| format!("工作目录（项目根目录）：{}", storage.root().display()),
+                );
             div()
                 .v_flex()
                 .gap_2()
+                .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(working_directory_note))
                 .child(Self::labeled_field("任务", "runtime-task", None, &self.task_prompt))
                 .when(adapter == RuntimeAdapter::CodexAppServer, |panel| {
                     panel.child(Self::labeled_field(
@@ -2487,6 +2605,60 @@ fn main() {
                         ),
                 )
                 .child(div().text_sm().child(self.task_result.clone()))
+        }
+
+        /// The “run agents inside this project” block of the project's agent tab.
+        fn render_project_agents_section(
+            &mut self,
+            project: &Project,
+            cx: &mut Context<Self>,
+        ) -> impl IntoElement {
+            let entity = cx.entity().clone();
+            let language = self.language;
+            let adapter = self.project_agent_adapter;
+            let mut selector = div().flex().gap_2().flex_wrap();
+            for candidate in
+                [RuntimeAdapter::CodexAppServer, RuntimeAdapter::ClaudeCode, RuntimeAdapter::Dsh]
+            {
+                let chooser = entity.clone();
+                selector = selector.child(
+                    Button::new(format!("project-agent-adapter-{}", candidate.backend_id()))
+                        .label(candidate.label())
+                        .when(candidate == adapter, |button| button.primary())
+                        .on_click(move |_, _, cx| {
+                            chooser.update(cx, |view, cx| {
+                                view.project_agent_adapter = candidate;
+                                cx.notify();
+                            });
+                        }),
+                );
+            }
+            let root_note = self.project_storages.get(&project.id).map_or_else(
+                || "项目根目录未打开，无法在项目内运行。".to_owned(),
+                |storage| format!("任务工作目录（项目根目录）：{}", storage.root().display()),
+            );
+            div()
+                .v_flex()
+                .gap_3()
+                .p_4()
+                .rounded_lg()
+                .border_1()
+                .border_color(rgb(BORDER))
+                .bg(rgb(CARD_BG))
+                .child(
+                    div().text_base().font_weight(FontWeight::SEMIBOLD).child(
+                        language.choose("在项目中运行智能体", "Run agents in this project"),
+                    ),
+                )
+                .child(selector)
+                .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(root_note))
+                .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(
+                    language.choose(
+                        "智能体进程以项目根目录为工作目录；提示词自动附加项目级说明；工具授权取全局与项目 allowlist 的交集，项目不能扩大全局授权。每次运行都会写入项目会话记录，可在“会话”标签回放。",
+                        "Agent processes run with the project root as their working directory; project instructions are prepended to the prompt; tool grants are the intersection of global and project allowlists, so a project never expands global authorization. Every run is recorded as a project session, replayable in the Sessions tab.",
+                    ),
+                ))
+                .child(self.render_task_controls(adapter, cx))
         }
 
         fn render_adapter_detail(
@@ -3969,27 +4141,30 @@ fn main() {
                     };
                     div()
                         .v_flex()
-                        .gap_3()
+                        .gap_4()
+                        .child(self.render_project_agents_section(&project, cx))
                         .child(
-                            div()
-                                .text_base()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(language.choose("项目级配置", "Project-scoped configuration")),
-                        )
-                        .child(div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(scope_summary))
-                        .child(
-                            div()
-                                .p_3()
-                                .rounded_lg()
-                                .border_1()
-                                .border_color(rgb(BORDER))
-                                .bg(rgb(SURFACE_BG))
-                                .text_sm()
-                                .text_color(rgb(TEXT_SECONDARY))
-                                .child(language.choose(
-                                    "技能许可、MCP 许可和项目说明会保存在此项目作用域内。Codex 命令、Provider 和 bridge 地址是全局运行时设置，只能在“智能体与工具”中修改，不会被此项目覆盖。",
-                                    "Skill permissions, MCP permissions, and project instructions belong to this project. The Codex command, providers, and bridge address are global runtime settings; they can only be changed in Agents & tools and are never overridden here.",
-                                )),
+                            div().v_flex().gap_3().child(
+                                div()
+                                    .text_base()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(language.choose("项目级配置", "Project-scoped configuration")),
+                            )
+                            .child(div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(scope_summary))
+                            .child(
+                                div()
+                                    .p_3()
+                                    .rounded_lg()
+                                    .border_1()
+                                    .border_color(rgb(BORDER))
+                                    .bg(rgb(SURFACE_BG))
+                                    .text_sm()
+                                    .text_color(rgb(TEXT_SECONDARY))
+                                    .child(language.choose(
+                                        "技能许可、MCP 许可和项目说明会保存在此项目作用域内。Codex 命令、Provider 和 bridge 地址是全局运行时设置，只能在“智能体与工具”中修改，不会被此项目覆盖。",
+                                        "Skill permissions, MCP permissions, and project instructions belong to this project. The Codex command, providers, and bridge address are global runtime settings; they can only be changed in Agents & tools and are never overridden here.",
+                                    )),
+                            ),
                         )
                         .into_any_element()
                 }
