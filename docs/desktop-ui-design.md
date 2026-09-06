@@ -197,11 +197,13 @@ Backend/bridge plugin list. Each card: kind, version, `capabilities` badges (`in
 
 `[TODO]` heartbeat & health reporting, capability reporting, connection test.
 
+Implemented today: the page owns the JLCircuit bridge **listen address** (loopback-only, persisted into the runtime settings the manually-launched `circuitfabric-jlc-bridge` reads) — the bridge is an EDA-side transport, so its endpoint is configured here, never on the agent runtime endpoints.
+
 ### 5.6 Agents & Tools
 
 Two-pane layout mirroring Projects (grouped list on the left, detail on the right):
 
-- **Runtime endpoints**: Codex App Server command / working directory / bridge address with a supervised start & stop lifecycle (status chip: starting / running · PID / stopped / failed, echoed in the sidebar); Claude Code and DSH shown as "coming soon" stubs.
+- **Runtime endpoints**: Codex App Server command / working directory with a supervised start & stop lifecycle (status chip: starting / running · PID / stopped / failed, echoed in the sidebar); the JLC bridge listen address belongs to EDA Services (§5.5); Claude Code and DSH shown as "coming soon" stubs.
 - **LLM providers**: multi-provider card list (default marked ★), add/edit/remove, enable/disable, vision config; a prominent note that "API keys are environment-variable names only — no key value is saved here".
 - **Skills & MCP**: authorized skills/MCP list with kind badges, revoke actions, and scope — global authorizations persist immediately to `runtime.json`, project authorizations to the project's own `project-config.json`.
 

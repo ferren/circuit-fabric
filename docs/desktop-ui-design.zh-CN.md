@@ -197,11 +197,13 @@ backend/bridge 插件列表。每个插件卡片：类型、版本、`capabiliti
 
 `[TODO]` 心跳与健康上报、能力报告、连接测试按钮。
 
+已实现：本页管理 JLCircuit bridge 的**监听地址**（仅限回环地址；写入运行时设置，由手动启动的 `circuitfabric-jlc-bridge` 读取）——bridge 是 EDA 侧传输，其端点在这里配置，不出现在智能体运行时端点里。
+
 ### 5.6 智能体与工具（Agents & Tools）
 
 与"项目"一致的两栏布局（左侧分组列表 + 右侧详情）：
 
-- **运行时端点**：Codex App Server 命令 / 工作目录 / bridge 地址，配受监管的启动与停止生命周期（状态芯片：启动中 / 运行中 · PID / 已停止 / 启动失败，侧边栏同步显示）；Claude Code、DSH 显示为"即将推出"桩。
+- **运行时端点**：Codex App Server 命令 / 工作目录，配受监管的启动与停止生命周期（状态芯片：启动中 / 运行中 · PID / 已停止 / 启动失败，侧边栏同步显示）；JLC bridge 监听地址归「EDA 服务」（§5.5）管；Claude Code、DSH 显示为"即将推出"桩。
 - **LLM Provider**：多 Provider 卡片列表（默认项 ★），增删改、启用/停用、Vision 配置。醒目提示"API Key 只填写环境变量名，不在此保存密钥值"。
 - **技能与 MCP**：已授权技能/MCP 列表，含类别徽标、撤销操作与授权范围——全局授权立即写入 `runtime.json`，项目授权立即写入该项目的 `project-config.json`。
 

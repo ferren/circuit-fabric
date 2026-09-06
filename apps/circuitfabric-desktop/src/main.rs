@@ -77,7 +77,7 @@ impl ControlPlaneScreen {
 
     #[must_use]
     pub const fn is_todo(self) -> bool {
-        !matches!(self, Self::Overview | Self::Projects | Self::AgentsAndMcp)
+        !matches!(self, Self::Overview | Self::Projects | Self::EdaServices | Self::AgentsAndMcp)
     }
 }
 
@@ -2183,6 +2183,158 @@ fn main() {
                 .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(self.status.clone()))
         }
 
+        /// The EDA services page owns EDA-side transports: the `JLCircuit` bridge listen address
+        /// lives here — not on the agent runtime endpoints — because the bridge serves the EDA
+        /// plugin, and is launched manually via `circuitfabric-jlc-bridge`, which reads the same
+        /// persisted runtime settings.
+        fn render_eda_services_page(
+            &mut self,
+            _window: &mut Window,
+            cx: &mut Context<Self>,
+        ) -> impl IntoElement {
+            let entity = cx.entity().clone();
+            let language = self.language;
+            let bridge_saver = entity;
+            let mut planned_items = div().v_flex().gap_1p5();
+            for item in [
+                language.choose("bridge 健康上报与心跳", "Bridge health reporting and heartbeat"),
+                language.choose(
+                    "能力协商（inspect / preview / apply / readback / drc…）",
+                    "Capability negotiation (inspect / preview / apply / readback / drc…)",
+                ),
+                language.choose("连接测试与状态反馈", "Connection test and status feedback"),
+                language.choose("EDA 后端/bridge 插件列表", "EDA backend/bridge plugin list"),
+            ] {
+                planned_items = planned_items.child(
+                    div()
+                        .flex()
+                        .items_start()
+                        .gap_2()
+                        .child(
+                            div()
+                                .px_1p5()
+                                .py_0p5()
+                                .flex_none()
+                                .rounded_sm()
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(0x00b4_5309))
+                                .bg(rgb(0x00fe_f3c7))
+                                .child("TODO"),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(TEXT_SECONDARY))
+                                .whitespace_normal()
+                                .child(item),
+                        ),
+                );
+            }
+
+            div()
+                .size_full()
+                .min_w(px(720.))
+                .relative()
+                .v_flex()
+                .gap_4()
+                .p_6()
+                .child(
+                    div()
+                        .v_flex()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xl()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(language.choose("EDA 服务", "EDA services")),
+                        )
+                        .child(
+                            div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(
+                                language.choose(
+                                    "EDA 侧的 bridge 与后端连接在这里配置；智能体运行时端点在「智能体与工具」页。",
+                                    "EDA-side bridges and backend connections are configured here; agent runtime endpoints live on the Agents & tools page.",
+                                ),
+                            ),
+                        ),
+                )
+                .child(
+                    div()
+                        .v_flex()
+                        .gap_3()
+                        .p_5()
+                        .rounded_xl()
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .bg(rgb(CARD_BG))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_base()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child("JLCircuit EDA bridge"),
+                                )
+                                .child(
+                                    div()
+                                        .px_1p5()
+                                        .py_0p5()
+                                        .rounded_sm()
+                                        .text_xs()
+                                        .bg(rgb(0x00e0_f2fe))
+                                        .text_color(rgb(0x000e_7490))
+                                        .child(language.choose("本地 WebSocket", "Local WebSocket")),
+                                ),
+                        )
+                        .child(
+                            div().text_sm().text_color(rgb(TEXT_SECONDARY)).whitespace_normal().child(
+                                language.choose(
+                                    "JLCircuit 插件与本机 `circuitfabric-jlc-bridge` 进程之间的传输。bridge 由你手动启动，并读取这里保存的监听地址；CircuitFabric 不代为启动它。",
+                                    "Transport between the JLCircuit plugin and the local `circuitfabric-jlc-bridge` process. You start the bridge manually and it reads the listen address saved here; CircuitFabric does not start it for you.",
+                                ),
+                            ),
+                        )
+                        .child(Self::labeled_field(
+                            language.choose("bridge 监听地址", "Bridge listen address"),
+                            "bridge-address",
+                            Some(language.choose(
+                                "仅允许回环地址（如 127.0.0.1:49630）；保存后写入运行时设置，bridge 下次启动时生效。",
+                                "Loopback only (e.g. 127.0.0.1:49630); saved into the runtime settings and read the next time the bridge starts.",
+                            )),
+                            &self.bridge_address,
+                        ))
+                        .child(
+                            Button::new("save-eda-bridge")
+                                .primary()
+                                .label(language.choose("保存设置", "Save settings"))
+                                .on_click(move |_, _, cx| {
+                                    bridge_saver.update(cx, ControlPlaneView::save_settings);
+                                }),
+                        ),
+                )
+                .child(
+                    div()
+                        .v_flex()
+                        .gap_2()
+                        .p_5()
+                        .rounded_xl()
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .bg(rgb(CARD_BG))
+                        .child(
+                            div()
+                                .text_base()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(language.choose("规划中的能力", "Planned capabilities")),
+                        )
+                        .child(planned_items),
+                )
+                .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(self.status.clone()))
+        }
+
         #[allow(clippy::too_many_lines)]
         fn render_codex_runtime_detail(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
             let entity = cx.entity().clone();
@@ -2344,12 +2496,14 @@ fn main() {
                             None,
                             &self.working_directory,
                         ))
-                        .child(Self::labeled_field(
-                            language.choose("JLC bridge 地址", "JLC bridge address"),
-                            "bridge-address",
-                            None,
-                            &self.bridge_address,
-                        )),
+                        .child(
+                            div().text_xs().text_color(rgb(TEXT_MUTED)).child(
+                                language.choose(
+                                    "JLC bridge 监听地址属于 EDA 侧服务，在「EDA 服务」页配置。",
+                                    "The JLC bridge listen address belongs to the EDA side and is configured on the EDA services page.",
+                                ),
+                            ),
+                        ),
                 )
                 .child(Self::info_note(
                     "API Key 仅以环境变量名引用（在 LLM Provider 中配置）；CircuitFabric 不保存、不回显任何密钥值。",
@@ -5263,6 +5417,9 @@ fn main() {
                 ControlPlaneScreen::Overview => Self::overview_page(language).into_any_element(),
                 ControlPlaneScreen::Projects => {
                     self.render_projects_page(window, cx).into_any_element()
+                }
+                ControlPlaneScreen::EdaServices => {
+                    self.render_eda_services_page(window, cx).into_any_element()
                 }
                 ControlPlaneScreen::AgentsAndMcp => {
                     self.render_agents_page(window, cx).into_any_element()
