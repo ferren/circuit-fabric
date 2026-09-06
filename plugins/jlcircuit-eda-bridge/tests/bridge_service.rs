@@ -37,6 +37,20 @@ fn write_settings(dir: &Path, address: &str) -> PathBuf {
     path
 }
 
+fn write_registry(dir: &Path, project_id: &str) {
+    let document = serde_json::json!({
+        "schemaVersion": 1,
+        "projects": [{
+            "projectId": project_id,
+            "canonicalRootPath": dir.join("project-root").display().to_string(),
+            "displayName": "Power Supply",
+            "lastOpenedUnixSeconds": 0,
+        }],
+    });
+    std::fs::write(dir.join("projects.json"), document.to_string())
+        .expect("write the project registry");
+}
+
 fn wait_until_listening(address: &str, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -85,6 +99,32 @@ fn supervised_bridge_reports_status_and_stops_cleanly() {
             report.capabilities
         );
     }
+    assert!(
+        report.projects.is_empty(),
+        "no projects are registered in the temporary settings directory"
+    );
+
+    // The extension's connect path: hello with an unregistered project must be
+    // rejected WITH an explanatory error reply — never a silent socket drop.
+    let rejection = probe::hello(&address, "default-project", Duration::from_secs(3))
+        .expect_err("an unregistered project must be rejected");
+    assert!(
+        rejection.contains("未注册"),
+        "the rejection should name the problem, got: {rejection}"
+    );
+
+    // Registering the project (the bridge re-reads the registry per message)
+    // flips both the status report and hello to success.
+    write_registry(&dir, "power-supply");
+    let status_after =
+        probe::status(&address, Duration::from_secs(3)).expect("status after registration");
+    assert!(
+        status_after.projects.iter().any(|project| project == "power-supply"),
+        "status must report the registered project, got {:?}",
+        status_after.projects
+    );
+    probe::hello(&address, "power-supply", Duration::from_secs(3))
+        .expect("hello succeeds for a registered project");
 
     // A second bridge on the same port must fail loudly: it exits on its own
     // and its stderr explains the bind failure.

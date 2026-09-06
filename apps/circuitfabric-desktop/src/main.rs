@@ -419,6 +419,22 @@ fn main() {
         SkillsAndMcp,
     }
 
+    /// One manageable EDA backend service on the EDA services page. The list
+    /// is the multi-EDA service registry surface: further backends slot in as
+    /// new variants with their own supervised bridge.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum EdaServiceSelection {
+        JlcircuitBridge,
+    }
+
+    impl EdaServiceSelection {
+        const fn label(self) -> &'static str {
+            match self {
+                Self::JlcircuitBridge => "JLCircuit EDA",
+            }
+        }
+    }
+
     /// Observable state of the supervised Codex App Server process.
     #[derive(Clone, Debug, Eq, PartialEq)]
     enum RuntimeLifecycleStatus {
@@ -612,6 +628,7 @@ fn main() {
         bridge_probe_pending: bool,
         bridge_test_pending: bool,
         bridge_test: Option<BridgeTestResult>,
+        eda_services_selection: EdaServiceSelection,
         tool_authorizations: ToolAuthorizationSettings,
         new_tool_id: Entity<InputState>,
         new_tool_kind: ToolAuthorizationKind,
@@ -896,6 +913,7 @@ fn main() {
                 bridge_probe_pending: false,
                 bridge_test_pending: false,
                 bridge_test: None,
+                eda_services_selection: EdaServiceSelection::JlcircuitBridge,
                 tool_authorizations: settings.tools,
                 new_tool_id,
                 catalog: settings.catalog,
@@ -2485,17 +2503,166 @@ fn main() {
                 .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(self.status.clone()))
         }
 
-        /// The EDA services page owns EDA-side transports: the `JLCircuit` bridge listen address
-        /// lives here — not on the agent runtime endpoints — because the bridge serves the EDA
-        /// plugin. `CircuitFabric` starts and stops the `circuitfabric-jlc-bridge` process as a
-        /// supervised child, monitors its port, and offers a protocol-level connection test;
-        /// the EDA extension itself connects to `ws://<listen address>/bridge`.
+        /// The EDA services page is the multi-EDA service registry, laid out like
+        /// Agents & tools: the left list manages one card per EDA backend service
+        /// (only `JLCircuit` is implemented today), the right pane shows the
+        /// selected service's settings, supervised lifecycle, and monitoring.
         fn render_eda_services_page(
             &mut self,
             window: &mut Window,
             cx: &mut Context<Self>,
         ) -> impl IntoElement {
             self.maybe_probe_bridge_health(window, cx);
+            let entity = cx.entity().clone();
+            let language = self.language;
+            let selector = entity;
+
+            let jlc_selected = self.eda_services_selection == EdaServiceSelection::JlcircuitBridge;
+            let lifecycle_label = self.bridge_status.clone().label(language);
+            let health = self.bridge_health.clone();
+            let address = self.bridge_address.read(cx).value().to_string();
+            let jlc_card = div()
+                .id("eda-service-jlcircuit")
+                .v_flex()
+                .gap_1()
+                .p_3()
+                .rounded_lg()
+                .border_1()
+                .border_color(rgb(if jlc_selected { ACCENT } else { BORDER }))
+                .bg(rgb(if jlc_selected { 0x00f0_f9ff } else { CARD_BG }))
+                .cursor_pointer()
+                .hover(|this| this.border_color(rgb(ACCENT_SOFT)))
+                .on_click(move |_, _, cx| {
+                    selector.update(cx, |view, cx| {
+                        view.eda_services_selection = EdaServiceSelection::JlcircuitBridge;
+                        cx.notify();
+                    });
+                })
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(status_dot(health.dot()))
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(if jlc_selected {
+                                    FontWeight::SEMIBOLD
+                                } else {
+                                    FontWeight::MEDIUM
+                                })
+                                .child(EdaServiceSelection::JlcircuitBridge.label()),
+                        )
+                        .child(
+                            div()
+                                .ml_auto()
+                                .text_xs()
+                                .text_color(rgb(TEXT_MUTED))
+                                .child(lifecycle_label),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(TEXT_MUTED))
+                        .truncate()
+                        .child(format!("ws://{address}/bridge")),
+                );
+
+            // Deliberately not selectable: further backends plug into this same
+            // service model later, but nothing claims to work today.
+            let planned_card = div()
+                .v_flex()
+                .gap_1()
+                .p_3()
+                .rounded_lg()
+                .border_1()
+                .border_color(rgb(BORDER))
+                .bg(rgb(CARD_BG))
+                .opacity(0.7)
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(rgb(TEXT_MUTED))
+                        .child(language.choose("更多 EDA 后端", "More EDA backends")),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(TEXT_MUTED))
+                        .whitespace_normal()
+                        .child(language.choose(
+                            "KiCad 等后续按同一服务模型接入：左侧注册、启停与监测。",
+                            "KiCad and others will plug into the same service model later: registered, supervised, and monitored from this list.",
+                        )),
+                );
+
+            let detail = match self.eda_services_selection {
+                EdaServiceSelection::JlcircuitBridge => {
+                    self.render_eda_bridge_detail(cx).into_any_element()
+                }
+            };
+
+            div()
+                .size_full()
+                .min_w(px(720.))
+                .relative()
+                .v_flex()
+                .gap_4()
+                .p_6()
+                .child(
+                    div()
+                        .v_flex()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xl()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(language.choose("EDA 服务", "EDA services")),
+                        )
+                        .child(
+                            div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(
+                                language.choose(
+                                    "EDA 后端服务在这里注册、启停与监测；智能体运行时端点在「智能体与工具」页。",
+                                    "EDA backend services are registered, supervised, and monitored here; agent runtime endpoints live on the Agents & tools page.",
+                                ),
+                            ),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h(px(0.))
+                        .flex()
+                        .gap_4()
+                        .child(
+                            div()
+                                .w(px(320.))
+                                .flex_none()
+                                .v_flex()
+                                .gap_2()
+                                .child(Self::agents_group_label(language.choose(
+                                    "已实现",
+                                    "Available",
+                                )))
+                                .child(jlc_card)
+                                .child(Self::agents_group_label(language.choose(
+                                    "规划中",
+                                    "Planned",
+                                )))
+                                .child(planned_card),
+                        )
+                        .child(detail),
+                )
+                .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(self.status.clone()))
+        }
+
+        /// The `JLCircuit` bridge service detail: settings, supervised lifecycle,
+        /// and layered health monitoring with the protocol-level connection test.
+        #[allow(clippy::too_many_lines)]
+        fn render_eda_bridge_detail(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
             let entity = cx.entity().clone();
             let language = self.language;
             let bridge_saver = entity.clone();
@@ -2516,43 +2683,6 @@ fn main() {
                 .map(|test| (elapsed_label(language, test.at.elapsed()), test.outcome.clone()));
             let capabilities_reported =
                 last_test.as_ref().is_some_and(|(_, outcome)| outcome.is_ok());
-            let mut planned_items = div().v_flex().gap_1p5();
-            for item in [
-                language.choose(
-                    "EDA 后端/bridge 插件列表（多后端注册与发现）",
-                    "EDA backend/bridge plugin list (multi-backend registry and discovery)",
-                ),
-                language.choose(
-                    "bridge 会话与最后回读结果上报",
-                    "Bridge session and last-readback reporting",
-                ),
-            ] {
-                planned_items = planned_items.child(
-                    div()
-                        .flex()
-                        .items_start()
-                        .gap_2()
-                        .child(
-                            div()
-                                .px_1p5()
-                                .py_0p5()
-                                .flex_none()
-                                .rounded_sm()
-                                .text_xs()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(0x00b4_5309))
-                                .bg(rgb(0x00fe_f3c7))
-                                .child("TODO"),
-                        )
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(rgb(TEXT_SECONDARY))
-                                .whitespace_normal()
-                                .child(item),
-                        ),
-                );
-            }
 
             // Capabilities are shown only when the bridge itself reported them
             // in a successful connection test — never claimed on its behalf.
@@ -2589,257 +2719,253 @@ fn main() {
                     language.choose(" 前", " ago"),
                 ),
             };
+            // The EDA extension's hello is rejected unless its projectId is
+            // registered, so the connection test reports that gate too — an
+            // empty list explains an EDA-side connect failure up front.
+            let projects_note = match &last_test {
+                Some((_, Ok(report))) if !report.projects.is_empty() => Some((
+                    language.choose_owned(
+                        format!(
+                            "已注册项目（EDA 插件连接时填写这些 ID）：{}",
+                            report.projects.join("、")
+                        ),
+                        format!(
+                            "Registered projects (use these IDs in the EDA extension): {}",
+                            report.projects.join(", ")
+                        ),
+                    ),
+                    TEXT_SECONDARY,
+                )),
+                Some((_, Ok(_))) => Some((
+                    language.choose(
+                        "连接成功，但尚无已注册项目：EDA 插件的连接会被拒绝——请先在「项目」页创建或打开项目。",
+                        "Connected, but no registered projects: the EDA extension's connection will be rejected — create or open a project on the Projects page first.",
+                    )
+                    .to_owned(),
+                    0x00b4_5309,
+                )),
+                _ => None,
+            };
 
             div()
-                .size_full()
-                .min_w(px(720.))
-                .relative()
+                .flex_1()
+                .min_w(px(0.))
                 .v_flex()
-                .gap_4()
-                .p_6()
+                .gap_3()
+                .p_5()
+                .rounded_xl()
+                .border_1()
+                .border_color(rgb(BORDER))
+                .bg(rgb(CARD_BG))
                 .child(
                     div()
-                        .v_flex()
-                        .gap_1()
+                        .flex()
+                        .items_start()
+                        .justify_between()
+                        .gap_3()
                         .child(
                             div()
-                                .text_xl()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(language.choose("EDA 服务", "EDA services")),
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_base()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child("JLCircuit EDA bridge"),
+                                )
+                                .child(
+                                    div()
+                                        .px_1p5()
+                                        .py_0p5()
+                                        .rounded_sm()
+                                        .text_xs()
+                                        .bg(rgb(0x00e0_f2fe))
+                                        .text_color(rgb(0x000e_7490))
+                                        .child(language.choose("本地 WebSocket", "Local WebSocket")),
+                                ),
                         )
                         .child(
-                            div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(
-                                language.choose(
-                                    "EDA 侧的 bridge 与后端连接在这里配置；智能体运行时端点在「智能体与工具」页。",
-                                    "EDA-side bridges and backend connections are configured here; agent runtime endpoints live on the Agents & tools page.",
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .px_2()
+                                .py_1()
+                                .rounded_sm()
+                                .bg(rgb(SURFACE_BG))
+                                .child(status_dot(status.dot()))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child(status.label(language)),
                                 ),
-                            ),
                         ),
                 )
                 .child(
+                    div().text_sm().text_color(rgb(TEXT_SECONDARY)).whitespace_normal().child(
+                        language.choose_owned(
+                            format!("JLCircuit 插件与本机 `circuitfabric-jlc-bridge` 进程之间的 WebSocket 传输。bridge 作为受监管的子进程在这里启动与停止，并读取这里保存的监听地址；EDA 插件连接 ws://{address}/bridge。"),
+                            format!("The WebSocket transport between the JLCircuit plugin and the local `circuitfabric-jlc-bridge` process. The bridge is started and stopped here as a supervised child process and reads the listen address saved here; the EDA extension connects to ws://{address}/bridge."),
+                        ),
+                    ),
+                )
+                .child(Self::labeled_field(
+                    language.choose("bridge 监听地址", "Bridge listen address"),
+                    "bridge-address",
+                    Some(language.choose(
+                        "仅允许回环地址（如 127.0.0.1:49630）；保存后写入运行时设置，bridge 下次启动时生效。",
+                        "Loopback only (e.g. 127.0.0.1:49630); saved into the runtime settings and read the next time the bridge starts.",
+                    )),
+                    &self.bridge_address,
+                ))
+                .child(
                     div()
-                        .v_flex()
-                        .gap_3()
-                        .p_5()
-                        .rounded_xl()
-                        .border_1()
-                        .border_color(rgb(BORDER))
-                        .bg(rgb(CARD_BG))
+                        .flex()
+                        .gap_2()
                         .child(
-                            div()
-                                .flex()
-                                .items_start()
-                                .justify_between()
-                                .gap_3()
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .child(
-                                            div()
-                                                .text_base()
-                                                .font_weight(FontWeight::SEMIBOLD)
-                                                .child("JLCircuit EDA bridge"),
-                                        )
-                                        .child(
-                                            div()
-                                                .px_1p5()
-                                                .py_0p5()
-                                                .rounded_sm()
-                                                .text_xs()
-                                                .bg(rgb(0x00e0_f2fe))
-                                                .text_color(rgb(0x000e_7490))
-                                                .child(language.choose(
-                                                    "本地 WebSocket",
-                                                    "Local WebSocket",
-                                                )),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .px_2()
-                                        .py_1()
-                                        .rounded_sm()
-                                        .bg(rgb(SURFACE_BG))
-                                        .child(status_dot(status.dot()))
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .font_weight(FontWeight::MEDIUM)
-                                                .child(status.label(language)),
-                                        ),
-                                ),
+                            Button::new("save-eda-bridge")
+                                .primary()
+                                .label(language.choose("保存设置", "Save settings"))
+                                .on_click(move |_, _, cx| {
+                                    bridge_saver.update(cx, ControlPlaneView::save_settings);
+                                }),
                         )
                         .child(
-                            div().text_sm().text_color(rgb(TEXT_SECONDARY)).whitespace_normal().child(
-                                language.choose_owned(
-                                    format!("JLCircuit 插件与本机 `circuitfabric-jlc-bridge` 进程之间的 WebSocket 传输。bridge 作为受监管的子进程在这里启动与停止，并读取这里保存的监听地址；EDA 插件连接 ws://{address}/bridge。"),
-                                    format!("The WebSocket transport between the JLCircuit plugin and the local `circuitfabric-jlc-bridge` process. The bridge is started and stopped here as a supervised child process and reads the listen address saved here; the EDA extension connects to ws://{address}/bridge."),
-                                ),
-                            ),
-                        )
-                        .child(Self::labeled_field(
-                            language.choose("bridge 监听地址", "Bridge listen address"),
-                            "bridge-address",
-                            Some(language.choose(
-                                "仅允许回环地址（如 127.0.0.1:49630）；保存后写入运行时设置，bridge 下次启动时生效。",
-                                "Loopback only (e.g. 127.0.0.1:49630); saved into the runtime settings and read the next time the bridge starts.",
-                            )),
-                            &self.bridge_address,
-                        ))
-                        .child(
-                            div()
-                                .flex()
-                                .gap_2()
-                                .child(
-                                    Button::new("save-eda-bridge")
-                                        .primary()
-                                        .label(language.choose("保存设置", "Save settings"))
-                                        .on_click(move |_, _, cx| {
-                                            bridge_saver.update(cx, ControlPlaneView::save_settings);
-                                        }),
-                                )
-                                .child(
-                                    Button::new("start-eda-bridge")
-                                        .disabled(is_running || is_starting)
-                                        .label(language.choose("启动服务", "Start service"))
-                                        .on_click(move |_, window, cx| {
-                                            bridge_starter.update(cx, |view, cx| {
-                                                view.start_bridge_service(window, cx);
-                                            });
-                                        }),
-                                )
-                                .child(
-                                    Button::new("stop-eda-bridge")
-                                        .disabled(!is_running)
-                                        .label(language.choose("停止服务", "Stop service"))
-                                        .on_click(move |_, _, cx| {
-                                            bridge_stopper
-                                                .update(cx, ControlPlaneView::stop_bridge_service);
-                                        }),
-                                ),
+                            Button::new("start-eda-bridge")
+                                .disabled(is_running || is_starting)
+                                .label(language.choose("启动服务", "Start service"))
+                                .on_click(move |_, window, cx| {
+                                    bridge_starter.update(cx, |view, cx| {
+                                        view.start_bridge_service(window, cx);
+                                    });
+                                }),
                         )
                         .child(
-                            div()
-                                .v_flex()
-                                .gap_2()
-                                .p_4()
-                                .rounded_lg()
-                                .border_1()
-                                .border_color(rgb(BORDER))
-                                .bg(rgb(SURFACE_BG))
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .child(language.choose("服务监测", "Service monitoring")),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .child(status_dot(health.dot()))
-                                        .child(
-                                            div()
-                                                .text_sm()
-                                                .whitespace_normal()
-                                                .child(health.label(language)),
-                                        ),
-                                )
-                                .when(externally_owned, |this| {
-                                    this.child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(rgb(TEXT_SECONDARY))
-                                            .whitespace_normal()
-                                            .child(language.choose(
-                                                "端口可达，但服务不是由本应用启动的（例如手动启动的 bridge）；「停止服务」只作用于本应用启动的进程。",
-                                                "The port answers, but the service was not started by this app (e.g. a manually launched bridge); Stop service only affects processes this app started.",
-                                            )),
-                                    )
-                                })
-                                .child(
-                                    div().flex().items_center().gap_2().child(
-                                        Button::new("test-eda-bridge")
-                                            .disabled(is_test_pending)
-                                            .label(if is_test_pending {
-                                                language.choose("测试中…", "Testing…")
-                                            } else {
-                                                language.choose("测试连接", "Test connection")
-                                            })
-                                            .on_click(move |_, window, cx| {
-                                                bridge_tester.update(cx, |view, cx| {
-                                                    view.test_bridge_connection(window, cx);
-                                                });
-                                            }),
-                                    ),
-                                )
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .whitespace_normal()
-                                        .child(test_line),
-                                )
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(TEXT_SECONDARY))
-                                        .whitespace_normal()
-                                        .child(language.choose(
-                                            "连接测试会临时占用 bridge 的唯一 WebSocket 连接；若 EDA 插件正连接中，测试可能超时，这不代表服务离线。",
-                                            "The connection test temporarily occupies the bridge's single WebSocket connection; if the EDA plugin is attached the test may time out, which does not mean the service is offline.",
-                                        )),
-                                )
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(TEXT_MUTED))
-                                        .child(language.choose(
-                                            "已上报能力（连接测试成功后显示）",
-                                            "Reported capabilities (shown after a successful connection test)",
-                                        )),
-                                )
-                                .when(capabilities_reported, |this| {
-                                    this.child(capability_items)
-                                })
-                                .when(!capabilities_reported, |this| {
-                                        this.child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(rgb(TEXT_MUTED))
-                                                .whitespace_normal()
-                                                .child(language.choose(
-                                                    "能力尚未上报，不展示为可执行。",
-                                                    "No capabilities reported yet; nothing is shown as executable.",
-                                                )),
-                                        )
-                                    },
-                                ),
+                            Button::new("stop-eda-bridge")
+                                .disabled(!is_running)
+                                .label(language.choose("停止服务", "Stop service"))
+                                .on_click(move |_, _, cx| {
+                                    bridge_stopper
+                                        .update(cx, ControlPlaneView::stop_bridge_service);
+                                }),
                         ),
                 )
                 .child(
                     div()
                         .v_flex()
                         .gap_2()
-                        .p_5()
-                        .rounded_xl()
+                        .p_4()
+                        .rounded_lg()
                         .border_1()
                         .border_color(rgb(BORDER))
-                        .bg(rgb(CARD_BG))
+                        .bg(rgb(SURFACE_BG))
                         .child(
                             div()
-                                .text_base()
+                                .text_sm()
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .child(language.choose("规划中的能力", "Planned capabilities")),
+                                .child(language.choose("服务监测", "Service monitoring")),
                         )
-                        .child(planned_items),
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(status_dot(health.dot()))
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .whitespace_normal()
+                                        .child(health.label(language)),
+                                ),
+                        )
+                        .when(externally_owned, |this| {
+                            this.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_SECONDARY))
+                                    .whitespace_normal()
+                                    .child(language.choose(
+                                        "端口可达，但服务不是由本应用启动的（例如手动启动的 bridge）；「停止服务」只作用于本应用启动的进程。",
+                                        "The port answers, but the service was not started by this app (e.g. a manually launched bridge); Stop service only affects processes this app started.",
+                                    )),
+                            )
+                        })
+                        .child(
+                            div().flex().items_center().gap_2().child(
+                                Button::new("test-eda-bridge")
+                                    .disabled(is_test_pending)
+                                    .label(if is_test_pending {
+                                        language.choose("测试中…", "Testing…")
+                                    } else {
+                                        language.choose("测试连接", "Test connection")
+                                    })
+                                    .on_click(move |_, window, cx| {
+                                        bridge_tester.update(cx, |view, cx| {
+                                            view.test_bridge_connection(window, cx);
+                                        });
+                                    }),
+                            ),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .whitespace_normal()
+                                .child(test_line),
+                        )
+                        .when_some(projects_note, |this, (note, color)| {
+                            this.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(color))
+                                    .whitespace_normal()
+                                    .child(note),
+                            )
+                        })
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(TEXT_SECONDARY))
+                                .whitespace_normal()
+                                .child(language.choose(
+                                    "连接测试会临时占用 bridge 的唯一 WebSocket 连接；若 EDA 插件正连接中，测试可能超时，这不代表服务离线。",
+                                    "The connection test temporarily occupies the bridge's single WebSocket connection; if the EDA plugin is attached the test may time out, which does not mean the service is offline.",
+                                )),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(TEXT_MUTED))
+                                .child(language.choose(
+                                    "已上报能力（连接测试成功后显示）",
+                                    "Reported capabilities (shown after a successful connection test)",
+                                )),
+                        )
+                        .when(capabilities_reported, |this| this.child(capability_items))
+                        .when(!capabilities_reported, |this| {
+                            this.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_MUTED))
+                                    .whitespace_normal()
+                                    .child(language.choose(
+                                        "能力尚未上报，不展示为可执行。",
+                                        "No capabilities reported yet; nothing is shown as executable.",
+                                    )),
+                            )
+                        })
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(TEXT_MUTED))
+                                .whitespace_normal()
+                                .child(language.choose(
+                                    "最后回读：尚未上报（等待 bridge 协议支持回读结果上报）。",
+                                    "Last readback: not reported yet (pending bridge protocol support for readback reporting).",
+                                )),
+                        ),
                 )
-                .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(self.status.clone()))
         }
 
         #[allow(clippy::too_many_lines)]

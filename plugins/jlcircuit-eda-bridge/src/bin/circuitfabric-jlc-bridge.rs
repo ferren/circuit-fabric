@@ -72,9 +72,39 @@ fn serve_connection(mut stream: TcpStream, config_path: &std::path::Path) -> Res
                 if project_id.as_deref() != Some(requested_project) {
                     threads.clear();
                 }
-                let registry = ProjectRegistry::load(config_path.with_file_name("projects.json"))
-                    .map_err(|e| e.to_string())?;
+                // A missing registry file means "no projects registered yet" —
+                // the same semantics the desktop uses — not a broken bridge.
+                let registry = match ProjectRegistry::load_or_default(
+                    config_path.with_file_name("projects.json"),
+                ) {
+                    Ok(registry) => registry,
+                    Err(error) => {
+                        let _ = send_json(
+                            &mut stream,
+                            json!({
+                                "type": "error",
+                                "message": format!("项目注册表无法读取：{error}"),
+                            }),
+                        );
+                        return Err(error.to_string());
+                    }
+                };
                 if registry.root_for(requested_project).is_none() {
+                    // Reject with an error message instead of silently dropping
+                    // the socket, so the EDA extension shows the real reason
+                    // rather than a generic "bridge not running".
+                    let known: Vec<&str> =
+                        registry.entries().map(|entry| entry.project_id.as_str()).collect();
+                    let _ = send_json(
+                        &mut stream,
+                        json!({
+                            "type": "error",
+                            "message": format!(
+                                "项目 `{requested_project}` 未注册。可用项目 ID：{}。请先在 CircuitFabric 桌面端创建或打开项目。",
+                                if known.is_empty() { "（无）".to_owned() } else { known.join(", ") }
+                            ),
+                        }),
+                    );
                     return Err("项目未注册，拒绝连接".to_owned());
                 }
                 project_id = Some(requested_project.to_owned());
@@ -102,8 +132,9 @@ fn serve_connection(mut stream: TcpStream, config_path: &std::path::Path) -> Res
                     .ok_or_else(|| "chat requires text".to_owned())?;
                 let settings =
                     RuntimeSettings::load_or_default(config_path).map_err(|e| e.to_string())?;
-                let registry = ProjectRegistry::load(config_path.with_file_name("projects.json"))
-                    .map_err(|e| e.to_string())?;
+                let registry =
+                    ProjectRegistry::load_or_default(config_path.with_file_name("projects.json"))
+                        .map_err(|e| e.to_string())?;
                 let root = registry.root_for(project_id).ok_or_else(|| "项目未注册".to_owned())?;
                 let storage = ProjectStorage::open(root).map_err(|e| e.to_string())?;
                 let configuration = storage.load_configuration().map_err(|e| e.to_string())?;
@@ -185,9 +216,18 @@ fn serve_connection(mut stream: TcpStream, config_path: &std::path::Path) -> Res
             Some("ping") => send_json(&mut stream, json!({ "type": "pong" }))?,
             Some("status") => {
                 // Connection-test surface for the desktop control plane: reports the
-                // protocol version and the plugin manifest's declared capabilities.
+                // protocol version, the plugin manifest's declared capabilities, and
+                // the registered project IDs — the same registry gate the EDA
+                // extension's hello depends on, so the desktop test can explain an
+                // EDA-side connect failure instead of reporting success in isolation.
                 let bridge_manifest = jlcircuit_eda_bridge::JlcircuitEdaBridge::default();
                 let manifest = bridge_manifest.manifest();
+                let projects: Vec<String> =
+                    ProjectRegistry::load_or_default(config_path.with_file_name("projects.json"))
+                        .map(|registry| {
+                            registry.entries().map(|entry| entry.project_id.clone()).collect()
+                        })
+                        .unwrap_or_default();
                 send_json(
                     &mut stream,
                     json!({
@@ -200,6 +240,7 @@ fn serve_connection(mut stream: TcpStream, config_path: &std::path::Path) -> Res
                             .iter()
                             .map(|capability| json!(capability.as_str()))
                             .collect::<Vec<_>>(),
+                        "projects": projects,
                     }),
                 )?;
             }

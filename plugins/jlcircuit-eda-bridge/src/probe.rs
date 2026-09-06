@@ -23,6 +23,8 @@ pub struct BridgeStatusReport {
     pub protocol_version: u64,
     pub bridge_name: String,
     pub capabilities: Vec<String>,
+    /// Registered project IDs — the gate the EDA extension's `hello` depends on.
+    pub projects: Vec<String>,
 }
 
 /// Checks whether anything is listening on the bridge address.
@@ -40,8 +42,8 @@ pub fn tcp_reachable(address: &str, timeout: Duration) -> Result<(), String> {
 }
 
 /// Performs the protocol-level connection test: WebSocket handshake plus a
-/// `status` message, returning the bridge's self-reported version and
-/// capabilities.
+/// `status` message, returning the bridge's self-reported version,
+/// capabilities, and registered project IDs.
 ///
 /// # Errors
 ///
@@ -50,25 +52,7 @@ pub fn tcp_reachable(address: &str, timeout: Duration) -> Result<(), String> {
 /// already attached — the bridge serves one connection at a time), or the
 /// reply is not a valid `status_ack`.
 pub fn status(address: &str, timeout: Duration) -> Result<BridgeStatusReport, String> {
-    let socket: SocketAddr =
-        address.parse().map_err(|error| format!("bridge 地址无效（{address}）：{error}"))?;
-    let mut stream = TcpStream::connect_timeout(&socket, timeout)
-        .map_err(|error| format!("无法连接 {address}：{error}"))?;
-    stream.set_read_timeout(Some(timeout)).map_err(|error| error.to_string())?;
-    stream.set_write_timeout(Some(timeout)).map_err(|error| error.to_string())?;
-
-    let key = handshake_key();
-    let request = format!(
-        "GET /bridge HTTP/1.1\r\nHost: {address}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
-         Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
-    );
-    stream.write_all(request.as_bytes()).map_err(|error| error.to_string())?;
-    let headers = read_http_headers(&mut stream)?;
-    if !headers.starts_with("HTTP/1.1 101") {
-        let status_line = headers.lines().next().unwrap_or_default();
-        return Err(format!("bridge 拒绝了 WebSocket 握手：{status_line}"));
-    }
-
+    let mut stream = open_bridge_socket(address, timeout)?;
     write_client_frame(&mut stream, 0x1, br#"{"type":"status"}"#)?;
     let reply =
         read_text_frame(&mut stream)?.ok_or_else(|| "bridge 在应答前关闭了连接".to_owned())?;
@@ -93,7 +77,67 @@ pub fn status(address: &str, timeout: Duration) -> Result<BridgeStatusReport, St
                 items.iter().filter_map(|item| item.as_str().map(ToOwned::to_owned)).collect()
             })
             .unwrap_or_default(),
+        projects: message
+            .get("projects")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items.iter().filter_map(|item| item.as_str().map(ToOwned::to_owned)).collect()
+            })
+            .unwrap_or_default(),
     })
+}
+
+/// Performs the same `hello` handshake the EDA extension sends, for the exact
+/// connect path an EDA client takes.
+///
+/// # Errors
+///
+/// Returns an error when the transport fails, or carries the bridge's own
+/// error message (for example an unregistered project ID) verbatim.
+pub fn hello(address: &str, project_id: &str, timeout: Duration) -> Result<(), String> {
+    let mut stream = open_bridge_socket(address, timeout)?;
+    let hello = serde_json::json!({
+        "type": "hello",
+        "protocolVersion": 1,
+        "projectId": project_id,
+    });
+    write_client_frame(&mut stream, 0x1, hello.to_string().as_bytes())?;
+    let reply =
+        read_text_frame(&mut stream)?.ok_or_else(|| "bridge 在应答前关闭了连接".to_owned())?;
+    let message: Value = serde_json::from_str(&reply)
+        .map_err(|error| format!("bridge 应答不是有效 JSON：{error}"))?;
+    match message.get("type").and_then(Value::as_str) {
+        Some("hello_ack") => Ok(()),
+        Some("error") => Err(message
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("bridge 拒绝了连接")
+            .to_owned()),
+        other => Err(format!("bridge 应答了意外的消息：{other:?}")),
+    }
+}
+
+/// Connects to the bridge and completes the `/bridge` WebSocket upgrade.
+fn open_bridge_socket(address: &str, timeout: Duration) -> Result<TcpStream, String> {
+    let socket: SocketAddr =
+        address.parse().map_err(|error| format!("bridge 地址无效（{address}）：{error}"))?;
+    let mut stream = TcpStream::connect_timeout(&socket, timeout)
+        .map_err(|error| format!("无法连接 {address}：{error}"))?;
+    stream.set_read_timeout(Some(timeout)).map_err(|error| error.to_string())?;
+    stream.set_write_timeout(Some(timeout)).map_err(|error| error.to_string())?;
+
+    let key = handshake_key();
+    let request = format!(
+        "GET /bridge HTTP/1.1\r\nHost: {address}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+         Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).map_err(|error| error.to_string())?;
+    let headers = read_http_headers(&mut stream)?;
+    if !headers.starts_with("HTTP/1.1 101") {
+        let status_line = headers.lines().next().unwrap_or_default();
+        return Err(format!("bridge 拒绝了 WebSocket 握手：{status_line}"));
+    }
+    Ok(stream)
 }
 
 /// Non-crypto randomness for the handshake key and frame masks: these only
