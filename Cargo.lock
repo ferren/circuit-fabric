@@ -936,10 +936,13 @@ dependencies = [
 name = "circuitfabric-codex-runtime"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "ring",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
  "win32job",
+ "zeroize",
 ]
 
 [[package]]

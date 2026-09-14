@@ -142,7 +142,20 @@ impl ToolCatalog {
         id: &str,
         grants: &ToolAuthorizationSettings,
     ) -> Result<Value, RuntimeError> {
-        self.mcp_request(id, grants, "tools/list", &json!({}))
+        self.list_tools_with_secrets(id, grants, None)
+    }
+
+    /// Discover tools with the unlocked secrets vault as the fallback source
+    /// for the server's whitelisted environment variables.
+    /// # Errors
+    /// Authorization, process, protocol and timeout failures are returned.
+    pub fn list_tools_with_secrets(
+        &self,
+        id: &str,
+        grants: &ToolAuthorizationSettings,
+        secrets: Option<&crate::secrets::SecretValues>,
+    ) -> Result<Value, RuntimeError> {
+        self.mcp_request(id, grants, "tools/list", &json!({}), secrets)
     }
 
     /// Call an authorized server; re-evaluate grants at every invocation.
@@ -155,7 +168,22 @@ impl ToolCatalog {
         name: &str,
         arguments: &Value,
     ) -> Result<Value, RuntimeError> {
-        self.mcp_request(id, grants, "tools/call", &json!({"name":name,"arguments":arguments}))
+        self.call_tool_with_secrets(id, grants, name, arguments, None)
+    }
+
+    /// Call a tool with the unlocked secrets vault as the fallback source for
+    /// the server's whitelisted environment variables.
+    /// # Errors
+    /// Authorization, process, protocol and timeout failures are returned.
+    pub fn call_tool_with_secrets(
+        &self,
+        id: &str,
+        grants: &ToolAuthorizationSettings,
+        name: &str,
+        arguments: &Value,
+        secrets: Option<&crate::secrets::SecretValues>,
+    ) -> Result<Value, RuntimeError> {
+        self.mcp_request(id, grants, "tools/call", &json!({"name":name,"arguments":arguments}), secrets)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -165,6 +193,7 @@ impl ToolCatalog {
         grants: &ToolAuthorizationSettings,
         method: &str,
         params: &Value,
+        secrets: Option<&crate::secrets::SecretValues>,
     ) -> Result<Value, RuntimeError> {
         if !grants.authorized_mcp_server_ids.iter().any(|s| s == id) {
             return Err(invalid(format!("MCP {id} 未授权")));
@@ -180,13 +209,13 @@ impl ToolCatalog {
             .into_iter()
             .chain(server.environment_variables.iter().map(String::as_str))
         {
-            if let Some(value) = env::var_os(name) {
-                command.env(name, value);
+            if let Some(value) = crate::secrets::resolve(name, secrets) {
+                command.env(name, value.as_str());
             }
         }
         for name in &server.environment_variables {
-            if env::var_os(name).is_none() {
-                return Err(invalid(format!("缺少环境变量 {name}")));
+            if crate::secrets::resolve(name, secrets).is_none() {
+                return Err(invalid(crate::secrets::missing_variable_message(name)));
             }
         }
         let mut child =
@@ -298,17 +327,23 @@ impl ToolCatalog {
         drop(receiver);
         let _ = reader.join();
         result.map(|mut value| {
-            redact_value(&mut value, server);
+            redact_value(&mut value, server, secrets);
             value
         })
     }
 }
 
-fn redact_value(value: &mut Value, server: &McpServerDefinition) {
+fn redact_value(
+    value: &mut Value,
+    server: &McpServerDefinition,
+    secrets: Option<&crate::secrets::SecretValues>,
+) {
     match value {
-        Value::String(text) => *text = crate::execution::redact(text, "", &[server]),
-        Value::Array(items) => items.iter_mut().for_each(|item| redact_value(item, server)),
-        Value::Object(fields) => fields.values_mut().for_each(|item| redact_value(item, server)),
+        Value::String(text) => *text = crate::execution::redact(text, "", &[server], secrets),
+        Value::Array(items) => items.iter_mut().for_each(|item| redact_value(item, server, secrets)),
+        Value::Object(fields) => {
+            fields.values_mut().for_each(|item| redact_value(item, server, secrets));
+        }
         _ => {}
     }
 }

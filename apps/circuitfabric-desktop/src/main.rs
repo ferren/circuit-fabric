@@ -25,12 +25,13 @@ pub enum ControlPlaneScreen {
     BomAndExport,
     Plugins,
     Usage,
+    SecretsVault,
     Settings,
 }
 
 impl ControlPlaneScreen {
     #[cfg(feature = "native-ui")]
-    const ALL: [Self; 12] = [
+    const ALL: [Self; 13] = [
         Self::Overview,
         Self::Projects,
         Self::Documents,
@@ -42,6 +43,7 @@ impl ControlPlaneScreen {
         Self::BomAndExport,
         Self::Plugins,
         Self::Usage,
+        Self::SecretsVault,
         Self::Settings,
     ];
 
@@ -59,6 +61,7 @@ impl ControlPlaneScreen {
             Self::BomAndExport => "BOM & export",
             Self::Plugins => "Plugins",
             Self::Usage => "Usage & audit",
+            Self::SecretsVault => "Secrets vault",
             Self::Settings => "Settings",
         }
     }
@@ -71,13 +74,20 @@ impl ControlPlaneScreen {
             }
             Self::EdaServices | Self::AgentsAndMcp | Self::SessionsAndTasks => "RUNTIME TOOLS",
             Self::ChangesAndApprovals | Self::BomAndExport => "MATERIALIZE & DELIVER",
-            Self::Plugins | Self::Usage | Self::Settings => "GOVERNANCE",
+            Self::Plugins | Self::Usage | Self::SecretsVault | Self::Settings => "GOVERNANCE",
         }
     }
 
     #[must_use]
     pub const fn is_todo(self) -> bool {
-        !matches!(self, Self::Overview | Self::Projects | Self::EdaServices | Self::AgentsAndMcp)
+        !matches!(
+            self,
+            Self::Overview
+                | Self::Projects
+                | Self::EdaServices
+                | Self::AgentsAndMcp
+                | Self::SecretsVault
+        )
     }
 }
 
@@ -133,6 +143,7 @@ impl UiLanguage {
                 ControlPlaneScreen::BomAndExport => "BOM 与导出",
                 ControlPlaneScreen::Plugins => "插件",
                 ControlPlaneScreen::Usage => "用量与审计",
+                ControlPlaneScreen::SecretsVault => "密钥保险库",
                 ControlPlaneScreen::Settings => "设置",
             },
         }
@@ -154,6 +165,7 @@ impl UiLanguage {
                 }
                 ControlPlaneScreen::Plugins
                 | ControlPlaneScreen::Usage
+                | ControlPlaneScreen::SecretsVault
                 | ControlPlaneScreen::Settings => "治理",
             },
         }
@@ -259,7 +271,8 @@ impl UiLanguage {
                 _,
                 ControlPlaneScreen::Overview
                 | ControlPlaneScreen::Projects
-                | ControlPlaneScreen::AgentsAndMcp,
+                | ControlPlaneScreen::AgentsAndMcp
+                | ControlPlaneScreen::SecretsVault,
             ) => unreachable!(),
         }
     }
@@ -296,6 +309,7 @@ fn main() {
         time::{Duration, Instant},
     };
 
+    use circuitfabric_codex_runtime::secrets::{SecretSource, UnlockedVault, secret_source};
     use circuitfabric_codex_runtime::{
         CodexAppServerHandle, LlmProviderSettings, RuntimeSettings, ToolAuthorizationKind,
         ToolAuthorizationSettings,
@@ -646,6 +660,21 @@ fn main() {
         task_result: String,
         task_cancel: Option<circuitfabric_codex_runtime::execution::Cancellation>,
         project_agent_adapter: RuntimeAdapter,
+        // Secrets vault: the encrypted API-key store. `vault` holds decrypted
+        // key material only while unlocked; `vault_index` is the plaintext
+        // variable-name index, readable even while locked.
+        vault_path: PathBuf,
+        vault: Option<UnlockedVault>,
+        vault_file_exists: bool,
+        vault_index: Vec<String>,
+        vault_prompt_open: bool,
+        vault_busy: bool,
+        vault_message: Option<String>,
+        vault_password: Entity<InputState>,
+        vault_password_confirm: Entity<InputState>,
+        secret_name: Entity<InputState>,
+        secret_value: Entity<InputState>,
+        selected_secret: Option<String>,
     }
 
     impl Drop for ControlPlaneView {
@@ -653,6 +682,7 @@ fn main() {
             if let Some(cancel) = &self.task_cancel {
                 cancel.cancel();
             }
+            // Dropping `vault` zeroizes the derived key and all decrypted values.
         }
     }
 
@@ -745,6 +775,15 @@ fn main() {
             cx: &mut Context<Self>,
         ) -> Entity<InputState> {
             cx.new(|cx| InputState::new(window, cx).default_value(value).placeholder(placeholder))
+        }
+
+        /// Password-style input: no echo, and the value stays out of the clipboard.
+        fn masked_input(
+            window: &mut Window,
+            placeholder: &'static str,
+            cx: &mut Context<Self>,
+        ) -> Entity<InputState> {
+            cx.new(|cx| InputState::new(window, cx).masked(true).placeholder(placeholder))
         }
 
         fn provider_fields(
@@ -845,9 +884,18 @@ fn main() {
             let task_prompt = Self::input(window, String::new(), "输入任务以验证真实模型调用", cx);
             let task_image =
                 Self::input(window, String::new(), "可选图片路径；使用 Vision 服务", cx);
-            for input in
-                [&project_search, &evidence_query, &new_project_id, &new_project_root, &new_tool_id]
-            {
+            let vault_password = Self::masked_input(window, "保险库密码", cx);
+            let vault_password_confirm = Self::masked_input(window, "再次输入密码", cx);
+            let secret_name = Self::input(window, String::new(), "OPENAI_API_KEY", cx);
+            let secret_value = Self::masked_input(window, "粘贴密钥值，保存后不再回显", cx);
+            for input in [
+                &project_search,
+                &evidence_query,
+                &new_project_id,
+                &new_project_root,
+                &new_tool_id,
+                &secret_name,
+            ] {
                 cx.subscribe(input, |_, _, event, cx| {
                     if let InputEvent::Change = event {
                         cx.notify();
@@ -861,6 +909,13 @@ fn main() {
                 "项目列表已恢复；全局运行时设置尚未修改。".to_owned()
             } else {
                 format!("项目恢复提示：{}", project_restore_diagnostics.join("；"))
+            };
+            let vault_path = UnlockedVault::default_path();
+            let vault_file_exists = UnlockedVault::exists(&vault_path);
+            let vault_index = if vault_file_exists {
+                UnlockedVault::variable_names(&vault_path).unwrap_or_default()
+            } else {
+                Vec::new()
             };
             Self {
                 sidebar_mark: Arc::new(Image::from_bytes(ImageFormat::Png, SIDEBAR_MARK.to_vec())),
@@ -929,6 +984,18 @@ fn main() {
                 task_result: String::new(),
                 task_cancel: None,
                 project_agent_adapter: RuntimeAdapter::CodexAppServer,
+                vault_path,
+                vault: None,
+                vault_file_exists,
+                vault_index,
+                vault_prompt_open: vault_file_exists,
+                vault_busy: false,
+                vault_message: None,
+                vault_password,
+                vault_password_confirm,
+                secret_name,
+                secret_value,
+                selected_secret: None,
                 new_tool_kind: ToolAuthorizationKind::Skill,
                 new_tool_scope: ToolScope::Global,
             }
@@ -1121,9 +1188,14 @@ fn main() {
             self.default_provider_id.clone_from(&settings.default_provider_id);
             self.codex_status = RuntimeLifecycleStatus::Starting;
             self.status = format!("Codex App Server: {} / {}", provider.id, provider.model);
+            let secrets = self.vault.as_ref().map(|vault| vault.values().clone());
             let launch = cx.background_spawn(async move {
-                CodexAppServerHandle::launch(&settings.codex, &provider)
-                    .map_err(|error| error.to_string())
+                CodexAppServerHandle::launch_with_secrets(
+                    &settings.codex,
+                    &provider,
+                    secrets.as_ref(),
+                )
+                .map_err(|error| error.to_string())
             });
             cx.spawn_in(window, async move |view, cx| {
                 let result = launch.await;
@@ -1226,28 +1298,32 @@ fn main() {
             self.bridge_health = BridgeHealth::Unknown;
             self.bridge_probed_at = None;
             self.status = format!("bridge 正在启动：ws://{address}/bridge");
+            let secrets = self.vault.as_ref().map(|vault| vault.values().clone());
             let launch = cx.background_spawn(async move {
-                BridgeProcessHandle::launch(&config_path).and_then(|mut handle| {
-                    let deadline = Instant::now() + Duration::from_secs(5);
-                    while Instant::now() < deadline {
-                        if let Some(exit) = handle.try_exit() {
-                            let diagnostics = handle.exit_diagnostics();
-                            let detail = if diagnostics.is_empty() {
-                                String::new()
-                            } else {
-                                format!("：{diagnostics}")
-                            };
-                            return Err(format!("bridge 进程已退出（{exit}）{detail}"));
+                BridgeProcessHandle::launch_with_vault(&config_path, secrets.as_ref()).and_then(
+                    |mut handle| {
+                        let deadline = Instant::now() + Duration::from_secs(5);
+                        while Instant::now() < deadline {
+                            if let Some(exit) = handle.try_exit() {
+                                let diagnostics = handle.exit_diagnostics();
+                                let detail = if diagnostics.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!("：{diagnostics}")
+                                };
+                                return Err(format!("bridge 进程已退出（{exit}）{detail}"));
+                            }
+                            if probe::tcp_reachable(&launch_address, Duration::from_millis(300))
+                                .is_ok()
+                            {
+                                return Ok(handle);
+                            }
+                            std::thread::sleep(Duration::from_millis(100));
                         }
-                        if probe::tcp_reachable(&launch_address, Duration::from_millis(300)).is_ok()
-                        {
-                            return Ok(handle);
-                        }
-                        std::thread::sleep(Duration::from_millis(100));
-                    }
-                    let _ = handle.stop();
-                    Err(format!("bridge 在 5 秒内未开始监听 {launch_address}"))
-                })
+                        let _ = handle.stop();
+                        Err(format!("bridge 在 5 秒内未开始监听 {launch_address}"))
+                    },
+                )
             });
             cx.spawn_in(window, async move |view, cx| {
                 let result = launch.await;
@@ -3177,6 +3253,280 @@ fn main() {
             grants
         }
 
+        /// Reports which source currently supplies one variable name: the
+        /// unlocked vault wins over the process environment. Rendered under
+        /// API-key fields so a mis-typed name is visible before a task fails.
+        fn secret_source_hint(&self, name: &str) -> Option<gpui::Div> {
+            let name = name.trim();
+            if name.is_empty() {
+                return None;
+            }
+            let language = self.language;
+            let (color, text) =
+                match secret_source(name, self.vault.as_ref().map(UnlockedVault::values)) {
+                    Some(SecretSource::Vault) => (
+                        0x0016_a34a,
+                        language.choose_owned(
+                            format!("✔ {name}：由密钥保险库提供（已解锁）"),
+                            format!("✔ {name}: supplied by the unlocked secrets vault"),
+                        ),
+                    ),
+                    Some(SecretSource::Environment) => (
+                        0x0016_a34a,
+                        language.choose_owned(
+                            format!("✔ {name}：由进程环境变量提供"),
+                            format!("✔ {name}: supplied by the process environment"),
+                        ),
+                    ),
+                    None => (
+                        0x00dc_2626,
+                        language.choose_owned(
+                            format!("✘ {name}：未找到该变量，请在密钥保险库收录，或设置同名环境变量"),
+                            format!(
+                                "✘ {name}: not found — record it in the secrets vault, or set an environment variable with this name"
+                            ),
+                        ),
+                    ),
+                };
+            Some(div().text_xs().whitespace_normal().text_color(rgb(color)).child(text))
+        }
+
+        /// Unlocks the vault with the typed password. Key derivation runs on a
+        /// background thread; a wrong password keeps the prompt open with the
+        /// vault's own error message.
+        fn unlock_vault(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+            if self.vault_busy {
+                return;
+            }
+            let password = self.vault_password.read(cx).value().to_string();
+            if password.is_empty() {
+                self.vault_message = Some("请输入保险库密码。".to_owned());
+                cx.notify();
+                return;
+            }
+            self.vault_busy = true;
+            self.vault_message = None;
+            let path = self.vault_path.clone();
+            let work = cx.background_spawn(async move {
+                UnlockedVault::unlock(&path, &password).map_err(|error| error.to_string())
+            });
+            cx.spawn_in(window, async move |view, cx| {
+                let result = work.await;
+                cx.update(|window, cx| {
+                    view.update(cx, |view, cx| {
+                        view.vault_busy = false;
+                        match result {
+                            Ok(vault) => {
+                                view.vault_index =
+                                    vault.values().names().cloned().collect::<Vec<_>>();
+                                let count = view.vault_index.len();
+                                view.vault = Some(vault);
+                                view.vault_file_exists = true;
+                                view.vault_prompt_open = false;
+                                view.vault_message = None;
+                                view.vault_password.update(cx, |state, cx| {
+                                    state.set_value("", window, cx);
+                                });
+                                view.status = format!("保险库已解锁，收录 {count} 个变量。");
+                            }
+                            Err(error) => {
+                                view.vault_message = Some(error);
+                            }
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .ok();
+            })
+            .detach();
+            cx.notify();
+        }
+
+        /// Creates a new vault file and unlocks it immediately.
+        fn create_vault(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+            if self.vault_busy {
+                return;
+            }
+            let password = self.vault_password.read(cx).value().to_string();
+            let confirm = self.vault_password_confirm.read(cx).value().to_string();
+            if password != confirm {
+                self.vault_message = Some("两次输入的密码不一致。".to_owned());
+                cx.notify();
+                return;
+            }
+            self.vault_busy = true;
+            self.vault_message = None;
+            let path = self.vault_path.clone();
+            let work = cx.background_spawn(async move {
+                UnlockedVault::create(&path, &password).map_err(|error| error.to_string())
+            });
+            cx.spawn_in(window, async move |view, cx| {
+                let result = work.await;
+                cx.update(|window, cx| {
+                    view.update(cx, |view, cx| {
+                        view.vault_busy = false;
+                        match result {
+                            Ok(vault) => {
+                                view.vault = Some(vault);
+                                view.vault_file_exists = true;
+                                view.vault_index = Vec::new();
+                                view.vault_message = None;
+                                view.vault_password.update(cx, |state, cx| {
+                                    state.set_value("", window, cx);
+                                });
+                                view.vault_password_confirm.update(cx, |state, cx| {
+                                    state.set_value("", window, cx);
+                                });
+                                "保险库已创建并解锁。".clone_into(&mut view.status);
+                            }
+                            Err(error) => {
+                                view.vault_message = Some(error);
+                            }
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .ok();
+            })
+            .detach();
+            cx.notify();
+        }
+
+        /// Locks the vault: dropping it zeroizes the derived key and decrypted
+        /// values. The plaintext name index stays readable from disk.
+        fn relock_vault(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+            if self.vault_busy {
+                return;
+            }
+            self.vault_password.update(cx, |state, cx| state.set_value("", window, cx));
+            self.vault_password_confirm.update(cx, |state, cx| state.set_value("", window, cx));
+            self.vault = None;
+            self.vault_prompt_open = false;
+            self.vault_index = UnlockedVault::variable_names(&self.vault_path).unwrap_or_default();
+            self.selected_secret = None;
+            self.vault_message = None;
+            "保险库已锁定；正在运行的任务保留其启动时注入的变量。".clone_into(&mut self.status);
+            cx.notify();
+        }
+
+        /// Adds or replaces one variable. The vault re-encrypts atomically on
+        /// each write, and the value field is cleared so it never echoes back.
+        fn save_secret_entry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+            let name = self.secret_name.read(cx).value().trim().to_owned();
+            let value = self.secret_value.read(cx).value().to_string();
+            if name.is_empty() {
+                self.vault_message = Some("请填写变量名。".to_owned());
+                cx.notify();
+                return;
+            }
+            let Some(vault) = self.vault.as_mut() else {
+                self.vault_message = Some("请先解锁保险库。".to_owned());
+                cx.notify();
+                return;
+            };
+            match vault.set(&name, &value) {
+                Ok(()) => {
+                    self.vault_index = vault.values().names().cloned().collect();
+                    self.secret_value.update(cx, |state, cx| state.set_value("", window, cx));
+                    self.selected_secret = Some(name.clone());
+                    self.vault_message = None;
+                    self.status = format!("已保存变量 {name}（值已加密写入保险库）。");
+                }
+                Err(error) => {
+                    self.vault_message = Some(error.to_string());
+                }
+            }
+            cx.notify();
+        }
+
+        fn remove_secret_entry(&mut self, name: &str, cx: &mut Context<Self>) {
+            let Some(vault) = self.vault.as_mut() else {
+                self.vault_message = Some("请先解锁保险库。".to_owned());
+                cx.notify();
+                return;
+            };
+            match vault.remove(name) {
+                Ok(_) => {
+                    self.vault_index = vault.values().names().cloned().collect();
+                    if self.selected_secret.as_deref() == Some(name) {
+                        self.selected_secret = None;
+                    }
+                    self.vault_message = None;
+                    self.status = format!("已移除变量 {name}。");
+                }
+                Err(error) => {
+                    self.vault_message = Some(error.to_string());
+                }
+            }
+            cx.notify();
+        }
+
+        /// Re-encrypts the vault under a new password. Key derivation is slow,
+        /// so the vault is moved to a background thread and always put back —
+        /// even when the change fails, the session stays unlocked.
+        fn change_vault_password(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+            if self.vault_busy {
+                return;
+            }
+            let password = self.vault_password.read(cx).value().to_string();
+            let confirm = self.vault_password_confirm.read(cx).value().to_string();
+            if password != confirm {
+                self.vault_message = Some("两次输入的密码不一致。".to_owned());
+                cx.notify();
+                return;
+            }
+            let Some(vault) = self.vault.take() else {
+                self.vault_message = Some("请先解锁保险库。".to_owned());
+                cx.notify();
+                return;
+            };
+            self.vault_busy = true;
+            self.vault_message = None;
+            let work = cx.background_spawn(async move {
+                let mut vault = vault;
+                let result = vault.change_password(&password).map_err(|error| error.to_string());
+                (vault, result)
+            });
+            cx.spawn_in(window, async move |view, cx| {
+                let (vault, result) = work.await;
+                cx.update(|window, cx| {
+                    view.update(cx, |view, cx| {
+                        view.vault_busy = false;
+                        view.vault = Some(vault);
+                        match result {
+                            Ok(()) => {
+                                view.vault_password.update(cx, |state, cx| {
+                                    state.set_value("", window, cx);
+                                });
+                                view.vault_password_confirm.update(cx, |state, cx| {
+                                    state.set_value("", window, cx);
+                                });
+                                view.vault_message = None;
+                                "保险库密码已更新。".clone_into(&mut view.status);
+                            }
+                            Err(error) => {
+                                view.vault_message = Some(error);
+                            }
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .ok();
+            })
+            .detach();
+            cx.notify();
+        }
+
+        fn dismiss_vault_prompt(&mut self, cx: &mut Context<Self>) {
+            self.vault_prompt_open = false;
+            "已暂缓解锁；缺少密钥的任务会失败并提示来源。可在「密钥保险库」页随时解锁。"
+                .clone_into(&mut self.status);
+            cx.notify();
+        }
+
         fn run_agent_task(
             &mut self,
             adapter: RuntimeAdapter,
@@ -3184,7 +3534,7 @@ fn main() {
             cx: &mut Context<Self>,
         ) {
             use circuitfabric_codex_runtime::execution::{
-                AgentKind, Cancellation, run_task_with_options,
+                AgentKind, Cancellation, run_task_with_secrets,
             };
             if self.task_cancel.is_some() {
                 return;
@@ -3257,14 +3607,16 @@ fn main() {
                 }
             });
             let project_root = project_scope.as_ref().map(|(_, root)| root.clone());
+            let secrets = self.vault.as_ref().map(|vault| vault.values().clone());
             let work = cx.background_spawn(async move {
-                run_task_with_options(
+                run_task_with_secrets(
                     &settings,
                     kind,
                     &grants,
                     &prompt,
                     image.as_deref(),
                     project_root.as_deref(),
+                    secrets.as_ref(),
                     &cancel,
                 )
             });
@@ -3492,6 +3844,10 @@ fn main() {
             let toggle_provider = entity.clone();
             let remove_provider = entity.clone();
             let toggle_vision = entity;
+            let api_key_hint =
+                self.secret_source_hint(&provider.api_key_environment_variable.read(cx).value());
+            let vision_key_hint = self
+                .secret_source_hint(&provider.vision_api_key_environment_variable.read(cx).value());
 
             let default_badge = selected_is_default.then(|| {
                 div()
@@ -3622,7 +3978,8 @@ fn main() {
                                 "Environment-variable name only, e.g. OPENAI_API_KEY; the key value never appears here.",
                             )),
                             &provider.api_key_environment_variable,
-                        )),
+                        ))
+                        .when_some(api_key_hint, ParentElement::child),
                 )
                 .child(
                     div()
@@ -3679,7 +4036,8 @@ fn main() {
                                 "Also an environment-variable name only.",
                             )),
                             &provider.vision_api_key_environment_variable,
-                        )),
+                        ))
+                        .when_some(vision_key_hint, ParentElement::child),
                 )
                 .child(
                     div()
@@ -3732,6 +4090,18 @@ fn main() {
             let entity = cx.entity().clone();
             let skill_importer = entity.clone();
             let mcp_saver = entity.clone();
+            let env_names = Self::parse_tool_ids(&self.catalog_env.read(cx).value());
+            let env_hints = if env_names.is_empty() {
+                None
+            } else {
+                let mut list = div().v_flex().gap_1();
+                for name in &env_names {
+                    if let Some(hint) = self.secret_source_hint(name) {
+                        list = list.child(hint);
+                    }
+                }
+                Some(list)
+            };
             let mut rows = div().v_flex().gap_2();
             for skill in self.catalog.skills.clone() {
                 let remover = entity.clone();
@@ -3894,11 +4264,17 @@ fn main() {
                                     tester.update(cx, |view, cx| {
                                         let catalog = view.catalog.clone();
                                         let grants = view.effective_grants();
+                                        let secrets =
+                                            view.vault.as_ref().map(|vault| vault.values().clone());
                                         let id = test_id.clone();
                                         view.status = "正在连接 MCP…".into();
                                         let work = cx.background_spawn(async move {
                                             catalog
-                                                .list_tools(&id, &grants)
+                                                .list_tools_with_secrets(
+                                                    &id,
+                                                    &grants,
+                                                    secrets.as_ref(),
+                                                )
                                                 .map(|value| value.to_string())
                                                 .map_err(|e| e.to_string())
                                         });
@@ -3960,6 +4336,7 @@ fn main() {
                     None,
                     &self.catalog_env,
                 ))
+                .when_some(env_hints, ParentElement::child)
                 .child(
                     div()
                         .flex()
@@ -5816,6 +6193,679 @@ fn main() {
             }
         }
 
+        /// The secrets vault page: one encrypted file on disk, held decrypted
+        /// only in memory while unlocked. The left column lists the recorded
+        /// variable names (names are not secret); the right pane creates,
+        /// unlocks, and locks the vault and edits entries without ever
+        /// echoing a value back.
+        #[allow(clippy::too_many_lines)]
+        fn render_secrets_page(
+            &mut self,
+            _window: &mut Window,
+            cx: &mut Context<Self>,
+        ) -> impl IntoElement {
+            let entity = cx.entity().clone();
+            let language = self.language;
+            let unlocked = self.vault.is_some();
+            let file_exists = self.vault_file_exists;
+            let busy = self.vault_busy;
+            let message = self.vault_message.clone();
+
+            let mut secret_rows = div().v_flex().gap_2();
+            if self.vault_index.is_empty() {
+                secret_rows = secret_rows.child(
+                    div()
+                        .p_3()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .bg(rgb(SURFACE_BG))
+                        .text_sm()
+                        .text_color(rgb(TEXT_MUTED))
+                        .child(language.choose(
+                            "暂无收录变量；保存第一条密钥后出现在这里。",
+                            "No variables recorded yet; saved keys appear here.",
+                        )),
+                );
+            } else {
+                for name in self.vault_index.clone() {
+                    let selector = entity.clone();
+                    let selected =
+                        unlocked && self.selected_secret.as_deref() == Some(name.as_str());
+                    let row_name = name.clone();
+                    let row = div()
+                        .id(format!("secret-row-{name}"))
+                        .v_flex()
+                        .gap_1()
+                        .p_3()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(rgb(if selected { ACCENT } else { BORDER }))
+                        .bg(rgb(if selected { 0x00f0_f9ff } else { CARD_BG }))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .when(!unlocked, |this| this.child(status_dot(0x0094_a3b8)))
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(if selected {
+                                            FontWeight::SEMIBOLD
+                                        } else {
+                                            FontWeight::MEDIUM
+                                        })
+                                        .text_color(rgb(if unlocked {
+                                            TEXT_PRIMARY
+                                        } else {
+                                            TEXT_MUTED
+                                        }))
+                                        .child(name),
+                                ),
+                        );
+                    secret_rows = secret_rows.child(if unlocked {
+                        row.cursor_pointer()
+                            .hover(|this| this.border_color(rgb(ACCENT_SOFT)))
+                            .on_click(move |_, _, cx| {
+                                selector.update(cx, |view, cx| {
+                                    view.selected_secret = Some(row_name.clone());
+                                    cx.notify();
+                                });
+                            })
+                    } else {
+                        row.opacity(0.7)
+                    });
+                }
+            }
+
+            let detail = if !file_exists {
+                let creator = entity.clone();
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .v_flex()
+                    .gap_4()
+                    .p_5()
+                    .rounded_xl()
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .bg(rgb(CARD_BG))
+                    .child(
+                        div()
+                            .v_flex()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_lg()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(language
+                                        .choose("创建密钥保险库", "Create the secrets vault")),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .whitespace_normal()
+                                    .text_color(rgb(TEXT_SECONDARY))
+                                    .child(language.choose(
+                                        "保险库以你设置的安全密码加密保存各 Provider/MCP 的 API Key；解锁后密钥作为环境变量注入运行时与 MCP 进程，不会写入配置文件或命令行参数。",
+                                        "The vault stores Provider/MCP API keys encrypted with your passphrase; once unlocked, keys are injected into runtime and MCP processes as environment variables — never written to config files or command-line arguments.",
+                                    )),
+                            ),
+                    )
+                    .child(Self::labeled_field(
+                        language.choose("保险库密码", "Vault password"),
+                        "vault-create-password",
+                        None,
+                        &self.vault_password,
+                    ))
+                    .child(Self::labeled_field(
+                        language.choose("确认密码", "Confirm password"),
+                        "vault-create-confirm",
+                        None,
+                        &self.vault_password_confirm,
+                    ))
+                    .when_some(message, |this, message| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .whitespace_normal()
+                                .text_color(rgb(0x00dc_2626))
+                                .child(message),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                Button::new("create-vault")
+                                    .primary()
+                                    .label(if busy {
+                                        language.choose("正在创建…", "Creating…")
+                                    } else {
+                                        language.choose("创建保险库", "Create vault")
+                                    })
+                                    .disabled(busy)
+                                    .on_click(move |_, window, cx| {
+                                        creator.update(cx, |view, cx| {
+                                            view.create_vault(window, cx);
+                                        });
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .text_xs()
+                                    .whitespace_normal()
+                                    .text_color(rgb(TEXT_MUTED))
+                                    .child(language.choose(
+                                        "密码至少 8 个字符，请牢记：丢失后无法找回已存密钥。",
+                                        "At least 8 characters; memorize it — a lost password cannot recover stored keys.",
+                                    )),
+                            ),
+                    )
+                    .into_any_element()
+            } else if !unlocked {
+                let dialog_entity = entity.clone();
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .v_flex()
+                    .gap_4()
+                    .p_5()
+                    .rounded_xl()
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .bg(rgb(CARD_BG))
+                    .child(
+                        div()
+                            .v_flex()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_lg()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(language
+                                        .choose("解锁密钥保险库", "Unlock the secrets vault")),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .whitespace_normal()
+                                    .text_color(rgb(TEXT_SECONDARY))
+                                    .child(language.choose(
+                                        "输入密码解锁后，密钥值才会注入运行时与 MCP 进程；锁定状态下任务与工具调用只能从进程环境读取。",
+                                        "Keys are injected into runtime and MCP processes only after you unlock with the password; while locked, tasks and tool calls can only read the process environment.",
+                                    )),
+                            ),
+                    )
+                    .child(Self::labeled_field(
+                        language.choose("保险库密码", "Vault password"),
+                        "vault-unlock-password",
+                        None,
+                        &self.vault_password,
+                    ))
+                    .when_some(message, |this, message| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .whitespace_normal()
+                                .text_color(rgb(0x00dc_2626))
+                                .child(message),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                Button::new("unlock-vault-page")
+                                    .primary()
+                                    .label(if busy {
+                                        language.choose("正在解锁…", "Unlocking…")
+                                    } else {
+                                        language.choose("解锁", "Unlock")
+                                    })
+                                    .disabled(busy)
+                                    .on_click(move |_, window, cx| {
+                                        dialog_entity.update(cx, |view, cx| {
+                                            view.unlock_vault(window, cx);
+                                        });
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .text_xs()
+                                    .whitespace_normal()
+                                    .text_color(rgb(TEXT_MUTED))
+                                    .child(format!(
+                                        "{} {}",
+                                        language.choose("保险库文件：", "Vault file:"),
+                                        self.vault_path.display()
+                                    )),
+                            ),
+                    )
+                    .into_any_element()
+            } else {
+                let relocker = entity.clone();
+                let saver = entity.clone();
+                let password_changer = entity.clone();
+                let count = self.vault_index.len();
+                let editing_name = self.secret_name.read(cx).value().trim().to_owned();
+                let updating = self.vault_index.iter().any(|name| name == &editing_name);
+
+                let mut selected_card = None;
+                if let Some(selected) = self.selected_secret.clone()
+                    && self.vault_index.iter().any(|name| name == &selected)
+                {
+                    let remover = entity.clone();
+                    let remove_name = selected.clone();
+                    selected_card = Some(
+                        div()
+                            .v_flex()
+                            .gap_2()
+                            .p_4()
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .bg(rgb(SURFACE_BG))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap_3()
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(0.))
+                                            .v_flex()
+                                            .gap_1()
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .child(format!("变量名 {selected}")),
+                                            )
+                                            .child(
+                                                div().text_xs().text_color(rgb(TEXT_MUTED)).child(
+                                                    language.choose(
+                                                        "值 ••••••••（不回显）",
+                                                        "Value •••••••• (never echoed)",
+                                                    ),
+                                                ),
+                                            ),
+                                    )
+                                    .child(
+                                        Button::new(format!("remove-secret-{selected}"))
+                                            .danger()
+                                            .label(language.choose("删除", "Remove"))
+                                            .on_click(move |_, _, cx| {
+                                                remover.update(cx, |view, cx| {
+                                                    view.remove_secret_entry(&remove_name, cx);
+                                                });
+                                            }),
+                                    ),
+                            )
+                            .into_any_element(),
+                    );
+                }
+
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .v_flex()
+                    .gap_4()
+                    .p_5()
+                    .rounded_xl()
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .bg(rgb(CARD_BG))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(status_dot(0x0022_c55e))
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .whitespace_normal()
+                                            .text_color(rgb(TEXT_SECONDARY))
+                                            .child(language.choose_owned(
+                                                format!(
+                                                    "已解锁 · {count} 个变量 · 文件 {}",
+                                                    self.vault_path.display()
+                                                ),
+                                                format!(
+                                                    "Unlocked · {count} variables · file {}",
+                                                    self.vault_path.display()
+                                                ),
+                                            )),
+                                    ),
+                            )
+                            .child(
+                                Button::new("relock-vault")
+                                    .ghost()
+                                    .label(language.choose("锁定保险库", "Lock vault"))
+                                    .disabled(busy)
+                                    .on_click(move |_, window, cx| {
+                                        relocker.update(cx, |view, cx| {
+                                            view.relock_vault(window, cx);
+                                        });
+                                    }),
+                            ),
+                    )
+                    .when_some(selected_card, ParentElement::child)
+                    .child(
+                        div()
+                            .v_flex()
+                            .gap_3()
+                            .child(div().text_base().font_weight(FontWeight::SEMIBOLD).child(
+                                language.choose("收录 / 更新变量", "Record / update a variable"),
+                            ))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .gap_3()
+                                    .child(Self::labeled_field(
+                                        language.choose("变量名", "Variable name"),
+                                        "secret-name",
+                                        None,
+                                        &self.secret_name,
+                                    ))
+                                    .child(Self::labeled_field(
+                                        language.choose("密钥值", "Secret value"),
+                                        "secret-value",
+                                        Some(language.choose(
+                                            "粘贴密钥值；保存后不再回显。",
+                                            "Paste the key value; it is never echoed after saving.",
+                                        )),
+                                        &self.secret_value,
+                                    )),
+                            )
+                            .when_some(message, |this, message| {
+                                this.child(
+                                    div()
+                                        .text_xs()
+                                        .whitespace_normal()
+                                        .text_color(rgb(0x00dc_2626))
+                                        .child(message),
+                                )
+                            })
+                            .child(
+                                Button::new("save-secret")
+                                    .primary()
+                                    .label(if updating {
+                                        language.choose("更新变量", "Update variable")
+                                    } else {
+                                        language.choose("保存变量", "Save variable")
+                                    })
+                                    .on_click(move |_, window, cx| {
+                                        saver.update(cx, |view, cx| {
+                                            view.save_secret_entry(window, cx);
+                                        });
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .v_flex()
+                            .gap_3()
+                            .child(
+                                div().text_base().font_weight(FontWeight::SEMIBOLD).child(
+                                    language.choose("修改保险库密码", "Change vault password"),
+                                ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .gap_3()
+                                    .child(Self::labeled_field(
+                                        language.choose("新密码", "New password"),
+                                        "vault-change-password",
+                                        None,
+                                        &self.vault_password,
+                                    ))
+                                    .child(Self::labeled_field(
+                                        language.choose("确认新密码", "Confirm new password"),
+                                        "vault-change-confirm",
+                                        None,
+                                        &self.vault_password_confirm,
+                                    )),
+                            )
+                            .child(
+                                Button::new("change-vault-password")
+                                    .ghost()
+                                    .label(if busy {
+                                        language.choose("正在更新…", "Updating…")
+                                    } else {
+                                        language.choose("更新密码", "Update password")
+                                    })
+                                    .disabled(busy)
+                                    .on_click(move |_, window, cx| {
+                                        password_changer.update(cx, |view, cx| {
+                                            view.change_vault_password(window, cx);
+                                        });
+                                    }),
+                            ),
+                    )
+                    .into_any_element()
+            };
+
+            div()
+                .size_full()
+                .min_w(px(720.))
+                .relative()
+                .v_flex()
+                .gap_4()
+                .p_6()
+                .child(
+                    div()
+                        .v_flex()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xl()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(language.choose("密钥保险库", "Secrets vault")),
+                        )
+                        .child(
+                            div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(
+                                language.choose(
+                                    "API Key 加密保存在本机保险库文件中，仅解锁期间驻留内存；同名进程环境变量仍是后备来源。",
+                                    "API keys live in one encrypted local vault file and in memory only while unlocked; same-named process environment variables remain the fallback source.",
+                                ),
+                            ),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h(px(0.))
+                        .flex()
+                        .gap_4()
+                        .child(
+                            div()
+                                .w(px(320.))
+                                .flex_none()
+                                .v_flex()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .child(Self::agents_group_label(
+                                            language.choose("变量", "Variables"),
+                                        ))
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(TEXT_MUTED))
+                                                .child(language.choose_owned(
+                                                    format!("{} 个", self.vault_index.len()),
+                                                    format!("{}", self.vault_index.len()),
+                                                )),
+                                        ),
+                                )
+                                .child(secret_rows),
+                        )
+                        .child(detail),
+                )
+                .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(self.status.clone()))
+        }
+
+        /// Startup prompt shown over the workspace when a vault file exists
+        /// but is still locked: unlock now, or explicitly defer. The backdrop
+        /// deliberately does not dismiss on click — deferral is a choice.
+        fn render_vault_prompt(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+            let entity = cx.entity().clone();
+            let language = self.language;
+            let dialog_entity = entity.clone();
+            let busy = self.vault_busy;
+            let message = self.vault_message.clone();
+
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .p_6()
+                .child(
+                    div()
+                        .id("vault-prompt-backdrop")
+                        .absolute()
+                        .inset_0()
+                        .bg(rgba(0x00_0f17_2ab3))
+                        .occlude(),
+                )
+                .child(
+                    div()
+                        .relative()
+                        .occlude()
+                        .w(px(480.))
+                        .v_flex()
+                        .gap_4()
+                        .p_5()
+                        .rounded_xl()
+                        .border_1()
+                        .border_color(rgb(ACCENT_SOFT))
+                        .bg(rgb(SURFACE_BG))
+                        .shadow_lg()
+                        .child(
+                            div()
+                                .v_flex()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_lg()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(TEXT_PRIMARY))
+                                        .child(language
+                                            .choose("解锁密钥保险库", "Unlock the secrets vault")),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .whitespace_normal()
+                                        .text_color(rgb(TEXT_SECONDARY))
+                                        .child(language.choose(
+                                            "保险库以你设置的安全密码加密保存各 Provider/MCP 的 API Key；解锁后密钥作为环境变量注入运行时与 MCP 进程，不会写入配置文件或命令行参数。",
+                                            "The vault stores Provider/MCP API keys encrypted with your passphrase; once unlocked, keys are injected into runtime and MCP processes as environment variables — never written to config files or command-line arguments.",
+                                        )),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .v_flex()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child(language.choose("保险库密码", "Vault password")),
+                                )
+                                .child(
+                                    div()
+                                        .h(px(36.))
+                                        .px_2()
+                                        .flex()
+                                        .items_center()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(rgb(BORDER))
+                                        .bg(rgb(CARD_BG))
+                                        .child(
+                                            InputBase::new("vault-prompt-password")
+                                                .flex_1()
+                                                .h_full()
+                                                .flex()
+                                                .items_center()
+                                                .child(self.vault_password.clone()),
+                                        ),
+                                ),
+                        )
+                        .when_some(message, |this, message| {
+                            this.child(
+                                div()
+                                    .text_xs()
+                                    .whitespace_normal()
+                                    .text_color(rgb(0x00dc_2626))
+                                    .child(message),
+                            )
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_end()
+                                .gap_2()
+                                .child(
+                                    Button::new("dismiss-vault-prompt")
+                                        .ghost()
+                                        .label(language.choose("暂不解锁", "Not now"))
+                                        .on_click(move |_, _, cx| {
+                                            entity
+                                                .update(cx, ControlPlaneView::dismiss_vault_prompt);
+                                        }),
+                                )
+                                .child(
+                                    Button::new("unlock-vault-prompt")
+                                        .primary()
+                                        .label(if busy {
+                                            language.choose("正在解锁…", "Unlocking…")
+                                        } else {
+                                            language.choose("解锁", "Unlock")
+                                        })
+                                        .disabled(busy)
+                                        .on_click(move |_, window, cx| {
+                                            dialog_entity.update(cx, |view, cx| {
+                                                view.unlock_vault(window, cx);
+                                            });
+                                        }),
+                                ),
+                        ),
+                )
+        }
+
         #[allow(clippy::too_many_lines)]
         fn render_command_palette(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
             let entity = cx.entity().clone();
@@ -5952,6 +7002,12 @@ fn main() {
             } else {
                 None
             };
+            let vault_prompt =
+                if self.vault_prompt_open && self.vault.is_none() && self.vault_file_exists {
+                    Some(self.render_vault_prompt(cx).into_any_element())
+                } else {
+                    None
+                };
             let entity = cx.entity().clone();
             let active_screen = self.screen;
             let language = self.language;
@@ -5963,6 +7019,7 @@ fn main() {
                 .unwrap_or_else(|| language.choose("未选择项目", "No project selected").to_owned());
             let mut navigation = div().v_flex().gap_0p5();
             let mut current_group = "";
+            let vault_unlocked = self.vault.is_some();
 
             for screen in ControlPlaneScreen::ALL {
                 if screen.group() != current_group {
@@ -6043,6 +7100,13 @@ fn main() {
                                     })
                                     .child("TODO"),
                             )
+                        })
+                        .when(screen == ControlPlaneScreen::SecretsVault, |this| {
+                            this.child(status_dot(if vault_unlocked {
+                                0x0022_c55e
+                            } else {
+                                0x0094_a3b8
+                            }))
                         }),
                 );
             }
@@ -6057,6 +7121,9 @@ fn main() {
                 }
                 ControlPlaneScreen::AgentsAndMcp => {
                     self.render_agents_page(window, cx).into_any_element()
+                }
+                ControlPlaneScreen::SecretsVault => {
+                    self.render_secrets_page(window, cx).into_any_element()
                 }
                 screen => Self::section_page(language, screen).into_any_element(),
             };
@@ -6302,7 +7369,8 @@ fn main() {
                                     ),
                                 ),
                         )
-                        .when_some(command_palette, ParentElement::child),
+                        .when_some(command_palette, ParentElement::child)
+                        .when_some(vault_prompt, ParentElement::child),
                 )
         }
     }

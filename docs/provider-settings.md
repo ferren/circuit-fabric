@@ -64,7 +64,15 @@ MCP currently supports local stdio servers. Configure an executable, a JSON arra
 }
 ```
 
-Never put credentials in command arguments or URLs. Configure the named variables in the desktop application's launch environment and restart it. Authorizing a local MCP executable permits it to run local code; model tool restrictions do not sandbox a malicious server.
+Never put credentials in command arguments or URLs. Supply the named variables either from the desktop application's launch environment, or from the built-in secrets vault (see below). Authorizing a local MCP executable permits it to run local code; model tool restrictions do not sandbox a malicious server.
+
+## Secrets vault
+
+The desktop app keeps every API key value in one encrypted store, `secrets.vault.json` next to `runtime.json`. The file holds only AES-256-GCM ciphertext under a key derived with PBKDF2-HMAC-SHA256 (600k iterations) from a vault password the user chooses at creation; a plaintext index of variable *names* (never values) lets the locked screen show what is stored. On startup the app prompts for the password when a vault exists; unlocking holds only the derived key in zeroized memory until relock or exit.
+
+At run time a whitelisted variable name resolves to the unlocked vault value first and to the process environment second. Task, MCP-test, supervised Codex and desktop-spawned bridge processes all receive values strictly through child-process environment injection; nothing is logged or passed on command lines. A missing value fails the task with a message naming both remedies. A manually started bridge never sees the vault: give it real environment variables, or start it from the desktop.
+
+Existing deployments that already export `JLCIRCUIT_LLM_API_KEY` etc. keep working unchanged — the vault is additive, and an OS-level variable only applies when the unlocked vault does not define the same name.
 
 ## Scope, persistence and cleanup
 

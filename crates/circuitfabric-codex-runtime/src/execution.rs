@@ -128,14 +128,44 @@ pub fn run_task_with_options(
     working_directory: Option<&std::path::Path>,
     cancel: &Cancellation,
 ) -> Result<String, RuntimeError> {
+    run_task_with_secrets(
+        settings,
+        kind,
+        grants,
+        prompt,
+        image,
+        working_directory,
+        None,
+        cancel,
+    )
+}
+
+/// Run one task with an explicit working directory plus the unlocked secrets
+/// vault as the fallback source for whitelisted variables whose values are not
+/// in this process's environment.
+/// # Errors
+/// Rejects invalid settings, a missing working directory, unavailable keys, runtime errors and
+/// cancelled tasks.
+#[allow(clippy::too_many_arguments)]
+pub fn run_task_with_secrets(
+    settings: &RuntimeSettings,
+    kind: AgentKind,
+    grants: &ToolAuthorizationSettings,
+    prompt: &str,
+    image: Option<&std::path::Path>,
+    working_directory: Option<&std::path::Path>,
+    secrets: Option<&crate::secrets::SecretValues>,
+    cancel: &Cancellation,
+) -> Result<String, RuntimeError> {
     if let Some(directory) = working_directory
         && !directory.is_dir()
     {
         return Err(invalid("工作目录不存在或不是文件夹"));
     }
-    run_task_in(settings, kind, grants, prompt, image, working_directory, cancel)
+    run_task_in(settings, kind, grants, prompt, image, working_directory, secrets, cancel)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_task_in(
     settings: &RuntimeSettings,
     kind: AgentKind,
@@ -143,6 +173,7 @@ fn run_task_in(
     prompt: &str,
     image: Option<&std::path::Path>,
     working_directory: Option<&std::path::Path>,
+    secrets: Option<&crate::secrets::SecretValues>,
     cancel: &Cancellation,
 ) -> Result<String, RuntimeError> {
     settings.validate()?;
@@ -167,11 +198,12 @@ fn run_task_in(
             .clone()
             .ok_or_else(|| invalid("缺少 Vision 环境变量名"))?;
     }
-    let key = env::var(&provider.api_key_environment_variable)
-        .map_err(|_| invalid(format!("缺少环境变量 {}", provider.api_key_environment_variable)))?;
-    if key.is_empty() {
-        return Err(invalid("API Key 环境变量为空"));
-    }
+    let key = crate::secrets::resolve(&provider.api_key_environment_variable, secrets)
+        .ok_or_else(|| {
+            invalid(crate::secrets::missing_variable_message(
+                &provider.api_key_environment_variable,
+            ))
+        })?;
     let instructions = settings.catalog.skill_instructions(grants)?;
     let servers = grants
         .authorized_mcp_server_ids
@@ -187,8 +219,8 @@ fn run_task_in(
         .collect::<Result<Vec<_>, _>>()?;
     for server in &servers {
         for name in &server.environment_variables {
-            if env::var_os(name).is_none() {
-                return Err(invalid(format!("缺少环境变量 {name}")));
+            if crate::secrets::resolve(name, secrets).is_none() {
+                return Err(invalid(crate::secrets::missing_variable_message(name)));
             }
         }
     }
@@ -199,17 +231,18 @@ fn run_task_in(
         if let Some(path) = image {
             inputs.push(serde_json::json!({"type":"localImage","path":fs::canonicalize(path)?}));
         }
-        return run_codex(settings, &provider, &servers, &environment, grants, &inputs, cancel)
-            .map(|output| redact(&output, &key, &servers));
+        return run_codex(settings, &provider, &servers, &environment, grants, &inputs, secrets, cancel)
+            .map(|output| redact(&output, &key, &servers, secrets));
     }
     let command = if kind == AgentKind::Claude {
-        claude_command(settings, &provider, &servers, &environment.home, &key)?
+        claude_command(settings, &provider, &servers, &environment.home, &key, secrets)?
     } else {
-        dsh_command(settings, &provider, &servers, &environment.home, &input)?
+        dsh_command(settings, &provider, &servers, &environment.home, &input, secrets)?
     };
-    execute_cli(command, &environment, input, kind, cancel, &key, &servers)
+    execute_cli(command, &environment, input, kind, cancel, &key, &servers, secrets)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_codex(
     settings: &RuntimeSettings,
     provider: &crate::LlmProviderSettings,
@@ -217,10 +250,11 @@ fn run_codex(
     environment: &RunEnvironment,
     grants: &ToolAuthorizationSettings,
     input: &[serde_json::Value],
+    secrets: Option<&crate::secrets::SecretValues>,
     cancel: &Cancellation,
 ) -> Result<String, RuntimeError> {
     let mut command = crate::app_server_command(&settings.codex, provider);
-    restrict_environment(&mut command, &provider.api_key_environment_variable, servers);
+    restrict_environment(&mut command, &provider.api_key_environment_variable, servers, secrets);
     command
         .current_dir(&environment.current)
         .env("CODEX_HOME", &environment.home)
@@ -244,7 +278,7 @@ fn run_codex(
             "approval_policy=\"never\"",
         ]);
     for server in servers {
-        let discovered = settings.catalog.list_tools(&server.id, grants)?;
+        let discovered = settings.catalog.list_tools_with_secrets(&server.id, grants, secrets)?;
         let names = discovered["tools"]
             .as_array()
             .ok_or_else(|| invalid("MCP 未返回工具清单"))?
@@ -286,9 +320,10 @@ fn claude_command(
     servers: &[&crate::tools::McpServerDefinition],
     home: &std::path::Path,
     key: &str,
+    secrets: Option<&crate::secrets::SecretValues>,
 ) -> Result<std::process::Command, RuntimeError> {
     let mut command = executable(&settings.adapters.claude_command);
-    restrict_environment(&mut command, &provider.api_key_environment_variable, servers);
+    restrict_environment(&mut command, &provider.api_key_environment_variable, servers, secrets);
     let mut mcp = serde_json::Map::new();
     for server in servers {
         // Claude expands ${NAME} in MCP env entries at runtime.
@@ -342,9 +377,10 @@ fn dsh_command(
     servers: &[&crate::tools::McpServerDefinition],
     home: &std::path::Path,
     input: &str,
+    secrets: Option<&crate::secrets::SecretValues>,
 ) -> Result<std::process::Command, RuntimeError> {
     let mut command = executable(&settings.adapters.dsh_command);
-    restrict_environment(&mut command, &provider.api_key_environment_variable, servers);
+    restrict_environment(&mut command, &provider.api_key_environment_variable, servers, secrets);
     let patch = home.join("runtime.patch.yml");
     let mut patches = vec![
         serde_json::json!({"id":"agent-default-model","config":{"provider":"deepseek-official","model":provider.model}}),
@@ -409,6 +445,7 @@ fn dsh_command(
     Ok(command)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_cli(
     mut command: std::process::Command,
     environment: &RunEnvironment,
@@ -417,6 +454,7 @@ fn execute_cli(
     cancel: &Cancellation,
     key: &str,
     servers: &[&crate::tools::McpServerDefinition],
+    secrets: Option<&crate::secrets::SecretValues>,
 ) -> Result<String, RuntimeError> {
     command
         .current_dir(&environment.current)
@@ -468,17 +506,17 @@ fn execute_cli(
         let mut detail = error_output.replace(key, "[REDACTED]");
         for server in servers {
             for name in &server.environment_variables {
-                if let Ok(value) = env::var(name)
+                if let Some(value) = crate::secrets::resolve(name, secrets)
                     && !value.is_empty()
                 {
-                    detail = detail.replace(&value, "[REDACTED]");
+                    detail = detail.replace(value.as_str(), "[REDACTED]");
                 }
             }
         }
         return Err(invalid(format!("{error}: {}", detail.chars().take(8000).collect::<String>())));
     }
     if kind == AgentKind::Dsh {
-        return Ok(redact(&output, key, servers));
+        return Ok(redact(&output, key, servers, secrets));
     }
     let response: serde_json::Value = serde_json::from_str(&output)?;
     if response["is_error"] == true {
@@ -488,6 +526,7 @@ fn execute_cli(
         response["result"].as_str().ok_or_else(|| invalid("Claude Code 未返回文本结果"))?,
         key,
         servers,
+        secrets,
     ))
 }
 
@@ -495,13 +534,14 @@ pub(crate) fn redact(
     text: &str,
     key: &str,
     servers: &[&crate::tools::McpServerDefinition],
+    secrets: Option<&crate::secrets::SecretValues>,
 ) -> String {
     let mut output = if key.is_empty() { text.to_owned() } else { text.replace(key, "[REDACTED]") };
     for name in servers.iter().flat_map(|s| &s.environment_variables) {
-        if let Ok(value) = env::var(name)
+        if let Some(value) = crate::secrets::resolve(name, secrets)
             && !value.is_empty()
         {
-            output = output.replace(&value, "[REDACTED]");
+            output = output.replace(value.as_str(), "[REDACTED]");
         }
     }
     output
@@ -511,6 +551,7 @@ fn restrict_environment(
     command: &mut std::process::Command,
     key: &str,
     servers: &[&crate::tools::McpServerDefinition],
+    secrets: Option<&crate::secrets::SecretValues>,
 ) {
     command.env_clear();
     for name in [
@@ -530,8 +571,8 @@ fn restrict_environment(
     .into_iter()
     .chain(servers.iter().flat_map(|s| s.environment_variables.iter().map(String::as_str)))
     {
-        if let Some(value) = env::var_os(name) {
-            command.env(name, value);
+        if let Some(value) = crate::secrets::resolve(name, secrets) {
+            command.env(name, value.as_str());
         }
     }
 }

@@ -61,7 +61,28 @@ impl BridgeProcessHandle {
     ///
     /// Returns an error when the binary cannot be resolved or spawned.
     pub fn launch(config_path: &Path) -> Result<Self, String> {
-        Self::launch_binary(&resolve_bridge_binary()?, config_path)
+        Self::launch_with_vault(config_path, None)
+    }
+
+    /// Starts the bridge with the unlocked secrets vault overlaid onto the
+    /// child environment: the bridge resolves key values from its own process
+    /// environment, so a desktop-started bridge receives the managed values
+    /// without the vault file or password ever being shared with it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the binary cannot be resolved or spawned.
+    pub fn launch_with_vault(
+        config_path: &Path,
+        vault: Option<&circuitfabric_codex_runtime::secrets::SecretValues>,
+    ) -> Result<Self, String> {
+        let binary = resolve_bridge_binary()?;
+        let mut command = Command::new(binary);
+        command.arg(config_path);
+        if let Some(values) = vault {
+            values.overlay_on(&mut command);
+        }
+        Self::spawn(command)
     }
 
     /// Starts the bridge from an explicit executable path (used by tests and
@@ -71,13 +92,19 @@ impl BridgeProcessHandle {
     ///
     /// Returns an error when the process cannot be spawned or supervised.
     pub fn launch_binary(binary: &Path, config_path: &Path) -> Result<Self, String> {
-        let mut child = Command::new(binary)
-            .arg(config_path)
+        let mut command = Command::new(binary);
+        command.arg(config_path);
+        Self::spawn(command)
+    }
+
+    fn spawn(mut command: Command) -> Result<Self, String> {
+        let program = command.get_program().to_owned();
+        let mut child = command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|error| format!("启动 bridge 失败（{}）：{error}", binary.display()))?;
+            .map_err(|error| format!("启动 bridge 失败（{}）：{error}", Path::new(&program).display()))?;
         let ownership = ProcessOwnership::attach(&mut child)
             .map_err(|error| format!("无法监管 bridge 进程：{error}"))?;
         Ok(Self { child, ownership: Some(ownership) })

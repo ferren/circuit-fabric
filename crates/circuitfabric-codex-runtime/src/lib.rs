@@ -1,8 +1,10 @@
 //! Local `Codex App Server` configuration and its JSON-RPC stdio client.
 //!
 //! The persisted configuration deliberately contains an environment-variable
-//! *name*, never an API key value. `codex app-server` inherits that variable
-//! from the desktop or bridge process.
+//! *name*, never an API key value. Values are supplied by the user's process
+//! environment, or by the encrypted [`secrets`] vault once the user unlocks it
+//! with their vault password; either way they reach child processes strictly
+//! through environment injection.
 
 use std::{
     collections::VecDeque,
@@ -24,6 +26,7 @@ pub const DEFAULT_API_KEY_ENV: &str = "OPENAI_API_KEY";
 pub const DEFAULT_PROVIDER_ID: &str = "zai";
 
 pub mod execution;
+pub mod secrets;
 pub mod tools;
 
 /// An OpenAI-compatible model provider configured by the desktop control plane.
@@ -191,6 +194,8 @@ impl Default for RuntimeSettings {
 pub enum RuntimeError {
     #[error("invalid CircuitFabric runtime settings: {0}")]
     InvalidSettings(String),
+    #[error("secrets vault: {0}")]
+    Vault(String),
     #[error("failed to read runtime settings at {path}: {source}")]
     ReadSettings { path: PathBuf, source: std::io::Error },
     #[error("failed to parse runtime settings at {path}: {source}")]
@@ -761,7 +766,30 @@ impl CodexAppServerHandle {
         settings: &CodexAppServerSettings,
         provider: &LlmProviderSettings,
     ) -> Result<Self, RuntimeError> {
-        let mut client = CodexAppServerClient::launch(settings, provider)?;
+        Self::launch_with_secrets(settings, provider, None)
+    }
+
+    /// Starts the supervised App Server with the unlocked secrets vault
+    /// overlaid onto the child environment, so the provider's referenced
+    /// variable resolves even when this process does not export it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the process cannot be spawned.
+    pub fn launch_with_secrets(
+        settings: &CodexAppServerSettings,
+        provider: &LlmProviderSettings,
+        secrets: Option<&secrets::SecretValues>,
+    ) -> Result<Self, RuntimeError> {
+        let mut command = app_server_command(settings, provider);
+        if let Some(values) = secrets {
+            values.overlay_on(&mut command);
+        }
+        let mut client = CodexAppServerClient::launch_command(
+            command,
+            &settings.command,
+            execution::Cancellation::default(),
+        )?;
         client.initialize()?;
         Ok(Self { client })
     }

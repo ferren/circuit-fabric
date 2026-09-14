@@ -12,7 +12,7 @@ Principles (applied across the whole app):
 
 1. **Categorize by workflow, not by technical layer.** Users navigate "create project → authorize documents → connect EDA → configure agent → run session → review change → export", not "store/fusion/materialization" layers.
 2. **Observable state, never disguised.** Write success, readback success, and verification success are three independent states; `inconclusive` (readback failed) is always amber for "unknown", never green "success".
-3. **Safety first.** High-risk materialization requires explicit approval bound to a baseline snapshot + plan hash; API keys appear only as **environment-variable names** — no key value is ever stored or displayed.
+3. **Safety first.** High-risk materialization requires explicit approval bound to a baseline snapshot + plan hash; API keys appear only as **environment-variable names** — key values live in the encrypted secrets vault and are never stored in settings or displayed.
 4. **Modern and beautiful.** Light/dark/system themes, unified color/type/spacing tokens, rounded cards, restrained shadows and motion, consistent empty states.
 5. **Progressive delivery.** Unimplemented functions are shown with a `TODO` badge; entries are clickable into a "coming soon" placeholder that lists the target phase.
 
@@ -38,8 +38,9 @@ CircuitFabric
 │
 ├─ Plugins          manifest / version lock / signature / permissions / health
 ├─ Usage & Audit    token usage / audit log
+├─ Secrets vault    encrypted API-key store, unlocked by the user's vault password
 │
-└─ Settings         theme / language / data dir / secret store / about
+└─ Settings         theme / language / data dir / about
 ```
 
 Group semantics:
@@ -47,7 +48,7 @@ Group semantics:
 - **Design & Evidence** (Overview, Projects, Documents, Semantics): where a project's design facts come from and what they are now.
 - **Run & Tools** (EDA Services, Agents & Tools, Sessions): who changes things, through which tools, and session progress.
 - **Materialize & Deliver** (Changes, BOM & Export): how changes are reviewed, landed to EDA, and exported.
-- **Governance** (Plugins, Usage & Audit, Settings): are plugins trusted, how much was spent, global config.
+- **Governance** (Plugins, Usage & Audit, Secrets vault, Settings): are plugins trusted, how much was spent, where credentials live, global config.
 
 ### Mapping to existing code
 
@@ -204,10 +205,19 @@ Implemented today: the page is a two-pane **multi-EDA service registry** mirrori
 Two-pane layout mirroring Projects (grouped list on the left, detail on the right):
 
 - **Runtime endpoints**: Codex App Server command / working directory with a supervised start & stop lifecycle (status chip: starting / running · PID / stopped / failed, echoed in the sidebar); the JLC bridge listen address belongs to EDA Services (§5.5); Claude Code and DSH shown as "coming soon" stubs.
-- **LLM providers**: multi-provider card list (default marked ★), add/edit/remove, enable/disable, vision config; a prominent note that "API keys are environment-variable names only — no key value is saved here".
+- **LLM providers**: multi-provider card list (default marked ★), add/edit/remove, enable/disable, vision config; a prominent note that "API keys are environment-variable names only — no key value is saved here", plus a live source hint under each key field (✔ unlocked vault / ✔ process environment / ✘ not found).
 - **Skills & MCP**: authorized skills/MCP list with kind badges, revoke actions, and scope — global authorizations persist immediately to `runtime.json`, project authorizations to the project's own `project-config.json`.
 
 `[TODO]` skills/MCP authorization enforcement at runtime launch, Claude Code / DSH adapters.
+
+### 5.6a Secrets vault
+
+One governed store for every API key value, referenced elsewhere by variable name only:
+
+- **At rest**: `secrets.vault.json` next to `runtime.json`, holding only AEAD ciphertext (AES-256-GCM) under a key derived (PBKDF2-HMAC-SHA256, 600k iterations) from the user's own vault password. A plaintext index lists stored variable *names* so the locked screen can show what the vault holds; values never leave the ciphertext.
+- **Unlock flow**: when a vault file exists, app start shows a blocking unlock prompt (deferrable); unlocking holds the derived key — never the password — in zeroized memory and drops it on relock/exit. Wrong password and corruption fail with the same message.
+- **Management**: list/detail layout mirroring Projects — add/update (write-only, values never echo back), remove, relock, change password; every write re-encrypts atomically, and a failed write never desyncs memory from disk.
+- **Use**: unlocked values inject into spawned runtime/MCP child environments by variable name (vault wins over a stale OS-level variable; the process environment is the fallback). A desktop-started bridge/Codex supervisor process receives the same overlay. Nothing is written to settings, logs, or command lines.
 
 ### 5.7 Sessions
 
@@ -261,7 +271,7 @@ Plugin manifest: `id`, `kind` (`agent-runtime` / `eda-backend`), `apiVersion`, `
 
 ### 5.12 Settings
 
-Global preferences: theme (light/dark/system), language, data directory, secret-store provider, log level; about (version, branding).
+Global preferences: theme (light/dark/system), language, data directory, log level; about (version, branding). Credential storage is the secrets vault (§5.6a), a dedicated screen rather than a settings field.
 
 ## 6. Key interaction flows
 
