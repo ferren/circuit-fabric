@@ -668,6 +668,7 @@ fn main() {
         vault_file_exists: bool,
         vault_index: Vec<String>,
         vault_prompt_open: bool,
+        vault_quick_unlock_open: bool,
         vault_busy: bool,
         vault_message: Option<String>,
         vault_password: Entity<InputState>,
@@ -989,6 +990,7 @@ fn main() {
                 vault_file_exists,
                 vault_index,
                 vault_prompt_open: vault_file_exists,
+                vault_quick_unlock_open: false,
                 vault_busy: false,
                 vault_message: None,
                 vault_password,
@@ -3255,8 +3257,10 @@ fn main() {
 
         /// Reports which source currently supplies one variable name: the
         /// unlocked vault wins over the process environment. Rendered under
-        /// API-key fields so a mis-typed name is visible before a task fails.
-        fn secret_source_hint(&self, name: &str) -> Option<gpui::Div> {
+        /// API-key fields so a mis-typed name is visible before a task fails;
+        /// while a vault file exists but is locked, a 🔒 chip next to the
+        /// hint opens the quick-unlock dialog.
+        fn secret_source_hint(&self, name: &str, entity: &Entity<Self>) -> Option<gpui::Div> {
             let name = name.trim();
             if name.is_empty() {
                 return None;
@@ -3288,7 +3292,50 @@ fn main() {
                         ),
                     ),
                 };
-            Some(div().text_xs().whitespace_normal().text_color(rgb(color)).child(text))
+            let quick_unlock = if self.vault_file_exists && self.vault.is_none() {
+                let opener = entity.clone();
+                Some(
+                    div()
+                        .id(format!("quick-unlock-{name}"))
+                        .px_1p5()
+                        .py_0p5()
+                        .flex_none()
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(rgb(ACCENT))
+                        .text_xs()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(rgb(0x000e_7490))
+                        .cursor_pointer()
+                        .hover(|this| this.bg(rgb(0x00f0_f9ff)))
+                        .on_click(move |_, _, cx| {
+                            opener.update(cx, |view, cx| {
+                                view.vault_quick_unlock_open = true;
+                                view.vault_message = None;
+                                cx.notify();
+                            });
+                        })
+                        .child(language.choose("🔒 快速解锁", "🔒 Quick unlock")),
+                )
+            } else {
+                None
+            };
+            Some(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .whitespace_normal()
+                            .text_xs()
+                            .text_color(rgb(color))
+                            .child(text),
+                    )
+                    .when_some(quick_unlock, ParentElement::child),
+            )
         }
 
         /// Unlocks the vault with the typed password. Key derivation runs on a
@@ -3323,6 +3370,7 @@ fn main() {
                                 view.vault = Some(vault);
                                 view.vault_file_exists = true;
                                 view.vault_prompt_open = false;
+                                view.vault_quick_unlock_open = false;
                                 view.vault_message = None;
                                 view.vault_password.update(cx, |state, cx| {
                                     state.set_value("", window, cx);
@@ -3843,11 +3891,15 @@ fn main() {
             let set_default = entity.clone();
             let toggle_provider = entity.clone();
             let remove_provider = entity.clone();
-            let toggle_vision = entity;
-            let api_key_hint =
-                self.secret_source_hint(&provider.api_key_environment_variable.read(cx).value());
-            let vision_key_hint = self
-                .secret_source_hint(&provider.vision_api_key_environment_variable.read(cx).value());
+            let toggle_vision = entity.clone();
+            let api_key_hint = self.secret_source_hint(
+                &provider.api_key_environment_variable.read(cx).value(),
+                &entity,
+            );
+            let vision_key_hint = self.secret_source_hint(
+                &provider.vision_api_key_environment_variable.read(cx).value(),
+                &entity,
+            );
 
             let default_badge = selected_is_default.then(|| {
                 div()
@@ -4096,7 +4148,7 @@ fn main() {
             } else {
                 let mut list = div().v_flex().gap_1();
                 for name in &env_names {
-                    if let Some(hint) = self.secret_source_hint(name) {
+                    if let Some(hint) = self.secret_source_hint(name, &entity) {
                         list = list.child(hint);
                     }
                 }
@@ -6313,18 +6365,24 @@ fn main() {
                                     )),
                             ),
                     )
-                    .child(Self::labeled_field(
-                        language.choose("保险库密码", "Vault password"),
-                        "vault-create-password",
-                        None,
-                        &self.vault_password,
-                    ))
-                    .child(Self::labeled_field(
-                        language.choose("确认密码", "Confirm password"),
-                        "vault-create-confirm",
-                        None,
-                        &self.vault_password_confirm,
-                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap_3()
+                            .child(Self::labeled_field(
+                                language.choose("保险库密码", "Vault password"),
+                                "vault-create-password",
+                                None,
+                                &self.vault_password,
+                            ))
+                            .child(Self::labeled_field(
+                                language.choose("确认密码", "Confirm password"),
+                                "vault-create-confirm",
+                                None,
+                                &self.vault_password_confirm,
+                            )),
+                    )
                     .when_some(message, |this, message| {
                         this.child(
                             div()
@@ -6353,19 +6411,17 @@ fn main() {
                                             view.create_vault(window, cx);
                                         });
                                     }),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.))
-                                    .text_xs()
-                                    .whitespace_normal()
-                                    .text_color(rgb(TEXT_MUTED))
-                                    .child(language.choose(
-                                        "密码至少 8 个字符，请牢记：丢失后无法找回已存密钥。",
-                                        "At least 8 characters; memorize it — a lost password cannot recover stored keys.",
-                                    )),
                             ),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .whitespace_normal()
+                            .text_color(rgb(TEXT_MUTED))
+                            .child(language.choose(
+                                "密码至少 8 个字符，请牢记：丢失后无法找回已存密钥。",
+                                "At least 8 characters; memorize it — a lost password cannot recover stored keys.",
+                            )),
                     )
                     .into_any_element()
             } else if !unlocked {
@@ -6436,20 +6492,18 @@ fn main() {
                                             view.unlock_vault(window, cx);
                                         });
                                     }),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.))
-                                    .text_xs()
-                                    .whitespace_normal()
-                                    .text_color(rgb(TEXT_MUTED))
-                                    .child(format!(
-                                        "{} {}",
-                                        language.choose("保险库文件：", "Vault file:"),
-                                        self.vault_path.display()
-                                    )),
                             ),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .whitespace_normal()
+                            .text_color(rgb(TEXT_MUTED))
+                            .child(format!(
+                                "{} {}",
+                                language.choose("保险库文件：", "Vault file:"),
+                                self.vault_path.display()
+                            )),
                     )
                     .into_any_element()
             } else {
@@ -6866,6 +6920,146 @@ fn main() {
                 )
         }
 
+        /// Quick unlock dialog opened from the 🔒 chips next to secret-source
+        /// hints: same card structure as the startup prompt, with Cancel
+        /// instead of the deferred choice. The backdrop does not dismiss.
+        fn render_vault_quick_unlock(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+            let entity = cx.entity().clone();
+            let language = self.language;
+            let dialog_entity = entity.clone();
+            let busy = self.vault_busy;
+            let message = self.vault_message.clone();
+
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .p_6()
+                .child(
+                    div()
+                        .id("vault-quick-unlock-backdrop")
+                        .absolute()
+                        .inset_0()
+                        .bg(rgba(0x00_0f17_2ab3))
+                        .occlude(),
+                )
+                .child(
+                    div()
+                        .relative()
+                        .occlude()
+                        .w(px(480.))
+                        .v_flex()
+                        .gap_4()
+                        .p_5()
+                        .rounded_xl()
+                        .border_1()
+                        .border_color(rgb(ACCENT_SOFT))
+                        .bg(rgb(SURFACE_BG))
+                        .shadow_lg()
+                        .child(
+                            div()
+                                .v_flex()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_lg()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(TEXT_PRIMARY))
+                                        .child(language
+                                            .choose("快速解锁保险库", "Quick vault unlock")),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .whitespace_normal()
+                                        .text_color(rgb(TEXT_SECONDARY))
+                                        .child(language.choose(
+                                            "输入保险库密码即可解锁；解锁后密钥作为环境变量注入运行时与 MCP 进程，不会写入配置文件或命令行参数。",
+                                            "Enter the vault password to unlock; keys are then injected into runtime and MCP processes as environment variables — never written to config files or command-line arguments.",
+                                        )),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .v_flex()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child(language.choose("保险库密码", "Vault password")),
+                                )
+                                .child(
+                                    div()
+                                        .h(px(36.))
+                                        .px_2()
+                                        .flex()
+                                        .items_center()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(rgb(BORDER))
+                                        .bg(rgb(CARD_BG))
+                                        .child(
+                                            InputBase::new("vault-quick-unlock-password")
+                                                .flex_1()
+                                                .h_full()
+                                                .flex()
+                                                .items_center()
+                                                .child(self.vault_password.clone()),
+                                        ),
+                                ),
+                        )
+                        .when_some(message, |this, message| {
+                            this.child(
+                                div()
+                                    .text_xs()
+                                    .whitespace_normal()
+                                    .text_color(rgb(0x00dc_2626))
+                                    .child(message),
+                            )
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_end()
+                                .gap_2()
+                                .child(
+                                    Button::new("cancel-vault-quick-unlock")
+                                        .ghost()
+                                        .label(language.choose("取消", "Cancel"))
+                                        .on_click(move |_, window, cx| {
+                                            entity.update(cx, |view, cx| {
+                                                view.vault_quick_unlock_open = false;
+                                                view.vault_message = None;
+                                                view.vault_password.update(cx, |state, cx| {
+                                                    state.set_value("", window, cx);
+                                                });
+                                                cx.notify();
+                                            });
+                                        }),
+                                )
+                                .child(
+                                    Button::new("unlock-vault-quick")
+                                        .primary()
+                                        .label(if busy {
+                                            language.choose("正在解锁…", "Unlocking…")
+                                        } else {
+                                            language.choose("解锁", "Unlock")
+                                        })
+                                        .disabled(busy)
+                                        .on_click(move |_, window, cx| {
+                                            dialog_entity.update(cx, |view, cx| {
+                                                view.unlock_vault(window, cx);
+                                            });
+                                        }),
+                                ),
+                        ),
+                )
+        }
+
         #[allow(clippy::too_many_lines)]
         fn render_command_palette(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
             let entity = cx.entity().clone();
@@ -7005,6 +7199,12 @@ fn main() {
             let vault_prompt =
                 if self.vault_prompt_open && self.vault.is_none() && self.vault_file_exists {
                     Some(self.render_vault_prompt(cx).into_any_element())
+                } else {
+                    None
+                };
+            let vault_quick_unlock =
+                if self.vault_quick_unlock_open && self.vault.is_none() && self.vault_file_exists {
+                    Some(self.render_vault_quick_unlock(cx).into_any_element())
                 } else {
                     None
                 };
@@ -7370,7 +7570,8 @@ fn main() {
                                 ),
                         )
                         .when_some(command_palette, ParentElement::child)
-                        .when_some(vault_prompt, ParentElement::child),
+                        .when_some(vault_prompt, ParentElement::child)
+                        .when_some(vault_quick_unlock, ParentElement::child),
                 )
         }
     }
