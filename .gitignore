@@ -16,3 +16,9 @@ target/
 Thumbs.db
 .idea/
 .vscode/
+
+# Local agent tooling state (indexes, runtime context, review scratch)
+.claude/
+.codegraph/
+.multica/
+.review/
