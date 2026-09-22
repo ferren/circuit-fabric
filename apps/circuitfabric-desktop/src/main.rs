@@ -8,6 +8,12 @@
 
 use circuitfabric_contracts::ProjectId;
 
+#[cfg_attr(not(feature = "native-ui"), allow(dead_code))]
+mod usage_audit;
+
+#[cfg_attr(not(feature = "native-ui"), allow(dead_code))]
+mod plugin_governance;
+
 #[cfg(all(feature = "native-ui", windows))]
 #[allow(unsafe_code)]
 mod windows_icon;
@@ -84,9 +90,23 @@ impl ControlPlaneScreen {
             self,
             Self::Overview
                 | Self::Projects
+                | Self::Semantics
                 | Self::EdaServices
                 | Self::AgentsAndMcp
+                | Self::Plugins
                 | Self::SecretsVault
+        )
+    }
+
+    /// Screens whose page is scoped to one open project: they render a
+    /// "select a project first" empty state until one is chosen, so their
+    /// navigation entries stay disabled until a project is selected.
+    #[cfg_attr(not(feature = "native-ui"), allow(dead_code))]
+    #[must_use]
+    pub const fn requires_project(self) -> bool {
+        matches!(
+            self,
+            Self::Semantics | Self::ChangesAndApprovals | Self::BomAndExport
         )
     }
 }
@@ -100,6 +120,24 @@ enum UiLanguage {
 
 #[cfg(feature = "native-ui")]
 impl UiLanguage {
+    const fn from_preference(language: circuitfabric_codex_runtime::GlobalLanguage) -> Self {
+        match language {
+            circuitfabric_codex_runtime::GlobalLanguage::SimplifiedChinese => {
+                Self::SimplifiedChinese
+            }
+            circuitfabric_codex_runtime::GlobalLanguage::English => Self::English,
+        }
+    }
+
+    const fn preference(self) -> circuitfabric_codex_runtime::GlobalLanguage {
+        match self {
+            Self::SimplifiedChinese => {
+                circuitfabric_codex_runtime::GlobalLanguage::SimplifiedChinese
+            }
+            Self::English => circuitfabric_codex_runtime::GlobalLanguage::English,
+        }
+    }
+
     const fn toggled(self) -> Self {
         match self {
             Self::SimplifiedChinese => Self::English,
@@ -294,6 +332,17 @@ impl DesktopShell {
     }
 }
 
+/// Native window caption: the app name alone until a project is opened,
+/// then the app name plus the selected project's name.
+#[cfg_attr(not(feature = "native-ui"), allow(dead_code))]
+#[must_use]
+pub fn app_window_title(selected_project_name: Option<&str>) -> String {
+    match selected_project_name {
+        Some(name) => format!("CircuitFabric — {name}"),
+        None => "CircuitFabric".to_owned(),
+    }
+}
+
 #[cfg(not(feature = "native-ui"))]
 fn main() {
     println!("CircuitFabric desktop scaffold. Rebuild with --features native-ui to start GPUI.");
@@ -305,25 +354,33 @@ fn main() {
     use std::{
         collections::BTreeMap,
         path::{Path, PathBuf},
-        sync::Arc,
-        time::{Duration, Instant},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
+    use crate::plugin_governance::PluginGovernanceStore;
+    use crate::usage_audit::{
+        AuditKindFilter, AuditRecord, UsageAuditModel, UsagePeriod, UsageRecord,
+    };
     use circuitfabric_codex_runtime::secrets::{SecretSource, UnlockedVault, secret_source};
     use circuitfabric_codex_runtime::{
-        CodexAppServerHandle, LlmProviderSettings, RuntimeSettings, ToolAuthorizationKind,
-        ToolAuthorizationSettings,
+        CodexAppServerHandle, GlobalPreferences, GlobalTheme, LlmProviderSettings, LogLevel,
+        RuntimeSettings, SecretStorageProvider, ToolAuthorizationKind, ToolAuthorizationSettings,
     };
-    use circuitfabric_contracts::Project;
+    use circuitfabric_contracts::{FactStatus, LogicalCircuitSnapshot, Project, SnapshotAuthority};
     use circuitfabric_project::{
-        DocumentCategory, ProjectDocument, ProjectRegistry, ProjectStorage, ProjectWorkspace,
-        SessionActor, SessionEvent, SessionEventKind, SessionListing, SessionReplay, SessionSeed,
-        SessionStatus, SessionUsage, is_text_extractable, rfc3339,
+        ChangeSetAuditEntry, ChangeSetStageStatus, DocumentCategory, ProjectDocument,
+        ProjectRegistry, ProjectStorage, ProjectWorkspace, SessionActor, SessionEvent,
+        SessionEventKind, SessionListing, SessionReplay, SessionSeed, SessionStatus, SessionUsage,
+        StoredChangeSet, is_text_extractable, rfc3339,
     };
     use gpui::{
         AppContext, Context, Entity, FontWeight, Image, ImageFormat, InteractiveElement,
         IntoElement, KeystrokeEvent, ParentElement, Render, StatefulInteractiveElement, Styled,
-        Window, WindowOptions, div, img, prelude::FluentBuilder as _, px, rgb, rgba,
+        Window, WindowOptions, div, img, prelude::FluentBuilder as _, px, rgb as gpui_rgb, rgba,
     };
     use gpui_base::{InputBase, input::InputEditorStyle};
     use gpui_component::{
@@ -340,11 +397,11 @@ fn main() {
         include_bytes!("../../../assets/branding/circuitfabric-sidebar-mark.png");
 
     // Design tokens: a dark-navy sidebar, a light content surface, and a cyan accent.
-    const SIDEBAR_BG: u32 = 0x000f_172a;
+    const SIDEBAR_BG: u32 = 0x000f_172b;
     const SIDEBAR_DIVIDER: u32 = 0x001e_293b;
     const SIDEBAR_GROUP: u32 = 0x005f_7085;
     const SIDEBAR_TEXT: u32 = 0x009c_a7b8;
-    const SIDEBAR_TEXT_ACTIVE: u32 = 0x00f1_f5f9;
+    const SIDEBAR_TEXT_ACTIVE: u32 = 0x00f1_f5fa;
     const SIDEBAR_ITEM_HOVER: u32 = 0x001a_2637;
     const SIDEBAR_ITEM_ACTIVE: u32 = 0x001e_2d46;
     const SIDEBAR_ITEM_PRESSED: u32 = 0x0026_3756;
@@ -357,6 +414,40 @@ fn main() {
     const TEXT_PRIMARY: u32 = 0x000f_172a;
     const TEXT_SECONDARY: u32 = 0x0047_5563;
     const TEXT_MUTED: u32 = 0x006b_7280;
+
+    // All existing UI colour calls pass through this small semantic-token resolver.
+    // It lets the complete shell (including pages implemented before preferences
+    // existed) react immediately to a theme change rather than only repainting
+    // the Settings page.
+    static DARK_MODE: AtomicBool = AtomicBool::new(false);
+
+    fn rgb(light_color: u32) -> gpui::Rgba {
+        let color = if DARK_MODE.load(Ordering::Relaxed) {
+            match light_color {
+                SURFACE_BG => 0x000f_172a,
+                CARD_BG => 0x0011_1827,
+                BORDER => 0x0033_4155,
+                TEXT_PRIMARY => 0x00f8_fafc,
+                TEXT_SECONDARY => 0x00cbd5e1,
+                TEXT_MUTED => 0x0094_a3b8,
+                SIDEBAR_BG => 0x0002_0612,
+                SIDEBAR_DIVIDER => 0x0033_4155,
+                SIDEBAR_GROUP => 0x0094_a3b8,
+                SIDEBAR_TEXT => 0x00cbd5e1,
+                SIDEBAR_TEXT_ACTIVE => 0x00f8_fafc,
+                SIDEBAR_ITEM_HOVER => 0x001e_293b,
+                SIDEBAR_ITEM_ACTIVE => 0x001e_293b,
+                SIDEBAR_ITEM_PRESSED => 0x0033_4155,
+                // The pale informational chips need a dark surface as well.
+                0x00e0_f2fe => 0x0016_344a,
+                0x000e_7490 => 0x007dd3fc,
+                other => other,
+            }
+        } else {
+            light_color
+        };
+        gpui_rgb(color)
+    }
 
     fn status_dot(color: u32) -> impl IntoElement {
         div().size(px(8.)).rounded_full().bg(rgb(color)).flex_none()
@@ -468,7 +559,7 @@ fn main() {
             }
         }
 
-        fn label(self, language: UiLanguage) -> String {
+        fn label(&self, language: UiLanguage) -> String {
             match self {
                 Self::Starting => language.choose("正在启动…", "Starting…").to_owned(),
                 Self::Running { pid } => {
@@ -585,11 +676,75 @@ fn main() {
         NeedsConfiguration,
     }
 
+    /// The semantic browser deliberately asks for a typed subject before applying free-text
+    /// matching. It avoids a single ambiguous "search everything" result being interpreted as
+    /// an engineering fact.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum SemanticQueryScope {
+        Components,
+        Pins,
+        Nets,
+        Constraints,
+        Evidence,
+    }
+
+    impl SemanticQueryScope {
+        const ALL: [Self; 5] =
+            [Self::Components, Self::Pins, Self::Nets, Self::Constraints, Self::Evidence];
+
+        const fn label(self, language: UiLanguage) -> &'static str {
+            match (self, language) {
+                (Self::Components, UiLanguage::SimplifiedChinese) => "元件",
+                (Self::Pins, UiLanguage::SimplifiedChinese) => "引脚",
+                (Self::Nets, UiLanguage::SimplifiedChinese) => "网络",
+                (Self::Constraints, UiLanguage::SimplifiedChinese) => "约束 / 验证",
+                (Self::Evidence, UiLanguage::SimplifiedChinese) => "证据",
+                (Self::Components, UiLanguage::English) => "Components",
+                (Self::Pins, UiLanguage::English) => "Pins",
+                (Self::Nets, UiLanguage::English) => "Nets",
+                (Self::Constraints, UiLanguage::English) => "Constraints / verification",
+                (Self::Evidence, UiLanguage::English) => "Evidence",
+            }
+        }
+    }
+
+    /// A format choice is part of the export intent, but it does not make an
+    /// export authoritative on its own. Every choice below remains bound to
+    /// the selected immutable semantic snapshot and its evidence references.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum BomExportFormat {
+        Csv,
+        Excel,
+        Json,
+    }
+
+    impl BomExportFormat {
+        const ALL: [Self; 3] = [Self::Csv, Self::Excel, Self::Json];
+
+        const fn label(self) -> &'static str {
+            match self {
+                Self::Csv => "CSV",
+                Self::Excel => "Excel (.xlsx)",
+                Self::Json => "JSON",
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct SemanticQueryHit {
+        kind: &'static str,
+        subject: String,
+        detail: String,
+        evidence: String,
+    }
+
     /// One project's cached view of its persisted workspace state.
-    #[derive(Default)]
+    #[derive(Clone, Default)]
     struct ProjectWorkspaceData {
         documents: Vec<ProjectDocument>,
         session_listing: SessionListing,
+        semantic_snapshots: Vec<LogicalCircuitSnapshot>,
+        change_sets: Vec<StoredChangeSet>,
     }
 
     /// The read-only replay currently displayed in the Sessions tab.
@@ -611,6 +766,10 @@ fn main() {
         selected_provider: usize,
         screen: ControlPlaneScreen,
         language: UiLanguage,
+        global_theme: GlobalTheme,
+        data_directory: Entity<InputState>,
+        secret_storage_provider: SecretStorageProvider,
+        log_level: LogLevel,
         settings_path: std::path::PathBuf,
         status: String,
         command_palette_open: bool,
@@ -622,8 +781,20 @@ fn main() {
         project_storages: BTreeMap<ProjectId, ProjectStorage>,
         project_data: BTreeMap<ProjectId, ProjectWorkspaceData>,
         session_replay: Option<SessionReplaySelection>,
+        usage_period: UsagePeriod,
+        usage_filter: Entity<InputState>,
+        audit_kind_filter: AuditKindFilter,
+        audit_filter: Entity<InputState>,
         evidence_query: Entity<InputState>,
+        semantic_query: Entity<InputState>,
+        semantic_query_scope: SemanticQueryScope,
+        selected_semantic_snapshot: Option<(ProjectId, String)>,
+        selected_change_set: Option<(ProjectId, String)>,
+        approval_drawer_open: bool,
+        approval_note: Entity<InputState>,
+        bom_export_format: BomExportFormat,
         selected_project: Option<ProjectId>,
+        window_title: String,
         project_search: Entity<InputState>,
         project_filter: ProjectFilter,
         project_tab: ProjectDetailTab,
@@ -660,6 +831,9 @@ fn main() {
         task_result: String,
         task_cancel: Option<circuitfabric_codex_runtime::execution::Cancellation>,
         project_agent_adapter: RuntimeAdapter,
+        plugin_directory: Entity<InputState>,
+        plugin_governance_path: PathBuf,
+        plugin_governance: PluginGovernanceStore,
         // Secrets vault: the encrypted API-key store. `vault` holds decrypted
         // key material only while unlocked; `vault_index` is the plaintext
         // variable-name index, readable even while locked.
@@ -715,7 +889,19 @@ fn main() {
                 storage.list_documents().map_err(|error| format!("文档索引未读取：{error}"))?;
             let session_listing =
                 storage.list_sessions().map_err(|error| format!("会话记录未读取：{error}"))?;
-            data.insert(project_id.clone(), ProjectWorkspaceData { documents, session_listing });
+            let semantic_snapshots = storage
+                .list_logical_snapshots()
+                .map_err(|error| format!("语义快照未读取：{error}"))?;
+            let change_sets = storage.list_change_sets().map_err(|error| error.to_string())?;
+            data.insert(
+                project_id.clone(),
+                ProjectWorkspaceData {
+                    documents,
+                    session_listing,
+                    semantic_snapshots,
+                    change_sets,
+                },
+            );
             storages.insert(project_id, storage);
             Ok(())
         }
@@ -831,6 +1017,8 @@ fn main() {
             let loaded = RuntimeSettings::load_or_default(&settings_path);
             let load_error = loaded.as_ref().err().map(ToString::to_string);
             let settings = loaded.unwrap_or_default();
+            DARK_MODE
+                .store(Self::theme_is_dark(settings.global_preferences.theme), Ordering::Relaxed);
             let project_registry_path = Self::project_registry_path(&settings_path);
             let (
                 project_registry,
@@ -865,7 +1053,25 @@ fn main() {
             })
             .detach();
             let project_search = Self::input(window, String::new(), "Search projects", cx);
+            let data_directory = Self::input(
+                window,
+                settings.global_preferences.data_directory.display().to_string(),
+                "CircuitFabric data directory",
+                cx,
+            );
             let evidence_query = Self::input(window, String::new(), "capacitor", cx);
+            let semantic_query = Self::input(
+                window,
+                String::new(),
+                "reference, pin, net, constraint, document…",
+                cx,
+            );
+            let usage_filter =
+                Self::input(window, String::new(), "project, provider, or runtime", cx);
+            let audit_filter =
+                Self::input(window, String::new(), "project, runtime, session, or event", cx);
+            let approval_note =
+                Self::input(window, String::new(), "Approval or rejection reason", cx);
             let new_project_id = Self::input(window, String::new(), "power-supply", cx);
             let new_project_name = Self::input(window, String::new(), "Power supply", cx);
             let new_project_description =
@@ -885,6 +1091,12 @@ fn main() {
             let task_prompt = Self::input(window, String::new(), "输入任务以验证真实模型调用", cx);
             let task_image =
                 Self::input(window, String::new(), "可选图片路径；使用 Vision 服务", cx);
+            let plugin_directory = Self::input(
+                window,
+                PathBuf::from("plugins").display().to_string(),
+                "Plugin manifest directory",
+                cx,
+            );
             let vault_password = Self::masked_input(window, "保险库密码", cx);
             let vault_password_confirm = Self::masked_input(window, "再次输入密码", cx);
             let secret_name = Self::input(window, String::new(), "OPENAI_API_KEY", cx);
@@ -892,10 +1104,15 @@ fn main() {
             for input in [
                 &project_search,
                 &evidence_query,
+                &semantic_query,
+                &usage_filter,
+                &audit_filter,
+                &approval_note,
                 &new_project_id,
                 &new_project_root,
                 &new_tool_id,
                 &secret_name,
+                &plugin_directory,
             ] {
                 cx.subscribe(input, |_, _, event, cx| {
                     if let InputEvent::Change = event {
@@ -912,6 +1129,18 @@ fn main() {
                 format!("项目恢复提示：{}", project_restore_diagnostics.join("；"))
             };
             let vault_path = UnlockedVault::default_path();
+            let plugin_governance_path = settings_path.with_file_name("plugin-governance.json");
+            let plugin_governance =
+                match PluginGovernanceStore::load_or_default(&plugin_governance_path) {
+                    Ok(store) => store,
+                    Err(error) => {
+                        // Keep the existing store intact on disk and surface the problem in
+                        // the status bar; an empty in-memory inventory is safer than
+                        // overwriting an unreadable audit trail.
+                        eprintln!("Plugin governance store was not loaded: {error}");
+                        PluginGovernanceStore::default()
+                    }
+                };
             let vault_file_exists = UnlockedVault::exists(&vault_path);
             let vault_index = if vault_file_exists {
                 UnlockedVault::variable_names(&vault_path).unwrap_or_default()
@@ -937,7 +1166,11 @@ fn main() {
                 default_provider_id: settings.default_provider_id,
                 selected_provider: 0,
                 screen: ControlPlaneScreen::Overview,
-                language: UiLanguage::SimplifiedChinese,
+                language: UiLanguage::from_preference(settings.global_preferences.language),
+                global_theme: settings.global_preferences.theme,
+                data_directory,
+                secret_storage_provider: settings.global_preferences.secret_storage_provider,
+                log_level: settings.global_preferences.log_level,
                 settings_path,
                 status,
                 command_palette_open: false,
@@ -949,8 +1182,20 @@ fn main() {
                 project_storages,
                 project_data,
                 session_replay: None,
+                usage_period: UsagePeriod::All,
+                usage_filter,
+                audit_kind_filter: AuditKindFilter::All,
+                audit_filter,
                 evidence_query,
+                semantic_query,
+                semantic_query_scope: SemanticQueryScope::Components,
+                selected_semantic_snapshot: None,
+                selected_change_set: None,
+                approval_drawer_open: false,
+                approval_note,
+                bom_export_format: BomExportFormat::Csv,
                 selected_project: None,
+                window_title: String::new(),
                 project_search,
                 project_filter: ProjectFilter::All,
                 project_tab: ProjectDetailTab::Overview,
@@ -985,6 +1230,9 @@ fn main() {
                 task_result: String::new(),
                 task_cancel: None,
                 project_agent_adapter: RuntimeAdapter::CodexAppServer,
+                plugin_directory,
+                plugin_governance_path,
+                plugin_governance,
                 vault_path,
                 vault: None,
                 vault_file_exists,
@@ -1033,6 +1281,86 @@ fn main() {
 
         fn optional_value(value: String) -> Option<String> {
             (!value.trim().is_empty()).then_some(value)
+        }
+
+        fn system_is_dark() -> bool {
+            // `AppsUseLightTheme` is the Windows user preference.  On platforms
+            // without this registry value, a light fallback keeps the UI usable
+            // while retaining the user's explicit "follow system" choice.
+            #[cfg(windows)]
+            {
+                let output = std::process::Command::new("reg")
+                    .args([
+                        "query",
+                        r"HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+                        "/v",
+                        "AppsUseLightTheme",
+                    ])
+                    .output();
+                return output.ok().is_some_and(|result| {
+                    let text = String::from_utf8_lossy(&result.stdout);
+                    text.lines()
+                        .any(|line| line.contains("AppsUseLightTheme") && line.ends_with("0x0"))
+                });
+            }
+            #[cfg(not(windows))]
+            {
+                false
+            }
+        }
+
+        fn theme_is_dark(theme: GlobalTheme) -> bool {
+            match theme {
+                GlobalTheme::Light => false,
+                GlobalTheme::Dark => true,
+                GlobalTheme::System => Self::system_is_dark(),
+            }
+        }
+
+        fn global_preferences_from_form(&self, cx: &Context<Self>) -> GlobalPreferences {
+            GlobalPreferences {
+                theme: self.global_theme,
+                language: self.language.preference(),
+                data_directory: self.data_directory.read(cx).value().to_string().into(),
+                secret_storage_provider: self.secret_storage_provider,
+                log_level: self.log_level,
+            }
+        }
+
+        /// Persists only global preferences, preserving any unsaved runtime form
+        /// state.  No API-key values are read, displayed, or serialized here.
+        fn persist_global_preferences(&mut self, cx: &mut Context<Self>) {
+            let preferences = self.global_preferences_from_form(cx);
+            let result =
+                RuntimeSettings::load_or_default(&self.settings_path).and_then(|mut settings| {
+                    settings.global_preferences = preferences;
+                    settings.save(&self.settings_path)
+                });
+            self.status = match result {
+                Ok(()) => self
+                    .language
+                    .choose(
+                        "全局偏好已保存；不会保存 API Key 值。",
+                        "Global preferences saved; no API key values are stored.",
+                    )
+                    .to_owned(),
+                Err(error) => format!(
+                    "{}: {error}",
+                    self.language.choose("全局偏好未保存", "Global preferences were not saved")
+                ),
+            };
+            cx.notify();
+        }
+
+        fn set_global_theme(&mut self, theme: GlobalTheme, cx: &mut Context<Self>) {
+            self.global_theme = theme;
+            DARK_MODE.store(Self::theme_is_dark(theme), Ordering::Relaxed);
+            self.persist_global_preferences(cx);
+        }
+
+        fn toggle_global_language(&mut self, cx: &mut Context<Self>) {
+            self.language = self.language.toggled();
+            self.persist_global_preferences(cx);
         }
 
         fn add_provider(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1138,6 +1466,7 @@ fn main() {
             settings.tools = self.tool_authorizations.clone();
             settings.catalog = self.catalog.clone();
             settings.adapters = self.adapters.clone();
+            settings.global_preferences = self.global_preferences_from_form(cx);
             settings
         }
 
@@ -1190,7 +1519,9 @@ fn main() {
             self.default_provider_id.clone_from(&settings.default_provider_id);
             self.codex_status = RuntimeLifecycleStatus::Starting;
             self.status = format!("Codex App Server: {} / {}", provider.id, provider.model);
-            let secrets = self.vault.as_ref().map(|vault| vault.values().clone());
+            let secrets = (self.secret_storage_provider == SecretStorageProvider::EncryptedVault)
+                .then(|| self.vault.as_ref().map(|vault| vault.values().clone()))
+                .flatten();
             let launch = cx.background_spawn(async move {
                 CodexAppServerHandle::launch_with_secrets(
                     &settings.codex,
@@ -1300,7 +1631,9 @@ fn main() {
             self.bridge_health = BridgeHealth::Unknown;
             self.bridge_probed_at = None;
             self.status = format!("bridge 正在启动：ws://{address}/bridge");
-            let secrets = self.vault.as_ref().map(|vault| vault.values().clone());
+            let secrets = (self.secret_storage_provider == SecretStorageProvider::EncryptedVault)
+                .then(|| self.vault.as_ref().map(|vault| vault.values().clone()))
+                .flatten();
             let launch = cx.background_spawn(async move {
                 BridgeProcessHandle::launch_with_vault(&config_path, secrets.as_ref()).and_then(
                     |mut handle| {
@@ -1802,10 +2135,31 @@ fn main() {
             self.selected_project = Some(project_id);
             self.project_tab = ProjectDetailTab::Overview;
             self.session_replay = None;
+            self.selected_semantic_snapshot = None;
+            self.selected_change_set = None;
+            self.approval_drawer_open = false;
             cx.notify();
         }
 
-        /// Reloads one project's cached document/session listings from its root.
+        /// Mirrors the selected project into the native window caption, e.g.
+        /// "CircuitFabric — Signal-chain prototype". Runs every frame but only
+        /// reaches the platform when the desired title actually changed, so
+        /// every path that sets `selected_project` is covered without each
+        /// one needing window access.
+        fn sync_window_title(&mut self, window: &mut Window) {
+            let project_name = self
+                .selected_project
+                .as_deref()
+                .and_then(|id| self.workspace.project(id))
+                .map(|project| project.name.clone());
+            let desired = app_window_title(project_name.as_deref());
+            if desired != self.window_title {
+                window.set_window_title(desired.as_str());
+                self.window_title = desired;
+            }
+        }
+
+        /// Reloads one project's cached document, session, and semantic projections from its root.
         fn refresh_project_data(&mut self, project_id: &str) -> Result<(), String> {
             let storage = self
                 .project_storages
@@ -1815,10 +2169,71 @@ fn main() {
                 storage.list_documents().map_err(|error| format!("文档索引未读取：{error}"))?;
             let session_listing =
                 storage.list_sessions().map_err(|error| format!("会话记录未读取：{error}"))?;
+            let semantic_snapshots = storage
+                .list_logical_snapshots()
+                .map_err(|error| format!("语义快照未读取：{error}"))?;
             self.project_data.entry(project_id.to_owned()).or_default().documents = documents;
             self.project_data.entry(project_id.to_owned()).or_default().session_listing =
                 session_listing;
+            self.project_data.entry(project_id.to_owned()).or_default().semantic_snapshots =
+                semantic_snapshots;
+            self.project_data.entry(project_id.to_owned()).or_default().change_sets =
+                storage.list_change_sets().map_err(|error| error.to_string())?;
             Ok(())
+        }
+
+        /// Builds the two read-only dashboard projections from persisted session records.
+        /// Usage summaries and audit events intentionally do not share a mutable UI model.
+        fn usage_audit_model(&self) -> UsageAuditModel {
+            let mut model = UsageAuditModel::default();
+            for (project_id, data) in &self.project_data {
+                for summary in &data.session_listing.sessions {
+                    model.usage.push(UsageRecord::from(&summary.metadata));
+                    if let Some(storage) = self.project_storages.get(project_id)
+                        && let Ok(replay) = storage.load_session(&summary.metadata.session_id)
+                    {
+                        model.audit.extend(AuditRecord::from_session(&replay));
+                    }
+                }
+            }
+            model.audit.sort_by(|left, right| {
+                right.timestamp_unix_seconds.cmp(&left.timestamp_unix_seconds)
+            });
+            model
+        }
+
+        /// Exports exactly the currently filtered audit projection.  It never changes the source
+        /// session files, and every CSV row repeats its project/provider/runtime/session context.
+        fn export_filtered_audit(&mut self, window: &Window, cx: &mut Context<Self>) {
+            let model = self.usage_audit_model();
+            let now = UsageAuditModel::now_unix_seconds();
+            let query = self.audit_filter.read(cx).value().to_string();
+            let records =
+                model.filtered_audit(self.usage_period, self.audit_kind_filter, &query, now);
+            let csv = UsageAuditModel::audit_csv(&records);
+            let dialog = rfd::AsyncFileDialog::new()
+                .set_title("Export immutable CircuitFabric audit")
+                .set_file_name("circuitfabric-audit.csv")
+                .add_filter("CSV", &["csv"])
+                .set_parent(window);
+            cx.spawn_in(window, async move |view, cx| {
+                let Some(destination) = dialog.save_file().await else {
+                    return;
+                };
+                let result = std::fs::write(destination.path(), csv);
+                cx.update(|_, cx| {
+                    view.update(cx, |view, cx| {
+                        view.status = match result {
+                            Ok(()) => format!("审计导出已保存：{}", destination.path().display()),
+                            Err(error) => format!("审计导出失败：{error}"),
+                        };
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .ok();
+            })
+            .detach();
         }
 
         fn import_project_document(
@@ -2251,6 +2666,331 @@ fn main() {
                             });
                         }),
                 )
+        }
+
+        fn persist_plugin_governance(&mut self) -> Result<(), String> {
+            self.plugin_governance.save(&self.plugin_governance_path)
+        }
+
+        /// Discovery delegates only to the declarative manifest parser.  In
+        /// particular, it does not invoke a plugin's entrypoint or health
+        /// endpoint, so opening this page cannot start third-party code.
+        fn discover_plugin_manifests(&mut self, cx: &mut Context<Self>) {
+            let root = PathBuf::from(self.plugin_directory.read(cx).value().to_string());
+            match self.plugin_governance.discover(&root) {
+                Ok(count) => match self.persist_plugin_governance() {
+                    Ok(()) => {
+                        self.status = format!(
+                            "Validated {count} plugin manifest(s) in {} without executing plugin code.",
+                            root.display()
+                        )
+                    }
+                    Err(error) => {
+                        self.status = format!(
+                            "Manifest discovery completed but audit persistence failed: {error}"
+                        )
+                    }
+                },
+                Err(error) => self.status = format!("Plugin manifest discovery failed: {error}"),
+            }
+            cx.notify();
+        }
+
+        fn apply_plugin_operation(&mut self, id: &str, operation: &str, cx: &mut Context<Self>) {
+            let result = match operation {
+                "install" => self.plugin_governance.install(id),
+                "update" => self.plugin_governance.update(id),
+                "uninstall" => self.plugin_governance.uninstall(id),
+                "revoke" => self.plugin_governance.revoke_permissions(id),
+                _ => Err("Unknown plugin operation".to_owned()),
+            };
+            self.status = match result {
+                Ok(()) => match self.persist_plugin_governance() {
+                    Ok(()) => format!(
+                        "Plugin `{id}`: {operation} recorded in the audit trail. No plugin code was started."
+                    ),
+                    Err(error) => {
+                        format!("Plugin action completed but audit persistence failed: {error}")
+                    }
+                },
+                Err(error) => format!("Plugin action failed: {error}"),
+            };
+            cx.notify();
+        }
+
+        #[allow(clippy::too_many_lines)]
+        fn render_plugins_page(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+            let entity = cx.entity().clone();
+            let records = self.plugin_governance.records().to_vec();
+            let audit =
+                self.plugin_governance.audit().iter().rev().take(20).cloned().collect::<Vec<_>>();
+            let discoverer = entity.clone();
+
+            let manifest_source = div()
+                .w_full()
+                .v_flex()
+                .gap_3()
+                .p_4()
+                .rounded_xl()
+                .border_1()
+                .border_color(rgb(BORDER))
+                .bg(rgb(CARD_BG))
+                .child(div().text_base().font_weight(FontWeight::SEMIBOLD).child("Manifest discovery"))
+                .child(div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(
+                    "Discovery reads and schema-validates plugin-manifest.json only. It does not load libraries, run scripts, launch processes, or probe plugin endpoints.",
+                ))
+                .child(Self::labeled_field(
+                    "Manifest directory",
+                    "plugin-manifest-directory",
+                    Some("Discovery walks subdirectories and accepts only a bounded JSON manifest."),
+                    &self.plugin_directory,
+                ))
+                .child(
+                    Button::new("discover-plugin-manifests")
+                        .primary()
+                        .label("Discover & validate manifests")
+                        .on_click(move |_, _, cx| {
+                            discoverer.update(cx, |view, cx| view.discover_plugin_manifests(cx));
+                        }),
+                );
+
+            let mut inventory = div().v_flex().gap_3();
+            if records.is_empty() {
+                inventory = inventory.child(
+                    div()
+                        .p_4()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .bg(rgb(SURFACE_BG))
+                        .text_sm()
+                        .text_color(rgb(TEXT_MUTED))
+                        .child("No validated plugin manifests yet. Select a directory and run declarative discovery."),
+                );
+            }
+            for record in records {
+                let id = record.id.clone();
+                let installer = entity.clone();
+                let updater = entity.clone();
+                let uninstaller = entity.clone();
+                let revoker = entity.clone();
+                let install_id = id.clone();
+                let update_id = id.clone();
+                let uninstall_id = id.clone();
+                let revoke_id = id.clone();
+                let requested = if record.requested_permissions.is_empty() {
+                    "none".to_owned()
+                } else {
+                    record.requested_permissions.join(", ")
+                };
+                let granted = if record.granted_permissions.is_empty() {
+                    "none".to_owned()
+                } else {
+                    record.granted_permissions.join(", ")
+                };
+                let lock = record.version_lock.clone().unwrap_or_else(|| "not locked".to_owned());
+                let capabilities = if record.capabilities.is_empty() {
+                    "none declared".to_owned()
+                } else {
+                    record.capabilities.join(", ")
+                };
+                inventory = inventory.child(
+                    div()
+                        .id(format!("plugin-inventory-{}", id))
+                        .w_full()
+                        .v_flex()
+                        .gap_3()
+                        .p_4()
+                        .rounded_xl()
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .bg(rgb(CARD_BG))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .truncate()
+                                        .text_base()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(record.id.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .px_2()
+                                        .py_0p5()
+                                        .rounded_sm()
+                                        .text_xs()
+                                        .bg(rgb(0x00e0_f2fe))
+                                        .text_color(rgb(0x000e_7490))
+                                        .child(record.state.label()),
+                                )
+                                .child(
+                                    div()
+                                        .px_2()
+                                        .py_0p5()
+                                        .rounded_sm()
+                                        .text_xs()
+                                        .bg(rgb(SURFACE_BG))
+                                        .text_color(rgb(TEXT_SECONDARY))
+                                        .child(format!("v{}", record.version)),
+                                ),
+                        )
+                        .child(div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(format!(
+                            "{} | API {} | isolation: {} | health: {}",
+                            record.kind,
+                            record.api_version,
+                            record.isolation,
+                            record.health.label()
+                        )))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(TEXT_MUTED))
+                                .child(format!("Capabilities: {capabilities}")),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(TEXT_MUTED))
+                                .child(format!("Version lock: {lock}")),
+                        )
+                        .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(format!(
+                                "Signature: {}{}",
+                                record.signature.label(),
+                                record
+                                    .signer
+                                    .as_ref()
+                                    .map(|signer| format!(" ({signer})"))
+                                    .unwrap_or_default()
+                            )))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(TEXT_MUTED))
+                                .child(format!("Requested permissions: {requested}")),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(TEXT_MUTED))
+                                .child(format!("Granted permissions: {granted}")),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(TEXT_MUTED))
+                                .child(format!("Manifest: {}", record.manifest_path.display())),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .gap_2()
+                                .child(
+                                    Button::new(format!("plugin-install-{id}"))
+                                        .label("Install")
+                                        .on_click(move |_, _, cx| {
+                                            installer.update(cx, |view, cx| {
+                                                view.apply_plugin_operation(
+                                                    &install_id,
+                                                    "install",
+                                                    cx,
+                                                )
+                                            });
+                                        }),
+                                )
+                                .child(
+                                    Button::new(format!("plugin-update-{id}"))
+                                        .label("Update")
+                                        .on_click(move |_, _, cx| {
+                                            updater.update(cx, |view, cx| {
+                                                view.apply_plugin_operation(
+                                                    &update_id, "update", cx,
+                                                )
+                                            });
+                                        }),
+                                )
+                                .child(
+                                    Button::new(format!("plugin-uninstall-{id}"))
+                                        .label("Uninstall")
+                                        .on_click(move |_, _, cx| {
+                                            uninstaller.update(cx, |view, cx| {
+                                                view.apply_plugin_operation(
+                                                    &uninstall_id,
+                                                    "uninstall",
+                                                    cx,
+                                                )
+                                            });
+                                        }),
+                                )
+                                .child(
+                                    Button::new(format!("plugin-revoke-{id}"))
+                                        .ghost()
+                                        .label("Revoke authorization")
+                                        .on_click(move |_, _, cx| {
+                                            revoker.update(cx, |view, cx| {
+                                                view.apply_plugin_operation(
+                                                    &revoke_id, "revoke", cx,
+                                                )
+                                            });
+                                        }),
+                                ),
+                        ),
+                );
+            }
+
+            let mut audit_rows = div().v_flex().gap_2();
+            if audit.is_empty() {
+                audit_rows = audit_rows.child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(TEXT_MUTED))
+                        .child("No plugin governance events recorded."),
+                );
+            }
+            for event in audit {
+                audit_rows = audit_rows.child(
+                    div()
+                        .p_3()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .bg(rgb(SURFACE_BG))
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(format!("{}: {}", event.plugin_id, event.action)),
+                        )
+                        .child(div().text_xs().text_color(rgb(TEXT_SECONDARY)).child(event.detail))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(TEXT_MUTED))
+                                .child(rfc3339(event.occurred_at_unix_seconds)),
+                        ),
+                );
+            }
+
+            div()
+                .id("plugins-governance-page")
+                .size_full()
+                .overflow_y_scroll()
+                .v_flex()
+                .gap_4()
+                .p_6()
+                .child(div().text_xl().font_weight(FontWeight::SEMIBOLD).child("Plugin governance"))
+                .child(div().text_sm().text_color(rgb(TEXT_SECONDARY)).child("Manifest inventory, trust, permissions, health, isolation, lifecycle controls, and an append-only local audit view."))
+                .child(manifest_source)
+                .child(div().text_base().font_weight(FontWeight::SEMIBOLD).child("Validated manifest inventory"))
+                .child(inventory)
+                .child(div().text_base().font_weight(FontWeight::SEMIBOLD).child("Audit trail"))
+                .child(audit_rows)
         }
 
         #[allow(clippy::too_many_lines)]
@@ -2816,7 +3556,7 @@ fn main() {
                 )),
                 Some((_, Ok(_))) => Some((
                     language.choose(
-                        "连接成功，但尚无已注册项目：EDA 插件的连接会被拒绝——请先在「项目」页创建或打开项目。",
+                        "连接成功，但尚无已注册项目：EDA 插件可连接，发送请求前请先在「项目」页创建或打开项目，再刷新项目列表。",
                         "Connected, but no registered projects: the EDA extension's connection will be rejected — create or open a project on the Projects page first.",
                     )
                     .to_owned(),
@@ -5500,6 +6240,12 @@ fn main() {
                 .get(&project.id)
                 .map(|data| data.documents.clone())
                 .unwrap_or_default();
+            let evidence_ready = documents
+                .iter()
+                .filter(|document| {
+                    self.workspace.is_document_evidence_available(&project.id, &document.id)
+                })
+                .count();
 
             let header = div()
                 .flex()
@@ -5543,7 +6289,20 @@ fn main() {
                                         );
                                     });
                                 })
-                        }),
+                        })
+                        .child(
+                            div()
+                                .px_2()
+                                .py_1()
+                                .rounded_sm()
+                                .bg(rgb(0x00e0_f2fe))
+                                .text_xs()
+                                .text_color(rgb(0x000e_7490))
+                                .child(language.choose_owned(
+                                    format!("{evidence_ready}/{} 可作证据", documents.len()),
+                                    format!("{evidence_ready}/{} evidence-ready", documents.len()),
+                                )),
+                        ),
                 );
 
             if documents.is_empty() {
@@ -5565,8 +6324,13 @@ fn main() {
             }
 
             let mut list = div().v_flex().gap_2();
-            for document in documents {
-                let searchable = is_text_extractable(&document.document_kind);
+            for document in &documents {
+                let integrity_verified =
+                    self.project_storages.get(&project.id).is_some_and(|storage| {
+                        storage.read_verified_document_content(&document).is_ok()
+                    });
+                let evidence_available = integrity_verified
+                    && self.workspace.is_document_evidence_available(&project.id, &document.id);
                 let category_style = match document.category {
                     DocumentCategory::Datasheet => (0x00e0_f2fe, 0x000e_7490),
                     DocumentCategory::ReferenceDesign => (0x00f3_e8ff, 0x0076_2b_a3),
@@ -5610,16 +6374,53 @@ fn main() {
                                         .py_0p5()
                                         .rounded_sm()
                                         .text_xs()
-                                        .bg(rgb(if searchable { 0x00dc_fce7 } else { SURFACE_BG }))
-                                        .text_color(rgb(if searchable {
+                                        .bg(rgb(if integrity_verified {
+                                            0x00dc_fce7
+                                        } else {
+                                            0x00fe_f2f2
+                                        }))
+                                        .text_color(rgb(if integrity_verified {
                                             0x0016_a34a
+                                        } else {
+                                            0x00b9_1c1c
+                                        }))
+                                        .child(if integrity_verified {
+                                            language.choose("完整性已验证", "Integrity verified")
+                                        } else {
+                                            language.choose("完整性无效", "Integrity invalid")
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .px_1p5()
+                                        .py_0p5()
+                                        .rounded_sm()
+                                        .text_xs()
+                                        .bg(rgb(if evidence_available {
+                                            0x00e0_f2fe
+                                        } else {
+                                            SURFACE_BG
+                                        }))
+                                        .text_color(rgb(if evidence_available {
+                                            0x000e_7490
                                         } else {
                                             TEXT_MUTED
                                         }))
-                                        .child(if searchable {
-                                            language.choose("文本可检索", "Text searchable")
+                                        .child(if evidence_available {
+                                            language.choose(
+                                                "已索引，可作证据",
+                                                "Indexed — evidence ready",
+                                            )
+                                        } else if is_text_extractable(&document.document_kind) {
+                                            language.choose(
+                                                "待索引，不可作证据",
+                                                "Pending index — not evidence",
+                                            )
                                         } else {
-                                            language.choose("仅哈希存档", "Hash-only archive")
+                                            language.choose(
+                                                "等待提取器，不可作证据",
+                                                "Awaiting extractor — not evidence",
+                                            )
                                         }),
                                 )
                                 .child(
@@ -5645,7 +6446,27 @@ fn main() {
             let evidence = if query.is_empty() {
                 None
             } else {
-                self.workspace.retrieve_document_evidence(&project.id, &query).ok()
+                self.workspace.retrieve_document_evidence(&project.id, &query).ok().map(
+                    |mut package| {
+                        // The document service contains indexed text in memory.  Re-check the
+                        // managed copy before displaying it so a document subsequently found
+                        // invalid is never presented as usable evidence in this UI.
+                        package.fragments.retain(|fragment| {
+                            documents.iter().any(|document| {
+                                document.id == fragment.document_id
+                                    && self.project_storages.get(&project.id).is_some_and(
+                                        |storage| {
+                                            storage.read_verified_document_content(document).is_ok()
+                                        },
+                                    )
+                                    && self
+                                        .workspace
+                                        .is_document_evidence_available(&project.id, &document.id)
+                            })
+                        });
+                        package
+                    },
+                )
             };
             let mut search_panel = div()
                 .v_flex()
@@ -5682,8 +6503,12 @@ fn main() {
                                     div()
                                         .text_xs()
                                         .text_color(rgb(0x000e_7490))
-                                        .child(fragment.locator.clone()),
+                                        .child(format!("locator: {}", fragment.locator)),
                                 )
+                                .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(format!(
+                                    "document_id: {} · content_hash: {}",
+                                    fragment.document_id, fragment.content_hash
+                                )))
                                 .child(
                                     div()
                                         .text_sm()
@@ -5981,6 +6806,2061 @@ fn main() {
                 .child(div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(description))
         }
 
+        fn render_settings_page(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+            let language = self.language;
+            let entity = cx.entity().clone();
+            let theme = self.global_theme;
+            let use_vault = self.secret_storage_provider == SecretStorageProvider::EncryptedVault;
+            let log_label = match self.log_level {
+                LogLevel::Error => "ERROR",
+                LogLevel::Warn => "WARN",
+                LogLevel::Info => "INFO",
+                LogLevel::Debug => "DEBUG",
+                LogLevel::Trace => "TRACE",
+            };
+            let next_log_level = match self.log_level {
+                LogLevel::Error => LogLevel::Warn,
+                LogLevel::Warn => LogLevel::Info,
+                LogLevel::Info => LogLevel::Debug,
+                LogLevel::Debug => LogLevel::Trace,
+                LogLevel::Trace => LogLevel::Error,
+            };
+
+            let system = entity.clone();
+            let light = entity.clone();
+            let dark = entity.clone();
+            let change_language = entity.clone();
+            let vault = entity.clone();
+            let environment = entity.clone();
+            let change_log_level = entity.clone();
+            let save = entity;
+
+            let theme_buttons = div()
+                .flex()
+                .gap_2()
+                .child(
+                    Button::new("theme-system")
+                        .label(language.choose("跟随系统", "System"))
+                        .when(theme == GlobalTheme::System, |button| button.primary())
+                        .on_click(move |_, _, cx| {
+                            system.update(cx, |view, cx| {
+                                view.set_global_theme(GlobalTheme::System, cx)
+                            });
+                        }),
+                )
+                .child(
+                    Button::new("theme-light")
+                        .label(language.choose("浅色", "Light"))
+                        .when(theme == GlobalTheme::Light, |button| button.primary())
+                        .on_click(move |_, _, cx| {
+                            light.update(cx, |view, cx| {
+                                view.set_global_theme(GlobalTheme::Light, cx)
+                            });
+                        }),
+                )
+                .child(
+                    Button::new("theme-dark")
+                        .label(language.choose("深色", "Dark"))
+                        .when(theme == GlobalTheme::Dark, |button| button.primary())
+                        .on_click(move |_, _, cx| {
+                            dark.update(cx, |view, cx| {
+                                view.set_global_theme(GlobalTheme::Dark, cx)
+                            });
+                        }),
+                );
+            let appearance = div()
+                .w_full()
+                .v_flex()
+                .gap_3()
+                .p_5()
+                .bg(rgb(CARD_BG))
+                .rounded_xl()
+                .border_1()
+                .border_color(rgb(BORDER))
+                .child(
+                    div()
+                        .text_base()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(language.choose("外观与语言", "Appearance & language")),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(TEXT_SECONDARY))
+                        .child(language.choose("主题", "Theme")),
+                )
+                .child(theme_buttons)
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(language.choose("界面语言", "Display language")),
+                )
+                .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(language.choose(
+                    "切换后完整界面立即重新渲染。",
+                    "The entire interface rerenders immediately.",
+                )))
+                .child(
+                    Button::new("settings-toggle-language")
+                        .label(language.choose("切换为 English", "Switch to 中文"))
+                        .on_click(move |_, _, cx| {
+                            change_language.update(cx, |view, cx| view.toggle_global_language(cx));
+                        }),
+                );
+            let secret_buttons = div()
+                .flex()
+                .gap_2()
+                .child(
+                    Button::new("secret-provider-vault")
+                        .label(language.choose("加密保险库", "Encrypted vault"))
+                        .when(use_vault, |button| button.primary())
+                        .on_click(move |_, _, cx| {
+                            vault.update(cx, |view, cx| {
+                                view.secret_storage_provider =
+                                    SecretStorageProvider::EncryptedVault;
+                                view.persist_global_preferences(cx);
+                            });
+                        }),
+                )
+                .child(
+                    Button::new("secret-provider-environment")
+                        .label(language.choose("进程环境", "Environment"))
+                        .when(!use_vault, |button| button.primary())
+                        .on_click(move |_, _, cx| {
+                            environment.update(cx, |view, cx| {
+                                view.secret_storage_provider = SecretStorageProvider::Environment;
+                                view.persist_global_preferences(cx);
+                            });
+                        }),
+                );
+            let storage = div()
+                .w_full()
+                .v_flex()
+                .gap_3()
+                .p_5()
+                .bg(rgb(CARD_BG))
+                .rounded_xl()
+                .border_1()
+                .border_color(rgb(BORDER))
+                .child(
+                    div()
+                        .text_base()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(language.choose("存储与诊断", "Storage & diagnostics")),
+                )
+                .child(Self::labeled_field(
+                    language.choose("数据目录", "Data directory"),
+                    "global-data-directory",
+                    Some(language.choose(
+                        "用于 CircuitFabric 本地配置和数据。",
+                        "Used for CircuitFabric local configuration and data.",
+                    )),
+                    &self.data_directory,
+                ))
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(language.choose("密钥存储提供方", "Secret storage provider")),
+                )
+                .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(language.choose(
+                    "设置页从不读取、显示或写入 API Key 值。",
+                    "This page never reads, displays, or writes API key values.",
+                )))
+                .child(secret_buttons)
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(language.choose("日志级别", "Log level")),
+                )
+                .child(Button::new("cycle-log-level").label(log_label).on_click(move |_, _, cx| {
+                    change_log_level.update(cx, |view, cx| {
+                        view.log_level = next_log_level;
+                        view.persist_global_preferences(cx);
+                    });
+                }))
+                .child(
+                    Button::new("save-global-preferences")
+                        .primary()
+                        .label(language.choose("保存全局设置", "Save global settings"))
+                        .on_click(move |_, _, cx| {
+                            save.update(cx, |view, cx| view.persist_global_preferences(cx));
+                        }),
+                );
+            let about =
+                div()
+                    .w_full()
+                    .v_flex()
+                    .gap_2()
+                    .p_5()
+                    .bg(rgb(CARD_BG))
+                    .rounded_xl()
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .child(
+                        div()
+                            .text_base()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(language.choose("关于 CircuitFabric", "About CircuitFabric")),
+                    )
+                    .child(div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(language.choose(
+                        "CircuitFabric 桌面控制平面",
+                        "CircuitFabric desktop control plane",
+                    )))
+                    .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(format!(
+                        "v{} · {}",
+                        env!("CARGO_PKG_VERSION"),
+                        language.choose("本地优先、密钥隔离", "local-first, secret-isolated")
+                    )));
+            div()
+                .size_full()
+                .p_6()
+                .v_flex()
+                .gap_4()
+                .child(
+                    div()
+                        .text_xl()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(language.choose("全局设置", "Global settings")),
+                )
+                .child(div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(language.choose(
+                    "这些偏好会立即应用，并在下次启动时恢复。",
+                    "These preferences apply immediately and are restored on the next launch.",
+                )))
+                .child(appearance)
+                .child(storage)
+                .child(about)
+        }
+
+        #[allow(clippy::too_many_lines)]
+        fn render_usage_audit_page(
+            &mut self,
+            _window: &Window,
+            cx: &mut Context<Self>,
+        ) -> impl IntoElement {
+            let entity = cx.entity().clone();
+            let language = self.language;
+            let model = self.usage_audit_model();
+            let now = UsageAuditModel::now_unix_seconds();
+            let usage_query = self.usage_filter.read(cx).value().to_string();
+            let audit_query = self.audit_filter.read(cx).value().to_string();
+            let period = self.usage_period;
+            let audit_kind = self.audit_kind_filter;
+            let usage = model.filtered_usage(period, &usage_query, now);
+            let audit = model.filtered_audit(period, audit_kind, &audit_query, now);
+            let grouped = UsageAuditModel::aggregate_usage(&usage);
+            let daily = UsageAuditModel::daily_totals(&usage);
+            let input_tokens = usage.iter().map(|record| record.input_tokens).sum::<u64>();
+            let output_tokens = usage.iter().map(|record| record.output_tokens).sum::<u64>();
+            let total_tokens = input_tokens + output_tokens;
+            let chart_max = UsageAuditModel::chart_scale(&daily);
+
+            let metric = |value: u64, label: &'static str| {
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .v_flex()
+                    .gap_1()
+                    .p_3()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .bg(rgb(CARD_BG))
+                    .child(
+                        div().text_lg().font_weight(FontWeight::SEMIBOLD).child(value.to_string()),
+                    )
+                    .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(label))
+            };
+
+            let period_button = entity.clone();
+            let kind_button = entity.clone();
+            let export_button = entity.clone();
+            let mut usage_rows = div().v_flex().gap_1();
+            if grouped.is_empty() {
+                usage_rows = usage_rows.child(
+                    div().text_sm().text_color(rgb(TEXT_MUTED)).child(language.choose(
+                        "当前筛选没有 Token 用量。",
+                        "No token usage matches this filter.",
+                    )),
+                );
+            }
+            for ((project, provider, runtime), (input, output, total)) in &grouped {
+                usage_rows =
+                    usage_rows.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .p_2()
+                            .rounded_md()
+                            .bg(rgb(SURFACE_BG))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .v_flex()
+                                    .gap_0p5()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .child(project.clone()),
+                                    )
+                                    .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(
+                                        format!("Provider: {provider} · Runtime: {runtime}"),
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_SECONDARY))
+                                    .child(format!("{input} in · {output} out")),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(format!("{total} tokens")),
+                            ),
+                    );
+            }
+
+            let mut bars = div().v_flex().gap_1();
+            if daily.is_empty() {
+                bars = bars.child(div().text_sm().text_color(rgb(TEXT_MUTED)).child(
+                    language.choose("暂无可绘制的用量。", "No usage available for this chart."),
+                ));
+            }
+            for (day, total) in daily.iter().rev().take(14).rev() {
+                let width = ((total.saturating_mul(360) / chart_max).max(6)) as f32;
+                bars = bars.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .w(px(84.))
+                                .text_xs()
+                                .text_color(rgb(TEXT_MUTED))
+                                .child(day.clone()),
+                        )
+                        .child(div().h(px(16.)).w(px(width)).rounded_sm().bg(rgb(ACCENT)))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(TEXT_SECONDARY))
+                                .child(format!("{total} tokens")),
+                        ),
+                );
+            }
+
+            let mut audit_rows = div().v_flex().gap_2();
+            if audit.is_empty() {
+                audit_rows = audit_rows.child(div().text_sm().text_color(rgb(TEXT_MUTED)).child(
+                    language.choose("当前筛选没有审计事件。", "No audit events match this filter."),
+                ));
+            }
+            for record in audit.iter().take(200) {
+                let source = &record.source;
+                audit_rows = audit_rows.child(
+                    div()
+                        .v_flex()
+                        .gap_1()
+                        .p_3()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .bg(rgb(CARD_BG))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .px_1p5()
+                                        .py_0p5()
+                                        .rounded_sm()
+                                        .text_xs()
+                                        .bg(rgb(0x00e0_f2fe))
+                                        .text_color(rgb(0x000e_7490))
+                                        .child(record.kind.label()),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(TEXT_MUTED))
+                                        .child(rfc3339(record.timestamp_unix_seconds)),
+                                ),
+                        )
+                        .child(div().text_sm().whitespace_normal().child(record.summary.clone()))
+                        .child(
+                            div().text_xs().text_color(rgb(TEXT_MUTED)).whitespace_normal().child(
+                                format!(
+                                    "Project: {} · Provider: {} · Runtime: {} · Session: {}",
+                                    source.project_id,
+                                    source.provider_id,
+                                    source.runtime_id,
+                                    source.session_id
+                                ),
+                            ),
+                        ),
+                );
+            }
+
+            div()
+                .size_full()
+                .p_6()
+                .v_flex()
+                .gap_4()
+                .child(div().v_flex().gap_1().child(
+                    div().text_xl().font_weight(FontWeight::SEMIBOLD).child(
+                        language.choose("用量与不可变审计", "Usage & immutable audit"),
+                    ),
+                ).child(
+                    div().text_sm().text_color(rgb(TEXT_SECONDARY)).whitespace_normal().child(
+                        language.choose(
+                            "用量汇总和审计事件是分离的只读投影；审计行始终保留项目、Provider、运行时和会话来源。",
+                            "Usage aggregation and audit events are separate read-only projections; every audit row retains project, provider, runtime, and session context.",
+                        ),
+                    ),
+                ))
+                .child(div().flex().flex_wrap().items_center().gap_2().child(
+                    Button::new("usage-audit-period").label(period.label()).on_click(move |_, _, cx| {
+                        period_button.update(cx, |view, cx| {
+                            view.usage_period = view.usage_period.next();
+                            cx.notify();
+                        });
+                    }),
+                ).child(
+                    Button::new("usage-audit-kind").ghost().label(audit_kind.label()).on_click(move |_, _, cx| {
+                        kind_button.update(cx, |view, cx| {
+                            view.audit_kind_filter = view.audit_kind_filter.next();
+                            cx.notify();
+                        });
+                    }),
+                ).child(
+                    Button::new("export-immutable-audit").primary().label(
+                        language.choose("导出筛选后的审计 CSV", "Export filtered audit CSV"),
+                    ).on_click(move |_, window, cx| {
+                        export_button.update(cx, |view, cx| view.export_filtered_audit(window, cx));
+                    }),
+                ))
+                .child(div().flex().flex_wrap().gap_2().child(
+                    div().flex_1().min_w(px(260.)).h(px(36.)).px_2().rounded_md().border_1().border_color(rgb(BORDER)).bg(rgb(CARD_BG)).child(
+                        InputBase::new("usage-audit-usage-filter").flex_1().h_full().flex().items_center().child(self.usage_filter.clone()),
+                    ),
+                ).child(
+                    div().flex_1().min_w(px(260.)).h(px(36.)).px_2().rounded_md().border_1().border_color(rgb(BORDER)).bg(rgb(CARD_BG)).child(
+                        InputBase::new("usage-audit-event-filter").flex_1().h_full().flex().items_center().child(self.audit_filter.clone()),
+                    ),
+                ))
+                .child(div().flex().flex_wrap().gap_3().child(metric(input_tokens, language.choose("输入 tokens", "Input tokens"))).child(metric(output_tokens, language.choose("输出 tokens", "Output tokens"))).child(metric(total_tokens, language.choose("总 tokens", "Total tokens"))))
+                .child(div().v_flex().gap_2().p_4().rounded_xl().border_1().border_color(rgb(BORDER)).bg(rgb(CARD_BG)).child(
+                    div().text_base().font_weight(FontWeight::SEMIBOLD).child(language.choose("Token 用量（按项目 / Provider / 运行时）", "Token usage by project / provider / runtime")),
+                ).child(usage_rows))
+                .child(div().v_flex().gap_2().p_4().rounded_xl().border_1().border_color(rgb(BORDER)).bg(rgb(CARD_BG)).child(
+                    div().text_base().font_weight(FontWeight::SEMIBOLD).child(language.choose("用量趋势", "Usage trend")),
+                ).child(bars))
+                .child(div().v_flex().gap_1().child(
+                    div().text_base().font_weight(FontWeight::SEMIBOLD).child(language.choose("审计日志（只读）", "Audit log (read-only)")),
+                ).child(
+                    div().text_xs().text_color(rgb(TEXT_MUTED)).child(language.choose(
+                        "筛选或导出不会改变审计记录；界面没有编辑、删除或改写操作。",
+                        "Filtering and exporting never changes records; this surface has no edit, delete, or rewrite operation.",
+                    )),
+                ).child(audit_rows))
+        }
+
+        fn short_hash(value: &str) -> String {
+            const PREFIX_LENGTH: usize = 18;
+            if value.len() > PREFIX_LENGTH {
+                format!("{}…", &value[..PREFIX_LENGTH])
+            } else if value.is_empty() {
+                "—".to_owned()
+            } else {
+                value.to_owned()
+            }
+        }
+
+        fn authority_style(authority: &SnapshotAuthority) -> (u32, u32, &'static str) {
+            match authority {
+                SnapshotAuthority::Observed => (0x00e0_f2fe, 0x000e_7490, "observed"),
+                SnapshotAuthority::Planned => (0x00f3_e8ff, 0x0076_2b_a3, "planned"),
+                SnapshotAuthority::Verified => (0x00dc_fce7, 0x0016_a34a, "verified"),
+            }
+        }
+
+        /// `inconclusive` is intentionally amber rather than green. It means a verification did
+        /// not establish a result, not that the checked property passed.
+        fn fact_style(status: &FactStatus) -> (u32, u32, &'static str) {
+            match status {
+                FactStatus::Passed => (0x00dc_fce7, 0x0016_a34a, "passed"),
+                FactStatus::Failed => (0x00fe_f2f2, 0x00b9_1c1c, "failed"),
+                FactStatus::Inconclusive => (0x00ff_fbeb, 0x00b4_5309, "inconclusive"),
+                FactStatus::NotRun => (0x00f1_f5f9, 0x0047_5563, "not run"),
+            }
+        }
+
+        /// Projects persisted semantic facts without treating uncertainty as success.  The
+        /// approval workflow has no persisted ChangeSet source yet, so its KPI stays explicitly
+        /// unread rather than becoming a misleading zero.
+        fn overview_fact_rows(
+            language: UiLanguage,
+            passed: usize,
+            failed: usize,
+            inconclusive: usize,
+            not_run: usize,
+        ) -> impl IntoElement {
+            let mut rows = div().v_flex().gap_2().child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_sm()
+                    .text_color(rgb(TEXT_SECONDARY))
+                    .child(status_dot(0x0094_a3b8))
+                    .child(language.choose(
+                        "待审批变更：未回读（尚无持久化 ChangeSet）",
+                        "Pending changes: not read back (no persisted ChangeSet store)",
+                    )),
+            );
+            if passed + failed + inconclusive + not_run == 0 {
+                rows = rows.child(
+                    div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(language.choose(
+                        "没有已加载的验证事实。导入语义快照并运行验证以建立待办项。",
+                        "No loaded verification facts. Import a semantic snapshot and run validation.",
+                    )),
+                );
+            } else {
+                for (status, count) in [
+                    (FactStatus::Passed, passed),
+                    (FactStatus::Failed, failed),
+                    (FactStatus::Inconclusive, inconclusive),
+                    (FactStatus::NotRun, not_run),
+                ] {
+                    let style = Self::fact_style(&status);
+                    rows = rows.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_sm()
+                            .text_color(rgb(TEXT_SECONDARY))
+                            .child(status_dot(style.1))
+                            .child(format!("{count} {}", style.2)),
+                    );
+                }
+            }
+            rows
+        }
+
+        fn semantic_query_hits(
+            snapshot: &LogicalCircuitSnapshot,
+            scope: SemanticQueryScope,
+            query: &str,
+        ) -> Vec<SemanticQueryHit> {
+            let query = query.trim().to_lowercase();
+            let matches = |values: &[String]| {
+                query.is_empty() || values.iter().any(|value| value.to_lowercase().contains(&query))
+            };
+            match scope {
+                SemanticQueryScope::Components => snapshot
+                    .components
+                    .iter()
+                    .filter_map(|component| {
+                        let values = vec![
+                            component.id.clone(),
+                            component.reference.clone(),
+                            component.value.clone().unwrap_or_default(),
+                        ];
+                        matches(&values).then(|| SemanticQueryHit {
+                            kind: "component",
+                            subject: format!("{} ({})", component.reference, component.id),
+                            detail: component
+                                .value
+                                .clone()
+                                .unwrap_or_else(|| "No value".to_owned()),
+                            evidence: component.evidence.len().to_string(),
+                        })
+                    })
+                    .collect(),
+                SemanticQueryScope::Pins => snapshot
+                    .components
+                    .iter()
+                    .flat_map(|component| {
+                        component.pins.iter().filter_map(move |pin| {
+                            let values = vec![
+                                component.reference.clone(),
+                                component.id.clone(),
+                                pin.id.clone(),
+                                pin.name.clone(),
+                            ];
+                            matches(&values).then(|| SemanticQueryHit {
+                                kind: "pin",
+                                subject: format!(
+                                    "{}:{} ({})",
+                                    component.reference, pin.id, pin.name
+                                ),
+                                detail: component.id.clone(),
+                                evidence: component.evidence.len().to_string(),
+                            })
+                        })
+                    })
+                    .collect(),
+                SemanticQueryScope::Nets => snapshot
+                    .nets
+                    .iter()
+                    .filter_map(|net| {
+                        let values = vec![net.id.clone(), net.name.clone().unwrap_or_default()];
+                        matches(&values).then(|| SemanticQueryHit {
+                            kind: "net",
+                            subject: net.name.clone().unwrap_or_else(|| net.id.clone()),
+                            detail: format!("{} pins · {}", net.pins.len(), net.id),
+                            evidence: "snapshot".to_owned(),
+                        })
+                    })
+                    .collect(),
+                SemanticQueryScope::Constraints => snapshot
+                    .constraints
+                    .iter()
+                    .filter_map(|constraint| {
+                        let values = vec![
+                            constraint.constraint_id.clone(),
+                            constraint.layer.clone(),
+                            format!("{:?}", constraint.status),
+                            constraint.explanation.clone(),
+                        ];
+                        matches(&values).then(|| SemanticQueryHit {
+                            kind: "constraint",
+                            subject: constraint.constraint_id.clone(),
+                            detail: format!("{} · {:?}", constraint.layer, constraint.status),
+                            evidence: constraint.evidence_refs.len().to_string(),
+                        })
+                    })
+                    .collect(),
+                SemanticQueryScope::Evidence => snapshot
+                    .evidence
+                    .iter()
+                    .chain(
+                        snapshot.components.iter().flat_map(|component| component.evidence.iter()),
+                    )
+                    .chain(
+                        snapshot
+                            .constraints
+                            .iter()
+                            .flat_map(|constraint| constraint.evidence_refs.iter()),
+                    )
+                    .filter_map(|evidence| {
+                        let values = vec![
+                            evidence.document_id.clone(),
+                            evidence.content_hash.clone(),
+                            evidence.locator.clone(),
+                            evidence.excerpt.clone().unwrap_or_default(),
+                        ];
+                        matches(&values).then(|| SemanticQueryHit {
+                            kind: "evidence",
+                            subject: evidence.document_id.clone(),
+                            detail: evidence.locator.clone(),
+                            evidence: Self::short_hash(&evidence.content_hash),
+                        })
+                    })
+                    .collect(),
+            }
+        }
+
+        #[allow(clippy::too_many_lines)]
+        fn render_semantics_page(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+            let language = self.language;
+            let entity = cx.entity().clone();
+            let Some(project_id) = self.selected_project.clone() else {
+                return Self::project_empty_state(
+                    language.choose("请先选择项目", "Select a project first"),
+                    language.choose(
+                        "电路语义始终从项目根目录的 logic/snapshots 读取，不会混入其他项目或演示数据。",
+                        "Circuit semantics are read only from this project's logic/snapshots directory; no other project or demo data is mixed in.",
+                    ),
+                )
+                .into_any_element();
+            };
+            let snapshots = self
+                .project_data
+                .get(&project_id)
+                .map(|data| data.semantic_snapshots.clone())
+                .unwrap_or_default();
+            if snapshots.is_empty() {
+                return div()
+                    .size_full()
+                    .v_flex()
+                    .gap_4()
+                    .p_6()
+                    .child(
+                        div().flex().items_center().justify_between().child(
+                            div().v_flex().gap_1().child(
+                                div().text_xl().font_weight(FontWeight::SEMIBOLD).child(
+                                    language.choose("电路语义", "Circuit semantics"),
+                                ),
+                            ).child(
+                                div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(
+                                    language.choose("项目语义快照", "Project semantic snapshots"),
+                                ),
+                            ),
+                        ).child({
+                            let refresher = entity.clone();
+                            Button::new("refresh-semantic-snapshots")
+                                .label(language.choose("刷新", "Refresh"))
+                                .on_click(move |_, _, cx| {
+                                    refresher.update(cx, |view, cx| {
+                                        view.status = match view.refresh_project_data(&project_id) {
+                                            Ok(()) => language.choose("语义快照已刷新", "Semantic snapshots refreshed").to_owned(),
+                                            Err(error) => format!("{}: {error}", language.choose("语义快照未刷新", "Semantic snapshots not refreshed")),
+                                        };
+                                        cx.notify();
+                                    });
+                                })
+                        }),
+                    )
+                    .child(Self::project_empty_state(
+                        language.choose("尚无语义快照", "No semantic snapshots"),
+                        language.choose(
+                            "尚未导入任何逻辑快照。此界面不会将“无数据”显示成已验证；EDA 导入器写入 logic/snapshots 后可刷新查看。",
+                            "No logical snapshot has been imported. This view never represents missing data as verified; refresh after an EDA importer writes logic/snapshots.",
+                        ),
+                    ))
+                    .into_any_element();
+            }
+
+            let selected_hash = self
+                .selected_semantic_snapshot
+                .as_ref()
+                .filter(|(selected_project, _)| selected_project == &project_id)
+                .map(|(_, hash)| hash.as_str());
+            let snapshot = selected_hash
+                .and_then(|hash| snapshots.iter().find(|snapshot| snapshot.snapshot_hash == hash))
+                .unwrap_or_else(|| snapshots.last().expect("non-empty snapshots"));
+            let query = self.semantic_query.read(cx).value().to_owned();
+            let query_hits = Self::semantic_query_hits(snapshot, self.semantic_query_scope, &query);
+            let authority = Self::authority_style(&snapshot.authority);
+
+            let mut lineage = div().flex().flex_wrap().gap_2();
+            for candidate in &snapshots {
+                let candidate_authority = Self::authority_style(&candidate.authority);
+                let selected = candidate.snapshot_hash == snapshot.snapshot_hash;
+                let selector = entity.clone();
+                let candidate_hash = candidate.snapshot_hash.clone();
+                let candidate_project = project_id.clone();
+                lineage = lineage.child(
+                    div()
+                        .id(format!("semantic-snapshot-{}", candidate_hash))
+                        .w(px(214.))
+                        .p_3()
+                        .v_flex()
+                        .gap_1()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(rgb(if selected { ACCENT } else { BORDER }))
+                        .bg(rgb(if selected { 0x00e0_f2fe } else { CARD_BG }))
+                        .cursor_pointer()
+                        .on_click(move |_, _, cx| {
+                            selector.update(cx, |view, cx| {
+                                view.selected_semantic_snapshot =
+                                    Some((candidate_project.clone(), candidate_hash.clone()));
+                                cx.notify();
+                            });
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child(Self::short_hash(&candidate.snapshot_hash)),
+                                )
+                                .child(
+                                    div()
+                                        .px_1p5()
+                                        .py_0p5()
+                                        .rounded_sm()
+                                        .text_xs()
+                                        .bg(rgb(candidate_authority.0))
+                                        .text_color(rgb(candidate_authority.1))
+                                        .child(candidate_authority.2),
+                                ),
+                        )
+                        .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(format!(
+                                "parent: {}",
+                                candidate
+                                    .parent_snapshot_hash
+                                    .as_deref()
+                                    .map_or_else(|| "root".to_owned(), Self::short_hash)
+                            ))),
+                );
+            }
+
+            let mut components = div().v_flex().gap_1();
+            for component in &snapshot.components {
+                components =
+                    components.child(
+                        div()
+                            .flex()
+                            .gap_3()
+                            .p_2()
+                            .rounded_md()
+                            .bg(rgb(SURFACE_BG))
+                            .child(
+                                div()
+                                    .w(px(92.))
+                                    .text_sm()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(component.reference.clone()),
+                            )
+                            .child(
+                                div()
+                                    .w(px(152.))
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_MUTED))
+                                    .child(component.id.clone()),
+                            )
+                            .child(
+                                div().flex_1().min_w(px(90.)).text_sm().child(
+                                    component.value.clone().unwrap_or_else(|| "—".to_owned()),
+                                ),
+                            )
+                            .child(
+                                div()
+                                    .w(px(70.))
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_MUTED))
+                                    .child(format!("{} evidence", component.evidence.len())),
+                            ),
+                    );
+            }
+            let mut pins = div().v_flex().gap_1();
+            for component in &snapshot.components {
+                for pin in &component.pins {
+                    let nets = snapshot
+                        .nets
+                        .iter()
+                        .filter(|net| {
+                            net.pins.iter().any(|pin_ref| {
+                                pin_ref.component_id == component.id && pin_ref.pin_id == pin.id
+                            })
+                        })
+                        .map(|net| net.name.clone().unwrap_or_else(|| net.id.clone()))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    pins = pins.child(
+                        div()
+                            .flex()
+                            .gap_3()
+                            .p_2()
+                            .rounded_md()
+                            .bg(rgb(SURFACE_BG))
+                            .child(div().w(px(92.)).text_sm().child(component.reference.clone()))
+                            .child(div().w(px(54.)).text_sm().child(pin.id.clone()))
+                            .child(div().w(px(128.)).truncate().text_sm().child(pin.name.clone()))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(90.))
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_MUTED))
+                                    .child(if nets.is_empty() { "—".to_owned() } else { nets }),
+                            ),
+                    );
+                }
+            }
+            let mut nets = div().v_flex().gap_1();
+            for net in &snapshot.nets {
+                nets = nets.child(
+                    div()
+                        .flex()
+                        .gap_3()
+                        .p_2()
+                        .rounded_md()
+                        .bg(rgb(SURFACE_BG))
+                        .child(
+                            div()
+                                .w(px(150.))
+                                .truncate()
+                                .text_sm()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(net.name.clone().unwrap_or_else(|| "Unnamed".to_owned())),
+                        )
+                        .child(
+                            div()
+                                .w(px(152.))
+                                .truncate()
+                                .text_xs()
+                                .text_color(rgb(TEXT_MUTED))
+                                .child(net.id.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(90.))
+                                .text_sm()
+                                .child(format!("{} pins", net.pins.len())),
+                        ),
+                );
+            }
+            let mut constraints = div().v_flex().gap_2();
+            for constraint in &snapshot.constraints {
+                let status = Self::fact_style(&constraint.status);
+                let evidence = if constraint.evidence_refs.is_empty() {
+                    "No evidence attached".to_owned()
+                } else {
+                    constraint
+                        .evidence_refs
+                        .iter()
+                        .map(|reference| {
+                            format!("{} @ {}", reference.document_id, reference.locator)
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" · ")
+                };
+                constraints = constraints.child(
+                    div()
+                        .v_flex()
+                        .gap_1()
+                        .p_3()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .bg(rgb(CARD_BG))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .text_sm()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child(constraint.constraint_id.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .px_1p5()
+                                        .py_0p5()
+                                        .rounded_sm()
+                                        .text_xs()
+                                        .bg(rgb(status.0))
+                                        .text_color(rgb(status.1))
+                                        .child(status.2),
+                                ),
+                        )
+                        .child(div().text_xs().text_color(rgb(TEXT_SECONDARY)).child(format!(
+                            "{} · {:?} · subjects: {}",
+                            constraint.layer,
+                            constraint.severity,
+                            constraint.subject_refs.join(", ")
+                        )))
+                        .child(
+                            div()
+                                .text_sm()
+                                .whitespace_normal()
+                                .child(constraint.explanation.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(
+                                    if matches!(constraint.status, FactStatus::Inconclusive) {
+                                        0x00b4_5309
+                                    } else {
+                                        TEXT_MUTED
+                                    },
+                                ))
+                                .child(evidence),
+                        ),
+                );
+            }
+
+            let mut evidence_sources = Vec::new();
+            for evidence in &snapshot.evidence {
+                evidence_sources.push((
+                    "snapshot".to_owned(),
+                    evidence.document_id.clone(),
+                    evidence.locator.clone(),
+                    evidence.content_hash.clone(),
+                ));
+            }
+            for component in &snapshot.components {
+                for evidence in &component.evidence {
+                    evidence_sources.push((
+                        format!("component:{}", component.reference),
+                        evidence.document_id.clone(),
+                        evidence.locator.clone(),
+                        evidence.content_hash.clone(),
+                    ));
+                }
+            }
+            for constraint in &snapshot.constraints {
+                for evidence in &constraint.evidence_refs {
+                    evidence_sources.push((
+                        format!("constraint:{}", constraint.constraint_id),
+                        evidence.document_id.clone(),
+                        evidence.locator.clone(),
+                        evidence.content_hash.clone(),
+                    ));
+                }
+            }
+            let mut evidence_rows = div().v_flex().gap_1();
+            for (origin, document_id, locator, hash) in &evidence_sources {
+                evidence_rows = evidence_rows.child(
+                    div()
+                        .flex()
+                        .gap_3()
+                        .p_2()
+                        .rounded_md()
+                        .bg(rgb(SURFACE_BG))
+                        .child(
+                            div()
+                                .w(px(150.))
+                                .truncate()
+                                .text_xs()
+                                .text_color(rgb(0x000e_7490))
+                                .child(origin.clone()),
+                        )
+                        .child(
+                            div()
+                                .w(px(140.))
+                                .truncate()
+                                .text_sm()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(document_id.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(90.))
+                                .truncate()
+                                .text_xs()
+                                .text_color(rgb(TEXT_SECONDARY))
+                                .child(locator.clone()),
+                        )
+                        .child(
+                            div()
+                                .w(px(150.))
+                                .truncate()
+                                .text_xs()
+                                .text_color(rgb(TEXT_MUTED))
+                                .child(Self::short_hash(hash)),
+                        ),
+                );
+            }
+            if evidence_sources.is_empty() {
+                evidence_rows = evidence_rows.child(
+                    div().text_xs().text_color(rgb(TEXT_MUTED)).child(language.choose(
+                        "此快照未附加证据；不能据此主张已验证。",
+                        "No evidence is attached to this snapshot; it cannot support a verified claim.",
+                    )),
+                );
+            }
+
+            let mut query_rows = div().v_flex().gap_1();
+            for hit in query_hits.iter().take(30) {
+                query_rows = query_rows.child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .p_2()
+                        .rounded_md()
+                        .bg(rgb(CARD_BG))
+                        .child(
+                            div().w(px(72.)).text_xs().text_color(rgb(0x000e_7490)).child(hit.kind),
+                        )
+                        .child(
+                            div()
+                                .w(px(190.))
+                                .truncate()
+                                .text_sm()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(hit.subject.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(90.))
+                                .truncate()
+                                .text_xs()
+                                .text_color(rgb(TEXT_SECONDARY))
+                                .child(hit.detail.clone()),
+                        )
+                        .child(
+                            div()
+                                .w(px(105.))
+                                .truncate()
+                                .text_xs()
+                                .text_color(rgb(TEXT_MUTED))
+                                .child(hit.evidence.clone()),
+                        ),
+                );
+            }
+            if query_hits.is_empty() {
+                query_rows = query_rows.child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(
+                    language.choose(
+                        "没有匹配的结构化语义事实。",
+                        "No structured semantic facts matched.",
+                    ),
+                ));
+            }
+            let mut scopes = div().flex().flex_wrap().gap_1();
+            for scope in SemanticQueryScope::ALL {
+                let setter = entity.clone();
+                scopes = scopes.child(
+                    Button::new(format!("semantic-scope-{:?}", scope))
+                        .label(scope.label(language))
+                        .when(scope == self.semantic_query_scope, |button| button.primary())
+                        .on_click(move |_, _, cx| {
+                            setter.update(cx, |view, cx| {
+                                view.semantic_query_scope = scope;
+                                cx.notify();
+                            });
+                        }),
+                );
+            }
+
+            div().id("semantic-browser-body").size_full().overflow_y_scroll().v_flex().gap_4().p_6()
+                .child(div().flex().items_start().justify_between().gap_3().child(
+                    div().v_flex().gap_1().child(div().text_xl().font_weight(FontWeight::SEMIBOLD).child(language.choose("电路语义", "Circuit semantics")))
+                        .child(div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(language.choose("只读项目快照、验证事实与可追溯证据。", "Read-only project snapshots, verification facts, and traceable evidence."))),
+                ).child({ let refresher = entity.clone(); Button::new("refresh-semantic-snapshots").label(language.choose("刷新快照", "Refresh snapshots")).on_click(move |_, _, cx| { refresher.update(cx, |view, cx| { view.status = match view.refresh_project_data(&project_id) { Ok(()) => language.choose("语义快照已刷新", "Semantic snapshots refreshed").to_owned(), Err(error) => format!("{}: {error}", language.choose("语义快照未刷新", "Semantic snapshots not refreshed")), }; cx.notify(); }); }) }))
+                .child(div().v_flex().gap_2().p_3().rounded_lg().border_1().border_color(rgb(BORDER)).bg(rgb(CARD_BG)).child(div().text_sm().font_weight(FontWeight::MEDIUM).child(language.choose("快照谱系", "Snapshot lineage"))).child(lineage))
+                .child(div().flex().flex_wrap().gap_3().child(
+                    div().flex_1().min_w(px(260.)).v_flex().gap_1().p_3().rounded_lg().border_1().border_color(rgb(BORDER)).bg(rgb(CARD_BG)).child(div().text_xs().text_color(rgb(TEXT_MUTED)).child("authority")).child(div().px_1p5().py_0p5().rounded_sm().text_xs().bg(rgb(authority.0)).text_color(rgb(authority.1)).child(authority.2)),
+                ).child(
+                    div().flex_1().min_w(px(260.)).v_flex().gap_1().p_3().rounded_lg().border_1().border_color(rgb(BORDER)).bg(rgb(CARD_BG)).child(div().text_xs().text_color(rgb(TEXT_MUTED)).child("logicalHash")).child(div().text_sm().child(snapshot.logical_hash.clone())),
+                ).child(
+                    div().flex_1().min_w(px(260.)).v_flex().gap_1().p_3().rounded_lg().border_1().border_color(rgb(BORDER)).bg(rgb(CARD_BG)).child(div().text_xs().text_color(rgb(TEXT_MUTED)).child("physicalHash")).child(div().text_sm().child(snapshot.physical_hash.clone().unwrap_or_else(|| language.choose("未观察到物理回读", "No physical readback observed").to_owned()))),
+                ).child(
+                    div().flex_1().min_w(px(260.)).v_flex().gap_1().p_3().rounded_lg().border_1().border_color(rgb(BORDER)).bg(rgb(CARD_BG)).child(div().text_xs().text_color(rgb(TEXT_MUTED)).child("snapshotHash")).child(div().text_sm().child(snapshot.snapshot_hash.clone())),
+                ))
+                .child(div().v_flex().gap_2().p_3().rounded_lg().border_1().border_color(rgb(BORDER)).bg(rgb(CARD_BG)).child(div().text_base().font_weight(FontWeight::SEMIBOLD).child(language.choose("结构化语义查询", "Structured semantic query"))).child(scopes).child(div().id("semantic-query").w_full().child(Input::new(&self.semantic_query))).child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(language.choose_owned(format!("{} 个结果", query_hits.len()), format!("{} result(s)", query_hits.len())))).child(query_rows))
+                .child(div().v_flex().gap_2().p_3().rounded_lg().border_1().border_color(rgb(BORDER)).bg(rgb(CARD_BG)).child(div().text_base().font_weight(FontWeight::SEMIBOLD).child(language.choose("元件", "Components"))).child(components))
+                .child(div().v_flex().gap_2().p_3().rounded_lg().border_1().border_color(rgb(BORDER)).bg(rgb(CARD_BG)).child(div().text_base().font_weight(FontWeight::SEMIBOLD).child(language.choose("引脚", "Pins"))).child(pins))
+                .child(div().v_flex().gap_2().p_3().rounded_lg().border_1().border_color(rgb(BORDER)).bg(rgb(CARD_BG)).child(div().text_base().font_weight(FontWeight::SEMIBOLD).child(language.choose("网络", "Nets"))).child(nets))
+                .child(div().v_flex().gap_2().p_3().rounded_lg().border_1().border_color(rgb(BORDER)).bg(rgb(CARD_BG)).child(div().text_base().font_weight(FontWeight::SEMIBOLD).child(language.choose("约束与验证结果", "Constraints & verification results"))).child(constraints))
+                .child(div().v_flex().gap_2().p_3().rounded_lg().border_1().border_color(rgb(BORDER)).bg(rgb(CARD_BG)).child(div().text_base().font_weight(FontWeight::SEMIBOLD).child(language.choose("证据链", "Evidence chain"))).child(evidence_rows))
+                .into_any_element()
+        }
+
+        fn current_observation_hash(&self, project_id: &str) -> Option<String> {
+            self.project_data.get(project_id)?.semantic_snapshots.iter().rev().find_map(
+                |snapshot| {
+                    (snapshot.authority == SnapshotAuthority::Observed)
+                        .then(|| snapshot.snapshot_hash.clone())
+                },
+            )
+        }
+
+        fn record_change_set_decision(
+            &mut self,
+            project_id: &str,
+            change_set_id: &str,
+            approved: bool,
+            cx: &mut Context<Self>,
+        ) {
+            let current_observation = self.current_observation_hash(project_id);
+            let rollback_handle = self.project_data.get(project_id).and_then(|data| {
+                data.change_sets
+                    .iter()
+                    .find(|record| record.id == change_set_id)
+                    .and_then(|record| record.rollback_handle.clone())
+            });
+            let reason = self.approval_note.read(cx).value().trim().to_owned();
+            let entry = ChangeSetAuditEntry {
+                timestamp_unix_seconds: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                actor: "desktop operator".to_owned(),
+                decision: if approved { "approved" } else { "rejected" }.to_owned(),
+                reason: if reason.is_empty() { "No reason supplied".to_owned() } else { reason },
+                observed_snapshot_hash: current_observation.clone(),
+                rollback_handle,
+            };
+            let persisted = self.project_storages.get(project_id).map(|storage| {
+                storage.record_change_set_decision(
+                    change_set_id,
+                    current_observation.as_deref(),
+                    entry,
+                )
+            });
+            self.status = match persisted {
+                Some(Ok(())) => match self.refresh_project_data(project_id) {
+                    Ok(()) => format!(
+                        "ChangeSet `{change_set_id}` {} and audit record persisted.",
+                        if approved { "approved" } else { "rejected" }
+                    ),
+                    Err(error) => {
+                        format!("Decision was persisted, but the page could not refresh: {error}")
+                    }
+                },
+                Some(Err(error)) => format!("ChangeSet decision not saved: {error}"),
+                None => "ChangeSet decision not saved: project storage is not open.".to_owned(),
+            };
+            if self.status.contains("persisted") {
+                self.approval_drawer_open = false;
+            }
+            cx.notify();
+        }
+
+        /// A ChangeSet projection makes every state transition inspectable: plan hashes and IR
+        /// diff remain separate from write/readback/verification, while approval actions are
+        /// guarded by a fresh observed-baseline comparison and appended to the same record.
+        #[allow(clippy::too_many_lines)]
+        fn render_changes_approvals_page(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+            let language = self.language;
+            let entity = cx.entity().clone();
+            let Some(project_id) = self.selected_project.clone() else {
+                return Self::project_empty_state(
+                    language.choose("Please select a project", "Select a project first"),
+                    language.choose(
+                        "ChangeSets are always scoped to one project.",
+                        "ChangeSets are always scoped to one project.",
+                    ),
+                )
+                .into_any_element();
+            };
+            let data = self.project_data.get(&project_id).cloned().unwrap_or_default();
+            let selected_id = self
+                .selected_change_set
+                .as_ref()
+                .filter(|(selected_project, _)| selected_project == &project_id)
+                .map(|(_, id)| id.as_str());
+            let selected = selected_id
+                .and_then(|id| data.change_sets.iter().find(|record| record.id == id))
+                .or_else(|| data.change_sets.first())
+                .cloned();
+            let current_observation = self.current_observation_hash(&project_id);
+
+            let mut change_set_rows = div().v_flex().gap_2();
+            for record in &data.change_sets {
+                let is_selected =
+                    selected.as_ref().is_some_and(|selected| selected.id == record.id);
+                let selector = entity.clone();
+                let select_project = project_id.clone();
+                let select_id = record.id.clone();
+                let decision = record.decision().map_or("pending", |entry| entry.decision.as_str());
+                change_set_rows = change_set_rows.child(
+                    div()
+                        .id(format!("changeset-{}", record.id))
+                        .cursor_pointer()
+                        .p_3()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(rgb(if is_selected { ACCENT } else { BORDER }))
+                        .bg(rgb(if is_selected { 0x00e0_f2fe } else { CARD_BG }))
+                        .on_click(move |_, _, cx| {
+                            selector.update(cx, |view, cx| {
+                                view.selected_change_set =
+                                    Some((select_project.clone(), select_id.clone()));
+                                cx.notify();
+                            })
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(record.id.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(TEXT_MUTED))
+                                        .child(decision.to_owned()),
+                                ),
+                        )
+                        .child(div().mt_1().text_xs().text_color(rgb(TEXT_SECONDARY)).child(
+                            format!(
+                                "{} → {}",
+                                Self::short_hash(&record.base_snapshot_hash),
+                                Self::short_hash(&record.target_snapshot_hash)
+                            ),
+                        )),
+                );
+            }
+            if data.change_sets.is_empty() {
+                change_set_rows = change_set_rows.child(div().text_sm().text_color(rgb(TEXT_MUTED)).child(
+                    "No persisted ChangeSets. A materializer writes proposed plans to logic/changesets."
+                ));
+            }
+
+            let details = if let Some(record) = selected {
+                let approval_allowed = record.approval_allowed(current_observation.as_deref());
+                let baseline_label = if approval_allowed {
+                    "Current observation matches baseline"
+                } else {
+                    "Current observation differs from baseline — approval disabled"
+                };
+                let mut diff_rows = div().v_flex().gap_1();
+                for operation in &record.ir_diff {
+                    diff_rows = diff_rows.child(
+                        div()
+                            .p_2()
+                            .rounded_md()
+                            .bg(rgb(SURFACE_BG))
+                            .text_sm()
+                            .child(operation.clone()),
+                    );
+                }
+                if record.ir_diff.is_empty() {
+                    diff_rows = diff_rows.child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(TEXT_MUTED))
+                            .child("No IR operations recorded."),
+                    );
+                }
+                let mut evidence_rows = div().v_flex().gap_1();
+                for evidence in &record.evidence {
+                    evidence_rows = evidence_rows.child(
+                        div().p_2().rounded_md().bg(rgb(SURFACE_BG)).text_xs().child(format!(
+                            "{} @ {} ({})",
+                            evidence.document_id,
+                            evidence.locator,
+                            Self::short_hash(&evidence.content_hash)
+                        )),
+                    );
+                }
+                if record.evidence.is_empty() {
+                    evidence_rows = evidence_rows.child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(TEXT_MUTED))
+                            .child("No evidence references recorded."),
+                    );
+                }
+                let stage = |name: &'static str, status: &ChangeSetStageStatus, detail: &str| {
+                    let (color, label) = match status {
+                        ChangeSetStageStatus::Passed => (0x0016_a34a, "passed"),
+                        ChangeSetStageStatus::Failed => (0x00b9_1c1c, "failed"),
+                        ChangeSetStageStatus::NotRun => (0x00b4_5309, "not run"),
+                    };
+                    div()
+                        .flex()
+                        .gap_2()
+                        .items_center()
+                        .p_2()
+                        .rounded_md()
+                        .bg(rgb(SURFACE_BG))
+                        .child(status_dot(color))
+                        .child(div().w(px(80.)).text_sm().child(name))
+                        .child(
+                            div().w(px(62.)).text_xs().text_color(rgb(TEXT_SECONDARY)).child(label),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_xs()
+                                .text_color(rgb(TEXT_MUTED))
+                                .child(detail.to_owned()),
+                        )
+                };
+                let drawer_opener = entity.clone();
+                let record_id = record.id.clone();
+                let drawer_project = project_id.clone();
+                let audit =
+                    record.audit.iter().rev().fold(div().v_flex().gap_1(), |rows, entry| {
+                        rows.child(div().p_2().rounded_md().bg(rgb(SURFACE_BG)).text_xs().child(
+                            format!(
+                                "{} · {} · {} · observed: {} · rollback: {}",
+                                entry.timestamp_unix_seconds,
+                                entry.actor,
+                                entry.decision,
+                                entry
+                                    .observed_snapshot_hash
+                                    .as_deref()
+                                    .map_or_else(|| "none".to_owned(), Self::short_hash),
+                                entry.rollback_handle.as_deref().unwrap_or("none")
+                            ),
+                        ))
+                    });
+                div()
+                    .v_flex()
+                    .gap_4()
+                    .p_5()
+                    .rounded_xl()
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .bg(rgb(CARD_BG))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .v_flex()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .text_xl()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child(record.id.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(rgb(TEXT_SECONDARY))
+                                            .child(baseline_label),
+                                    ),
+                            )
+                            .child(
+                                Button::new("open-approval-drawer")
+                                    .primary()
+                                    .label("Review approval")
+                                    .on_click(move |_, _, cx| {
+                                        drawer_opener.update(cx, |view, cx| {
+                                            view.selected_change_set =
+                                                Some((drawer_project.clone(), record_id.clone()));
+                                            view.approval_drawer_open = true;
+                                            cx.notify();
+                                        });
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .p_2()
+                                    .rounded_md()
+                                    .bg(rgb(SURFACE_BG))
+                                    .text_xs()
+                                    .child(format!("baseline: {}", record.base_snapshot_hash)),
+                            )
+                            .child(
+                                div()
+                                    .p_2()
+                                    .rounded_md()
+                                    .bg(rgb(SURFACE_BG))
+                                    .text_xs()
+                                    .child(format!("target: {}", record.target_snapshot_hash)),
+                            )
+                            .child(
+                                div()
+                                    .p_2()
+                                    .rounded_md()
+                                    .bg(rgb(SURFACE_BG))
+                                    .text_xs()
+                                    .child(format!("plan: {}", record.plan_hash)),
+                            )
+                            .child(div().p_2().rounded_md().bg(rgb(SURFACE_BG)).text_xs().child(
+                                format!(
+                                        "observed: {}",
+                                        current_observation
+                                            .as_deref()
+                                            .map_or_else(|| "none".to_owned(), Self::short_hash)
+                                    ),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .v_flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_base()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("IR diff"),
+                            )
+                            .child(diff_rows),
+                    )
+                    .child(
+                        div()
+                            .v_flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_base()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("Evidence references"),
+                            )
+                            .child(evidence_rows),
+                    )
+                    .child(
+                        div()
+                            .v_flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_base()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("Materialization report"),
+                            )
+                            .child(stage(
+                                "Write",
+                                &record.execution.write.status,
+                                &record.execution.write.detail,
+                            ))
+                            .child(stage(
+                                "Readback",
+                                &record.execution.readback.status,
+                                &record.execution.readback.detail,
+                            ))
+                            .child(stage(
+                                "Verification",
+                                &record.execution.verification.status,
+                                &record.execution.verification.detail,
+                            )),
+                    )
+                    .child(
+                        div()
+                            .v_flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_base()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("Approval audit (append-only)"),
+                            )
+                            .child(audit)
+                            .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(format!(
+                                "Rollback handle: {}",
+                                record.rollback_handle.as_deref().unwrap_or("not supplied")
+                            ))),
+                    )
+                    .into_any_element()
+            } else {
+                Self::project_empty_state("No ChangeSet selected", "Choose a persisted ChangeSet to inspect its hashes, diff, evidence, and audit.").into_any_element()
+            };
+
+            let mut page = div().size_full().overflow_y_scrollbar().v_flex().gap_4().p_6()
+                .child(div().flex().items_center().justify_between().child(
+                    div().v_flex().gap_1().child(div().text_xl().font_weight(FontWeight::SEMIBOLD).child("Changes & approvals"))
+                        .child(div().text_sm().text_color(rgb(TEXT_SECONDARY)).child("Approval is guarded by current observed state, baseline, and verification."))
+                ).child({ let refresher = entity.clone(); let refresh_project = project_id.clone(); Button::new("refresh-change-sets").label("Refresh").on_click(move |_, _, cx| refresher.update(cx, |view, cx| { view.status = view.refresh_project_data(&refresh_project).map_or_else(|error| format!("Refresh failed: {error}"), |_| "ChangeSets refreshed.".to_owned()); cx.notify(); })) }))
+                .child(div().flex().gap_4().items_start().child(div().w(px(250.)).flex_none().v_flex().gap_2().child(div().text_base().font_weight(FontWeight::SEMIBOLD).child("ChangeSets")).child(change_set_rows)).child(div().flex_1().min_w(px(420.)).child(details)));
+
+            if self.approval_drawer_open {
+                if let Some(record) = self
+                    .selected_change_set
+                    .as_ref()
+                    .and_then(|(_, id)| data.change_sets.iter().find(|record| &record.id == id))
+                {
+                    let can_approve = record.approval_allowed(current_observation.as_deref());
+                    let approve_view = entity.clone();
+                    let reject_view = entity.clone();
+                    let close_view = entity.clone();
+                    let decision_project = project_id.clone();
+                    let decision_id = record.id.clone();
+                    let rejection_project = project_id.clone();
+                    let rejection_id = record.id.clone();
+                    let actions = div()
+                        .flex()
+                        .gap_2()
+                        .child(
+                            Button::new("approve-change-set")
+                                .primary()
+                                .label("Approve")
+                                .disabled(!can_approve)
+                                .on_click(move |_, _, cx| {
+                                    approve_view.update(cx, |view, cx| {
+                                        view.record_change_set_decision(
+                                            &decision_project,
+                                            &decision_id,
+                                            true,
+                                            cx,
+                                        )
+                                    });
+                                }),
+                        )
+                        .child(Button::new("reject-change-set").label("Reject").on_click(
+                            move |_, _, cx| {
+                                reject_view.update(cx, |view, cx| {
+                                    view.record_change_set_decision(
+                                        &rejection_project,
+                                        &rejection_id,
+                                        false,
+                                        cx,
+                                    )
+                                });
+                            },
+                        ));
+                    let drawer = div().p_4().rounded_xl().border_1().border_color(rgb(ACCENT)).bg(rgb(CARD_BG)).v_flex().gap_3()
+                        .child(div().flex().justify_between().child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child("Approval drawer")).child(Button::new("close-approval-drawer").ghost().label("Close").on_click(move |_, _, cx| close_view.update(cx, |view, cx| { view.approval_drawer_open = false; cx.notify(); }))))
+                        .child(div().text_sm().text_color(rgb(if can_approve { 0x0016_a34a } else { 0x00b9_1c1c })).child(if can_approve { "Baseline, readback, and verification are ready." } else { "Approve is disabled: current observation must equal baseline and verification must pass." }))
+                        .child(div().h(px(36.)).px_2().rounded_md().border_1().border_color(rgb(BORDER)).child(InputBase::new("approval-note").h_full().flex().items_center().child(self.approval_note.clone())))
+                        .child(actions);
+                    page = page.child(drawer);
+                }
+            }
+            page.into_any_element()
+        }
+
+        /// BOM is a projection of an immutable logical snapshot, never an independently edited
+        /// parts list.  This keeps the selected format, every reference, and every evidence
+        /// locator attached to a concrete source of engineering truth while exporter plugins are
+        /// still pending.
+        #[allow(clippy::too_many_lines)]
+        fn render_bom_export_page(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+            let language = self.language;
+            let entity = cx.entity().clone();
+            let Some(project_id) = self.selected_project.clone() else {
+                return Self::project_empty_state(
+                    language.choose("请先选择项目", "Select a project first"),
+                    language.choose(
+                        "BOM 与导出只会投影所选项目中的语义快照，不会混入演示数据或其他项目。",
+                        "BOM and export only project the selected project's semantic snapshots; no demo or cross-project data is mixed in.",
+                    ),
+                )
+                .into_any_element();
+            };
+            let snapshots = self
+                .project_data
+                .get(&project_id)
+                .map(|data| data.semantic_snapshots.clone())
+                .unwrap_or_default();
+            if snapshots.is_empty() {
+                let refresher = entity.clone();
+                let refresh_project = project_id.clone();
+                return div()
+                    .size_full()
+                    .v_flex()
+                    .gap_4()
+                    .p_6()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .v_flex()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .text_xl()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child(language.choose("BOM 与导出", "BOM & export")),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(rgb(TEXT_SECONDARY))
+                                            .child(language.choose(
+                                                "先导入一个语义快照，才能建立可追溯的 BOM。",
+                                                "Import a semantic snapshot before creating a traceable BOM.",
+                                            )),
+                                    ),
+                            )
+                            .child(
+                                Button::new("refresh-bom-snapshots")
+                                    .label(language.choose("刷新快照", "Refresh snapshots"))
+                                    .on_click(move |_, _, cx| {
+                                        refresher.update(cx, |view, cx| {
+                                            view.status = match view.refresh_project_data(&refresh_project) {
+                                                Ok(()) => language
+                                                    .choose("语义快照已刷新", "Semantic snapshots refreshed")
+                                                    .to_owned(),
+                                                Err(error) => format!(
+                                                    "{}: {error}",
+                                                    language.choose(
+                                                        "语义快照未刷新",
+                                                        "Semantic snapshots not refreshed",
+                                                    )
+                                                ),
+                                            };
+                                            cx.notify();
+                                        });
+                                    }),
+                            ),
+                    )
+                    .child(Self::project_empty_state(
+                        language.choose("尚无可导出的语义快照", "No semantic snapshot to export"),
+                        language.choose(
+                            "TODO：EDA 导入器写入 logic/snapshots 后，刷新此页以查看 BOM；未绑定快照时不会生成导出。",
+                            "TODO: refresh this page after an EDA importer writes logic/snapshots; no export is generated without a bound snapshot.",
+                        ),
+                    ))
+                    .into_any_element();
+            }
+
+            let selected_hash = self
+                .selected_semantic_snapshot
+                .as_ref()
+                .filter(|(selected_project, _)| selected_project == &project_id)
+                .map(|(_, hash)| hash.as_str());
+            let snapshot = selected_hash
+                .and_then(|hash| snapshots.iter().find(|snapshot| snapshot.snapshot_hash == hash))
+                .unwrap_or_else(|| snapshots.last().expect("non-empty snapshots"));
+            let authority = Self::authority_style(&snapshot.authority);
+            let component_evidence_count =
+                snapshot.components.iter().map(|component| component.evidence.len()).sum::<usize>();
+            let total_evidence_count = snapshot.evidence.len() + component_evidence_count;
+
+            let mut snapshot_choices = div().flex().flex_wrap().gap_2();
+            for candidate in &snapshots {
+                let selector = entity.clone();
+                let candidate_project = project_id.clone();
+                let candidate_hash = candidate.snapshot_hash.clone();
+                let selected = candidate.snapshot_hash == snapshot.snapshot_hash;
+                snapshot_choices = snapshot_choices.child(
+                    Button::new(format!("bom-snapshot-{candidate_hash}"))
+                        .label(format!(
+                            "{} · {}",
+                            Self::short_hash(&candidate.snapshot_hash),
+                            Self::authority_style(&candidate.authority).2
+                        ))
+                        .when(selected, |button| button.primary())
+                        .on_click(move |_, _, cx| {
+                            selector.update(cx, |view, cx| {
+                                view.selected_semantic_snapshot =
+                                    Some((candidate_project.clone(), candidate_hash.clone()));
+                                cx.notify();
+                            });
+                        }),
+                );
+            }
+
+            let mut format_choices = div().flex().flex_wrap().gap_2();
+            for format in BomExportFormat::ALL {
+                let selector = entity.clone();
+                let bound_hash = snapshot.snapshot_hash.clone();
+                let selected = format == self.bom_export_format;
+                format_choices = format_choices.child(
+                    Button::new(format!("bom-export-format-{format:?}"))
+                        .label(format.label())
+                        .when(selected, |button| button.primary())
+                        .on_click(move |_, _, cx| {
+                            selector.update(cx, |view, cx| {
+                                view.bom_export_format = format;
+                                view.status = format!(
+                                    "{} 已选择；导出后端 TODO，生成时将绑定语义快照 {bound_hash}。",
+                                    format.label()
+                                );
+                                cx.notify();
+                            });
+                        }),
+                );
+            }
+
+            let mut bom_rows = div().v_flex().gap_1();
+            for component in &snapshot.components {
+                let evidence = if component.evidence.is_empty() {
+                    language.choose("未附加元件证据", "No component evidence attached").to_owned()
+                } else {
+                    component
+                        .evidence
+                        .iter()
+                        .map(|reference| {
+                            format!(
+                                "{} @ {} ({})",
+                                reference.document_id,
+                                reference.locator,
+                                Self::short_hash(&reference.content_hash)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                };
+                bom_rows = bom_rows.child(
+                    div()
+                        .flex()
+                        .gap_3()
+                        .p_3()
+                        .rounded_md()
+                        .bg(rgb(SURFACE_BG))
+                        .child(
+                            div()
+                                .w(px(110.))
+                                .text_sm()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(component.reference.clone()),
+                        )
+                        .child(div().w(px(190.)).truncate().text_sm().child(
+                            component.value.clone().unwrap_or_else(|| {
+                                language.choose("未指定值", "No value specified").to_owned()
+                            }),
+                        ))
+                        .child(
+                            div()
+                                .w(px(150.))
+                                .truncate()
+                                .text_xs()
+                                .text_color(rgb(TEXT_MUTED))
+                                .child(component.id.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(180.))
+                                .truncate()
+                                .text_xs()
+                                .text_color(rgb(TEXT_SECONDARY))
+                                .child(evidence),
+                        ),
+                );
+            }
+            if snapshot.components.is_empty() {
+                bom_rows =
+                    bom_rows
+                        .child(div().text_sm().text_color(rgb(TEXT_MUTED)).child(language.choose(
+                        "此快照不含元件；不会生成空 BOM 导出。",
+                        "This snapshot has no components; no empty BOM export will be generated.",
+                    )));
+            }
+
+            let netlist_entry = entity.clone();
+            let netlist_hash = snapshot.snapshot_hash.clone();
+            let spice_entry = entity.clone();
+            let spice_hash = snapshot.snapshot_hash.clone();
+            let refresher = entity.clone();
+            let refresh_project = project_id.clone();
+            div()
+                .id("bom-export-body")
+                .size_full()
+                .overflow_y_scroll()
+                .v_flex()
+                .gap_4()
+                .p_6()
+                .child(
+                    div()
+                        .flex()
+                        .items_start()
+                        .justify_between()
+                        .gap_3()
+                        .child(
+                            div()
+                                .v_flex()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_xl()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(language.choose("BOM 与工程导出", "BOM & project export")),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(rgb(TEXT_SECONDARY))
+                                        .child(language.choose(
+                                            "只读 BOM 投影；选择格式不改变语义快照、元件或证据。",
+                                            "Read-only BOM projection; choosing a format never changes the snapshot, components, or evidence.",
+                                        )),
+                                ),
+                        )
+                        .child(
+                            Button::new("refresh-bom-snapshots")
+                                .label(language.choose("刷新快照", "Refresh snapshots"))
+                                .on_click(move |_, _, cx| {
+                                    refresher.update(cx, |view, cx| {
+                                        view.status = match view.refresh_project_data(&refresh_project) {
+                                            Ok(()) => language
+                                                .choose("语义快照已刷新", "Semantic snapshots refreshed")
+                                                .to_owned(),
+                                            Err(error) => format!(
+                                                "{}: {error}",
+                                                language.choose(
+                                                    "语义快照未刷新",
+                                                    "Semantic snapshots not refreshed",
+                                                )
+                                            ),
+                                        };
+                                        cx.notify();
+                                    });
+                                }),
+                        ),
+                )
+                .child(
+                    div()
+                        .v_flex()
+                        .gap_2()
+                        .p_4()
+                        .rounded_xl()
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .bg(rgb(CARD_BG))
+                        .child(
+                            div()
+                                .text_base()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(language.choose("导出绑定", "Export binding")),
+                        )
+                        .child(snapshot_choices)
+                        .child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .gap_3()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(230.))
+                                        .v_flex()
+                                        .gap_1()
+                                        .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child("snapshotHash"))
+                                        .child(div().text_sm().child(snapshot.snapshot_hash.clone())),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(210.))
+                                        .v_flex()
+                                        .gap_1()
+                                        .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child("logicalHash"))
+                                        .child(div().text_sm().child(snapshot.logical_hash.clone())),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(116.))
+                                        .v_flex()
+                                        .gap_1()
+                                        .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child("authority"))
+                                        .child(
+                                            div()
+                                                .px_1p5()
+                                                .py_0p5()
+                                                .rounded_sm()
+                                                .text_xs()
+                                                .bg(rgb(authority.0))
+                                                .text_color(rgb(authority.1))
+                                                .child(authority.2),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(116.))
+                                        .v_flex()
+                                        .gap_1()
+                                        .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child("evidence"))
+                                        .child(div().text_sm().child(format!("{total_evidence_count} refs"))),
+                                ),
+                        )
+                        .child(
+                            div().text_xs().text_color(rgb(TEXT_MUTED)).child(language.choose(
+                                "所有导出都必须携带此 snapshotHash 与下方引用；缺少证据不会被显示为已验证。",
+                                "Every export must carry this snapshotHash and the references below; missing evidence is never presented as verified.",
+                            )),
+                        ),
+                )
+                .child(
+                    div()
+                        .v_flex()
+                        .gap_2()
+                        .p_4()
+                        .rounded_xl()
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .bg(rgb(CARD_BG))
+                        .child(
+                            div()
+                                .text_base()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(language.choose("BOM 预览", "BOM preview")),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap_3()
+                                .px_3()
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(TEXT_MUTED))
+                                .child(div().w(px(110.)).child(language.choose("参考号", "Reference")))
+                                .child(div().w(px(190.)).child(language.choose("值", "Value")))
+                                .child(div().w(px(150.)).child(language.choose("元件", "Component")))
+                                .child(div().flex_1().child(language.choose("证据引用", "Evidence references"))),
+                        )
+                        .child(bom_rows),
+                )
+                .child(
+                    div()
+                        .v_flex()
+                        .gap_3()
+                        .p_4()
+                        .rounded_xl()
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .bg(rgb(CARD_BG))
+                        .child(
+                            div()
+                                .text_base()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(language.choose("BOM 格式", "BOM format")),
+                        )
+                        .child(format_choices)
+                        .child(
+                            div().text_xs().text_color(rgb(0x00b4_5309)).child(language.choose(
+                                "TODO：CSV、Excel 和 JSON 导出器尚未实现，因此不会写出文件；当前选择会保留与所选快照的绑定。",
+                                "TODO: CSV, Excel, and JSON exporter backends are not implemented, so no file is written; this selection stays bound to the selected snapshot.",
+                            )),
+                        ),
+                )
+                .child(
+                    div()
+                        .v_flex()
+                        .gap_3()
+                        .p_4()
+                        .rounded_xl()
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .bg(rgb(CARD_BG))
+                        .child(
+                            div()
+                                .text_base()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(language.choose("工程导出入口", "Engineering export entry points")),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .gap_2()
+                                .child(
+                                    Button::new("export-netlist-todo")
+                                        .label(language.choose("网表导出（TODO）", "Netlist export (TODO)"))
+                                        .on_click(move |_, _, cx| {
+                                            netlist_entry.update(cx, |view, cx| {
+                                                view.status = format!(
+                                                    "网表导出后端尚未实现；不会生成文件。请求将绑定语义快照 {netlist_hash}。"
+                                                );
+                                                cx.notify();
+                                            });
+                                        }),
+                                )
+                                .child(
+                                    Button::new("export-spice-todo")
+                                        .label(language.choose("SPICE 导出（TODO）", "SPICE export (TODO)"))
+                                        .on_click(move |_, _, cx| {
+                                            spice_entry.update(cx, |view, cx| {
+                                                view.status = format!(
+                                                    "SPICE 导出后端尚未实现；不会生成文件。请求将绑定语义快照 {spice_hash}。"
+                                                );
+                                                cx.notify();
+                                            });
+                                        }),
+                                ),
+                        )
+                        .child(
+                            div().text_xs().text_color(rgb(0x00b4_5309)).child(language.choose(
+                                "TODO：网表和 SPICE 需要由后端插件实现。入口保持可见，以避免将不可用功能误报为已导出。",
+                                "TODO: netlist and SPICE require backend plugins. The entry points remain visible so unavailable functionality is never reported as exported.",
+                            )),
+                        ),
+                )
+                .into_any_element()
+        }
+
         fn section_page(language: UiLanguage, screen: ControlPlaneScreen) -> impl IntoElement {
             let (title, description, next_step) = language.page_copy(screen);
             div().size_full().v_flex().justify_center().items_center().p_8().child(
@@ -6044,9 +8924,74 @@ fn main() {
             )
         }
 
+        /// Renders only state that the control plane has loaded or observed. A missing
+        /// ChangeSet store is not represented as zero pending approvals, because zero would
+        /// imply a readback that has not occurred.
         #[allow(clippy::too_many_lines)]
-        fn overview_page(language: UiLanguage) -> impl IntoElement {
-            let metric = |value: &'static str, label: &'static str, color: u32| {
+        fn overview_page(&self, language: UiLanguage) -> impl IntoElement {
+            let project_count = self.workspace.projects().len();
+            let authorized_document_count = self
+                .project_data
+                .values()
+                .flat_map(|data| &data.documents)
+                .filter(|document| document.authorized)
+                .count();
+            let online_bridge_count =
+                usize::from(matches!(self.bridge_health, BridgeHealth::Listening { .. }));
+            let mut sessions = self
+                .project_data
+                .iter()
+                .flat_map(|(project_id, data)| {
+                    data.session_listing.sessions.iter().map(move |summary| {
+                        (
+                            project_id.clone(),
+                            summary.metadata.session_id.clone(),
+                            summary.metadata.status,
+                            summary.metadata.started_at_unix_seconds,
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            sessions.sort_by(|left, right| right.3.cmp(&left.3));
+            let recent_sessions = if sessions.is_empty() {
+                language
+                    .choose(
+                        "还没有已持久化的会话。请配置运行时后启动一次任务。",
+                        "No persisted sessions. Configure a runtime, then start a task.",
+                    )
+                    .to_owned()
+            } else {
+                sessions
+                    .into_iter()
+                    .take(3)
+                    .map(|(project_id, session_id, status, started_at)| {
+                        format!(
+                            "{session_id} · {} · {project_id} · {}",
+                            status.as_str(),
+                            rfc3339(started_at)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            let mut passed = 0_usize;
+            let mut failed = 0_usize;
+            let mut inconclusive = 0_usize;
+            let mut not_run = 0_usize;
+            for data in self.project_data.values() {
+                for snapshot in &data.semantic_snapshots {
+                    for constraint in &snapshot.constraints {
+                        match &constraint.status {
+                            FactStatus::Passed => passed += 1,
+                            FactStatus::Failed => failed += 1,
+                            FactStatus::Inconclusive => inconclusive += 1,
+                            FactStatus::NotRun => not_run += 1,
+                        }
+                    }
+                }
+            }
+
+            let metric = |value: String, label: &'static str, color: u32| {
                 div()
                     .flex_1()
                     .min_w(px(0.))
@@ -6070,7 +9015,7 @@ fn main() {
                     .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(label))
             };
 
-            let panel = |title: &'static str, body: &'static str| {
+            let panel = |title: &'static str, body: String| {
                 div()
                     .flex_1()
                     .min_w(px(0.))
@@ -6122,14 +9067,26 @@ fn main() {
                     div()
                         .flex()
                         .gap_3()
-                        .child(metric("0", language.choose("项目", "Projects"), 0x003b_82f6))
                         .child(metric(
-                            "0",
+                            project_count.to_string(),
+                            language.choose("项目", "Projects"),
+                            0x003b_82f6,
+                        ))
+                        .child(metric(
+                            authorized_document_count.to_string(),
                             language.choose("已授权文档", "Authorized documents"),
                             0x008b_5cf6,
                         ))
-                        .child(metric("0", language.choose("在线 bridge", "Online bridges"), 0x0022_c55e))
-                        .child(metric("0", language.choose("待审批", "Pending approvals"), 0x00f5_9e0b)),
+                        .child(metric(
+                            online_bridge_count.to_string(),
+                            language.choose("在线 bridge", "Online bridges"),
+                            self.bridge_health.dot(),
+                        ))
+                        .child(metric(
+                            "—".to_owned(),
+                            language.choose("待审批（未回读）", "Pending approvals (not read back)"),
+                            0x0094_a3b8,
+                        )),
                 )
                 .child(
                     div()
@@ -6137,25 +9094,54 @@ fn main() {
                         .gap_4()
                         .child(panel(
                             language.choose("运行时健康度", "Runtime health"),
-                            language.choose(
-                                "尚未连接——请在「智能体与工具」中配置运行时和 EDA bridge。",
-                                "Not connected — configure a runtime and EDA bridge in Agents & tools.",
+                            format!(
+                                "Codex App Server · {}\nEDA bridge · {}\n{}",
+                                self.codex_status.label(language),
+                                self.bridge_health.label(language),
+                                language.choose(
+                                    "状态来自受监管进程与最近一次 TCP 探测；未知并不表示在线。",
+                                    "Statuses come from supervised processes and the latest TCP probe; unknown is not online.",
+                                ),
                             ),
                         ))
                         .child(panel(
-                            language.choose("最近会话", "Recent sessions"),
-                            language.choose(
-                                "还没有会话历史。会话回放将在此显示。",
-                                "No session history yet. Session replay will appear here.",
-                            ),
+                            language.choose("最近会话与任务", "Recent sessions & tasks"),
+                            if self.task_cancel.is_some() {
+                                format!(
+                                    "{}\n{recent_sessions}",
+                                    language.choose("当前任务正在运行", "A runtime task is running")
+                                )
+                            } else {
+                                recent_sessions
+                            },
                         ))
-                        .child(panel(
-                            language.choose("需要关注", "Attention needed"),
-                            language.choose(
-                                "尚未记录验证结果。",
-                                "No verification result has been recorded.",
-                            ),
-                        )),
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .v_flex()
+                                .gap_3()
+                                .p_5()
+                                .bg(rgb(CARD_BG))
+                                .rounded_xl()
+                                .border_1()
+                                .border_color(rgb(BORDER))
+                                .shadow_xs()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(TEXT_PRIMARY))
+                                        .child(language.choose("待办与验证事实", "To-do & verification facts")),
+                                )
+                                .child(Self::overview_fact_rows(
+                                    language,
+                                    passed,
+                                    failed,
+                                    inconclusive,
+                                    not_run,
+                                )),
+                        ),
                 )
         }
     }
@@ -6163,11 +9149,16 @@ fn main() {
     impl ControlPlaneView {
         fn command_matches(&self, cx: &Context<Self>) -> Vec<ControlPlaneScreen> {
             let needle = self.command_search.read(cx).value().to_lowercase();
+            let project_selected = self.selected_project.is_some();
             ControlPlaneScreen::ALL
                 .into_iter()
+                // Project-scoped screens match the sidebar's disabled state:
+                // they only work with a selected project, so the palette does
+                // not offer them until one is open.
                 .filter(|screen| {
-                    needle.is_empty()
-                        || self.language.screen_label(*screen).to_lowercase().contains(&needle)
+                    (!screen.requires_project() || project_selected)
+                        && (needle.is_empty()
+                            || self.language.screen_label(*screen).to_lowercase().contains(&needle))
                 })
                 .collect()
         }
@@ -6215,33 +9206,57 @@ fn main() {
                 return;
             }
 
-            if !self.command_palette_open {
+            if self.command_palette_open {
+                match keystroke.key.as_str() {
+                    "escape" => self.close_command_palette(cx),
+                    "enter" => {
+                        let screen = self.command_matches(cx).get(self.command_selected).copied();
+                        if let Some(screen) = screen {
+                            self.command_activate(screen, cx);
+                        }
+                    }
+                    "up" => {
+                        let count = self.command_matches(cx).len();
+                        if count > 0 {
+                            self.command_selected = (self.command_selected + count - 1) % count;
+                            cx.notify();
+                        }
+                    }
+                    "down" => {
+                        let count = self.command_matches(cx).len();
+                        if count > 0 {
+                            self.command_selected = (self.command_selected + 1) % count;
+                            cx.notify();
+                        }
+                    }
+                    _ => {}
+                }
                 return;
             }
 
-            match keystroke.key.as_str() {
-                "escape" => self.close_command_palette(cx),
-                "enter" => {
-                    let screen = self.command_matches(cx).get(self.command_selected).copied();
-                    if let Some(screen) = screen {
-                        self.command_activate(screen, cx);
-                    }
-                }
-                "up" => {
-                    let count = self.command_matches(cx).len();
-                    if count > 0 {
-                        self.command_selected = (self.command_selected + count - 1) % count;
-                        cx.notify();
-                    }
-                }
-                "down" => {
-                    let count = self.command_matches(cx).len();
-                    if count > 0 {
-                        self.command_selected = (self.command_selected + 1) % count;
-                        cx.notify();
-                    }
-                }
-                _ => {}
+            // Outside the palette, Enter presses the default button of the
+            // top-most open dialog, exactly like clicking it.
+            if keystroke.key == "enter" {
+                self.press_default_dialog_button(window, cx);
+            }
+        }
+
+        /// Triggers the default (primary) action of the currently open modal
+        /// dialog: the startup vault prompt and quick unlock submit the typed
+        /// password, the new-project form confirms creation. Each action
+        /// reuses the button's own handler, so disabled states (e.g. a busy
+        /// unlock) suppress the key the same way they suppress the click.
+        fn press_default_dialog_button(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+            let vault_prompt_visible =
+                self.vault_prompt_open && self.vault.is_none() && self.vault_file_exists;
+            let quick_unlock_visible =
+                self.vault_quick_unlock_open && self.vault.is_none() && self.vault_file_exists;
+            if vault_prompt_visible || quick_unlock_visible {
+                self.unlock_vault(window, cx);
+                return;
+            }
+            if self.project_form_open {
+                self.create_project(window, cx);
             }
         }
 
@@ -7191,6 +10206,7 @@ fn main() {
         fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             self.refresh_codex_lifecycle();
             self.refresh_bridge_lifecycle();
+            self.sync_window_title(window);
             let command_palette = if self.command_palette_open {
                 Some(self.render_command_palette(cx).into_any_element())
             } else {
@@ -7220,6 +10236,7 @@ fn main() {
             let mut navigation = div().v_flex().gap_0p5();
             let mut current_group = "";
             let vault_unlocked = self.vault.is_some();
+            let project_selected = self.selected_project.is_some();
 
             for screen in ControlPlaneScreen::ALL {
                 if screen.group() != current_group {
@@ -7240,6 +10257,9 @@ fn main() {
                 let active = screen == active_screen;
                 let label = language.screen_label(screen);
                 let is_todo = screen.is_todo();
+                // Project-scoped screens stay gray and inert — no pointer,
+                // hover, or click — until a project is selected.
+                let unavailable = screen.requires_project() && !project_selected;
                 navigation = navigation.child(
                     div()
                         .id(format!("nav-{}", screen.label()))
@@ -7250,15 +10270,17 @@ fn main() {
                         .items_center()
                         .gap_2()
                         .rounded_md()
-                        .cursor_pointer()
                         .when(active, |this| this.bg(rgb(SIDEBAR_ITEM_ACTIVE)))
-                        .hover(|this| this.bg(rgb(SIDEBAR_ITEM_HOVER)))
-                        .active(|this| this.bg(rgb(SIDEBAR_ITEM_PRESSED)))
-                        .on_click(move |_, _, cx| {
-                            selector.update(cx, |view, cx| {
-                                view.screen = screen;
-                                cx.notify();
-                            });
+                        .when(!unavailable, |this| {
+                            this.cursor_pointer()
+                                .hover(|this| this.bg(rgb(SIDEBAR_ITEM_HOVER)))
+                                .active(|this| this.bg(rgb(SIDEBAR_ITEM_PRESSED)))
+                                .on_click(move |_, _, cx| {
+                                    selector.update(cx, |view, cx| {
+                                        view.screen = screen;
+                                        cx.notify();
+                                    });
+                                })
                         })
                         .child(
                             div()
@@ -7278,7 +10300,9 @@ fn main() {
                                 } else {
                                     FontWeight::NORMAL
                                 })
-                                .text_color(if active {
+                                .text_color(if unavailable {
+                                    rgb(SIDEBAR_GROUP)
+                                } else if active {
                                     rgb(SIDEBAR_TEXT_ACTIVE)
                                 } else {
                                     rgb(SIDEBAR_TEXT)
@@ -7312,7 +10336,11 @@ fn main() {
             }
 
             let page = match active_screen {
-                ControlPlaneScreen::Overview => Self::overview_page(language).into_any_element(),
+                ControlPlaneScreen::Overview => self.overview_page(language).into_any_element(),
+                ControlPlaneScreen::Semantics => self.render_semantics_page(cx).into_any_element(),
+                ControlPlaneScreen::BomAndExport => {
+                    self.render_bom_export_page(cx).into_any_element()
+                }
                 ControlPlaneScreen::Projects => {
                     self.render_projects_page(window, cx).into_any_element()
                 }
@@ -7325,6 +10353,14 @@ fn main() {
                 ControlPlaneScreen::SecretsVault => {
                     self.render_secrets_page(window, cx).into_any_element()
                 }
+                ControlPlaneScreen::Usage => {
+                    self.render_usage_audit_page(window, cx).into_any_element()
+                }
+                ControlPlaneScreen::Plugins => self.render_plugins_page(cx).into_any_element(),
+                ControlPlaneScreen::ChangesAndApprovals => {
+                    self.render_changes_approvals_page(cx).into_any_element()
+                }
+                ControlPlaneScreen::Settings => self.render_settings_page(cx).into_any_element(),
                 screen => Self::section_page(language, screen).into_any_element(),
             };
 
@@ -7516,8 +10552,7 @@ fn main() {
                                                 .label(language.toggle_label())
                                                 .on_click(move |_, _, cx| {
                                                     entity.update(cx, |view, cx| {
-                                                        view.language = view.language.toggled();
-                                                        cx.notify();
+                                                        view.toggle_global_language(cx);
                                                     });
                                                 }),
                                         ),
@@ -7624,5 +10659,46 @@ mod tests {
         shell.select_project("project-1".to_owned());
 
         assert_eq!(shell.selected_project(), Some("project-1"));
+    }
+
+    #[test]
+    fn only_project_scoped_screens_require_a_project() {
+        let project_independent = [
+            ControlPlaneScreen::Overview,
+            ControlPlaneScreen::Projects,
+            ControlPlaneScreen::Documents,
+            ControlPlaneScreen::EdaServices,
+            ControlPlaneScreen::AgentsAndMcp,
+            ControlPlaneScreen::SessionsAndTasks,
+            ControlPlaneScreen::Plugins,
+            ControlPlaneScreen::Usage,
+            ControlPlaneScreen::SecretsVault,
+            ControlPlaneScreen::Settings,
+        ];
+        for screen in project_independent {
+            assert!(
+                !screen.requires_project(),
+                "{screen:?} should stay usable without a selected project"
+            );
+        }
+        for screen in [
+            ControlPlaneScreen::Semantics,
+            ControlPlaneScreen::ChangesAndApprovals,
+            ControlPlaneScreen::BomAndExport,
+        ] {
+            assert!(
+                screen.requires_project(),
+                "{screen:?} should require a selected project"
+            );
+        }
+    }
+
+    #[test]
+    fn window_title_names_the_selected_project() {
+        assert_eq!(app_window_title(None), "CircuitFabric");
+        assert_eq!(
+            app_window_title(Some("信号链原型")),
+            "CircuitFabric — 信号链原型"
+        );
     }
 }

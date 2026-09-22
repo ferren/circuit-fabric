@@ -16,6 +16,7 @@ circuitfabric-contracts.workspace = true
 circuitfabric-project.workspace = true
 jlcircuit-eda-bridge.workspace = true
 serde_json.workspace = true
+serde.workspace = true
 gpui = { git = "https://github.com/zed-industries/zed", optional = true }
 gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "731e33c780357007c8316cefab8583590032812f", optional = true }
 gpui_platform = { git = "https://github.com/zed-industries/zed", optional = true, features = ["font-kit"] }
