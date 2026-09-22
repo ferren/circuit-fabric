@@ -26,6 +26,12 @@ pub struct DocumentService {
 }
 
 impl DocumentService {
+    /// Returns whether this project has an indexed, citation-ready document with this id.
+    #[must_use]
+    pub fn is_indexed(&self, project_id: &str, document_id: &str) -> bool {
+        self.documents.contains_key(&(project_id.to_owned(), document_id.to_owned()))
+    }
+
     /// Registers already-extracted text and derives citation-ready line fragments.
     ///
     /// Document identifiers are scoped per project: two projects may register the same `id`

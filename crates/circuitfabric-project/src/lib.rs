@@ -13,10 +13,15 @@ use circuitfabric_document::{DocumentError, DocumentService};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod changesets;
 mod documents;
 mod sessions;
 mod storage;
 
+pub use changesets::{
+    ChangeSetAuditEntry, ChangeSetEvidenceRef, ChangeSetExecutionReport, ChangeSetStage,
+    ChangeSetStageStatus, StoredChangeSet,
+};
 pub use documents::{
     DocumentCategory, DocumentImport, ProjectDocument, classify_document_kind, is_text_extractable,
 };
@@ -26,8 +31,9 @@ pub use sessions::{
     rfc3339,
 };
 pub use storage::{
-    PROJECT_REGISTRY_SCHEMA_VERSION, PROJECT_STORAGE_SCHEMA_VERSION, ProjectLayoutDiagnostics,
-    ProjectManifest, ProjectRegistry, ProjectRegistryEntry, ProjectStorage, ProjectStorageError,
+    CHANGESET_SCHEMA_VERSION, PROJECT_REGISTRY_SCHEMA_VERSION, PROJECT_STORAGE_SCHEMA_VERSION,
+    ProjectLayoutDiagnostics, ProjectManifest, ProjectRegistry, ProjectRegistryEntry,
+    ProjectStorage, ProjectStorageError,
 };
 
 #[derive(Debug, Error)]
@@ -160,6 +166,13 @@ impl ProjectWorkspace {
         Ok(self.documents.retrieve(project_id, query))
     }
 
+    /// Returns whether an authorized document passed integrity verification and was indexed
+    /// into citation-ready text for this project.
+    #[must_use]
+    pub fn is_document_evidence_available(&self, project_id: &str, document_id: &str) -> bool {
+        self.documents.is_indexed(project_id, document_id)
+    }
+
     /// Imports a user-selected file as an authorized document of this project's root and
     /// registers its extractable text for evidence retrieval.
     ///
@@ -220,7 +233,10 @@ impl ProjectWorkspace {
         }
         // An unreadable or non-UTF-8 copy simply has no citable text; the index record keeps
         // the document visible with its hash and provenance.
-        let Ok(bytes) = storage.read_document_content(document) else {
+        // Hash verification is deliberately part of the indexing boundary.  A document whose
+        // managed copy was changed after authorization is retained in the registry for audit,
+        // but cannot be surfaced through evidence retrieval.
+        let Ok(bytes) = storage.read_verified_document_content(document) else {
             return false;
         };
         let Ok(text) = String::from_utf8(bytes) else {
@@ -423,6 +439,36 @@ mod tests {
         assert_eq!(workspace.hydrate_project_documents("binary", &storage).expect("hydrate"), 0);
         let evidence = workspace.retrieve_document_evidence("binary", "PDF").expect("retrieve");
         assert!(evidence.fragments.is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_tampered_managed_copy_is_never_rehydrated_as_evidence() {
+        let root = test_root("evidence-tamper");
+        let storage = ProjectStorage::create(&root, project("tamper")).expect("project");
+        let mut workspace = ProjectWorkspace::default();
+        workspace.create_project(project("tamper")).expect("project");
+        let source = root.join("reference.md");
+        fs::write(&source, "The reference requires a 1uF capacitor.").expect("write source");
+        let document = workspace
+            .import_project_document("tamper", &storage, &source, DocumentCategory::Datasheet)
+            .expect("import")
+            .document;
+
+        fs::write(storage.root().join(&document.relative_path), "tampered contents")
+            .expect("tamper managed copy");
+
+        let mut restarted = ProjectWorkspace::default();
+        restarted.create_project(project("tamper")).expect("project");
+        assert_eq!(restarted.hydrate_project_documents("tamper", &storage).expect("hydrate"), 0);
+        assert!(!restarted.is_document_evidence_available("tamper", &document.id));
+        assert!(
+            restarted
+                .retrieve_document_evidence("tamper", "capacitor")
+                .expect("retrieve")
+                .fragments
+                .is_empty()
+        );
         let _ = fs::remove_dir_all(&root);
     }
 

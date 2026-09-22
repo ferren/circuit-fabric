@@ -10,11 +10,15 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use circuitfabric_contracts::{Project, ProjectId};
+use circuitfabric_contracts::{LogicalCircuitSnapshot, Project, ProjectId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::ProjectConfiguration;
+use crate::{ChangeSetAuditEntry, StoredChangeSet};
+
+/// Schema version for JSON records in `logic/changesets`.
+pub const CHANGESET_SCHEMA_VERSION: u32 = 1;
 
 /// Version of the persisted workspace manifest and its companion metadata files.
 pub const PROJECT_STORAGE_SCHEMA_VERSION: u32 = 1;
@@ -162,6 +166,20 @@ pub enum ProjectStorageError {
     ParseSession { path: PathBuf, reason: String },
     #[error("a session cannot be completed with status `running`")]
     InvalidCompletionStatus,
+    #[error("cannot read logical snapshot `{path}`: {source}")]
+    ReadLogicalSnapshot { path: PathBuf, source: io::Error },
+    #[error("cannot parse logical snapshot `{path}`: {source}")]
+    ParseLogicalSnapshot { path: PathBuf, source: serde_json::Error },
+    #[error("cannot read ChangeSet `{path}`: {source}")]
+    ReadChangeSet { path: PathBuf, source: io::Error },
+    #[error("cannot parse ChangeSet `{path}`: {source}")]
+    ParseChangeSet { path: PathBuf, source: serde_json::Error },
+    #[error("ChangeSet ID `{id}` is invalid")]
+    InvalidChangeSetId { id: String },
+    #[error("ChangeSet `{id}` does not exist")]
+    ChangeSetNotFound { id: String },
+    #[error("ChangeSet `{id}` was not approved because observed state does not match baseline")]
+    ChangeSetBaselineMismatch { id: String },
 }
 
 /// The only filesystem entry point for a project root.
@@ -270,6 +288,122 @@ impl ProjectStorage {
         self.root.join(CIRCUITFABRIC_DIRECTORY).join(DOCUMENT_INDEX_FILE)
     }
 
+    /// Returns the immutable logical snapshots available to this project, ordered by their
+    /// on-disk identifier. This is deliberately read-only: importing or materializing a
+    /// snapshot belongs to an EDA backend, while the control plane only projects its facts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the reserved snapshot directory cannot be read, or a snapshot is
+    /// not valid JSON for the current logical-circuit contract.
+    pub fn list_logical_snapshots(
+        &self,
+    ) -> Result<Vec<LogicalCircuitSnapshot>, ProjectStorageError> {
+        let directory = self.resolve_relative_path("logic/snapshots")?;
+        let entries = fs::read_dir(&directory).map_err(|source| ProjectStorageError::Io {
+            action: "list logical snapshots",
+            path: directory.clone(),
+            source,
+        })?;
+
+        let mut paths = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|source| ProjectStorageError::Io {
+                action: "read logical snapshot directory entry",
+                path: directory.clone(),
+                source,
+            })?;
+            let path = entry.path();
+            if path.extension().is_some_and(|extension| extension == "json") {
+                paths.push(path);
+            }
+        }
+        paths.sort();
+
+        paths
+            .into_iter()
+            .map(|path| {
+                let raw = fs::read_to_string(&path).map_err(|source| {
+                    ProjectStorageError::ReadLogicalSnapshot { path: path.clone(), source }
+                })?;
+                serde_json::from_str(&raw)
+                    .map_err(|source| ProjectStorageError::ParseLogicalSnapshot { path, source })
+            })
+            .collect()
+    }
+
+    /// Lists persisted ChangeSets in stable path order.  The control plane only reads these
+    /// records; materializers are responsible for creating their proposed plans.
+    pub fn list_change_sets(&self) -> Result<Vec<StoredChangeSet>, ProjectStorageError> {
+        let directory = self.resolve_relative_path("logic/changesets")?;
+        let entries = fs::read_dir(&directory).map_err(|source| ProjectStorageError::Io {
+            action: "list ChangeSets",
+            path: directory.clone(),
+            source,
+        })?;
+        let mut paths = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|source| ProjectStorageError::Io {
+                action: "read ChangeSet directory entry",
+                path: directory.clone(),
+                source,
+            })?;
+            let path = entry.path();
+            if path.extension().is_some_and(|extension| extension == "json") {
+                paths.push(path);
+            }
+        }
+        paths.sort();
+        paths
+            .into_iter()
+            .map(|path| {
+                let raw = fs::read_to_string(&path).map_err(|source| {
+                    ProjectStorageError::ReadChangeSet { path: path.clone(), source }
+                })?;
+                let record: StoredChangeSet = serde_json::from_str(&raw)
+                    .map_err(|source| ProjectStorageError::ParseChangeSet { path, source })?;
+                if record.schema_version != CHANGESET_SCHEMA_VERSION {
+                    return Err(ProjectStorageError::InvalidChangeSetId { id: record.id });
+                }
+                validate_change_set_id(&record.id)?;
+                Ok(record)
+            })
+            .collect()
+    }
+
+    /// Atomically writes a ChangeSet record supplied by a materialization backend.
+    pub fn save_change_set(&self, record: &StoredChangeSet) -> Result<(), ProjectStorageError> {
+        validate_change_set_id(&record.id)?;
+        if record.schema_version != CHANGESET_SCHEMA_VERSION {
+            return Err(ProjectStorageError::InvalidChangeSetId { id: record.id.clone() });
+        }
+        Self::write_json_atomically(&self.change_set_path(&record.id)?, record)
+    }
+
+    /// Appends an immutable approval or rejection audit entry and persists it atomically.
+    /// Approval is rejected unless the actual current observation and recorded readback both
+    /// match the ChangeSet baseline; callers should disable the UI action on the same predicate.
+    pub fn record_change_set_decision(
+        &self,
+        id: &str,
+        current_observation: Option<&str>,
+        entry: ChangeSetAuditEntry,
+    ) -> Result<(), ProjectStorageError> {
+        let path = self.change_set_path(id)?;
+        if !path.exists() {
+            return Err(ProjectStorageError::ChangeSetNotFound { id: id.to_owned() });
+        }
+        let raw = fs::read_to_string(&path)
+            .map_err(|source| ProjectStorageError::ReadChangeSet { path: path.clone(), source })?;
+        let mut record: StoredChangeSet = serde_json::from_str(&raw)
+            .map_err(|source| ProjectStorageError::ParseChangeSet { path: path.clone(), source })?;
+        if entry.decision == "approved" && !record.approval_allowed(current_observation) {
+            return Err(ProjectStorageError::ChangeSetBaselineMismatch { id: id.to_owned() });
+        }
+        record.audit.push(entry);
+        self.save_change_set(&record)
+    }
+
     /// Loads this project's persisted configuration (skill and MCP allow-lists, instructions).
     ///
     /// # Errors
@@ -372,6 +506,11 @@ impl ProjectStorage {
             }
         }
         Ok(candidate)
+    }
+
+    fn change_set_path(&self, id: &str) -> Result<PathBuf, ProjectStorageError> {
+        validate_change_set_id(id)?;
+        self.resolve_relative_path(Path::new("logic/changesets").join(format!("{id}.json")))
     }
 
     /// Returns the reserved directory for a registered-style EDA backend identifier.
@@ -653,6 +792,18 @@ fn validate_relative_path(path: &Path) -> Result<(), ProjectStorageError> {
     Ok(())
 }
 
+fn validate_change_set_id(id: &str) -> Result<(), ProjectStorageError> {
+    let path = Path::new(id);
+    if id.trim().is_empty()
+        || path.is_absolute()
+        || path.components().count() != 1
+        || !path.components().all(|component| matches!(component, Component::Normal(_)))
+    {
+        return Err(ProjectStorageError::InvalidChangeSetId { id: id.to_owned() });
+    }
+    Ok(())
+}
+
 fn nearest_existing_ancestor<'a>(candidate: &'a Path, root: &'a Path) -> PathBuf {
     let mut ancestor = candidate.to_owned();
     while !ancestor.exists() && ancestor != root {
@@ -795,6 +946,48 @@ mod tests {
     }
 
     #[test]
+    fn logical_snapshots_are_loaded_in_stable_path_order() {
+        let root = test_root("logical-snapshots");
+        let storage =
+            ProjectStorage::create(&root, project("semantic-project")).expect("create project");
+        let first =
+            LogicalCircuitSnapshot::empty(circuitfabric_contracts::SnapshotAuthority::Observed);
+        let second =
+            LogicalCircuitSnapshot::empty(circuitfabric_contracts::SnapshotAuthority::Verified);
+        fs::write(
+            root.join("logic/snapshots/b.json"),
+            serde_json::to_vec(&second).expect("serialize second snapshot"),
+        )
+        .expect("write second snapshot");
+        fs::write(
+            root.join("logic/snapshots/a.json"),
+            serde_json::to_vec(&first).expect("serialize first snapshot"),
+        )
+        .expect("write first snapshot");
+
+        let snapshots = storage.list_logical_snapshots().expect("list snapshots");
+
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0].authority, circuitfabric_contracts::SnapshotAuthority::Observed);
+        assert_eq!(snapshots[1].authority, circuitfabric_contracts::SnapshotAuthority::Verified);
+        remove_test_root(&root);
+    }
+
+    #[test]
+    fn malformed_logical_snapshot_is_not_silently_ignored() {
+        let root = test_root("logical-snapshot-corrupt");
+        let storage =
+            ProjectStorage::create(&root, project("semantic-project")).expect("create project");
+        fs::write(root.join("logic/snapshots/bad.json"), "not JSON")
+            .expect("write corrupt snapshot");
+
+        let error = storage.list_logical_snapshots().expect_err("corrupt snapshot is reported");
+
+        assert!(matches!(error, ProjectStorageError::ParseLogicalSnapshot { .. }));
+        remove_test_root(&root);
+    }
+
+    #[test]
     fn path_resolution_rejects_traversal_and_invalid_backend_ids() {
         let root = test_root("path-safety");
         let storage = ProjectStorage::create(&root, project("safe")).expect("create project");
@@ -864,6 +1057,60 @@ mod tests {
         );
         remove_test_root(&project_root);
         remove_test_root(&registry_root);
+    }
+
+    #[test]
+    fn approval_audit_round_trips_and_rejects_a_stale_observation() {
+        let root = test_root("changeset-approval");
+        let storage = ProjectStorage::create(&root, project("changeset-project")).expect("project");
+        let record = StoredChangeSet {
+            schema_version: CHANGESET_SCHEMA_VERSION,
+            id: "cs-approval".to_owned(),
+            base_snapshot_hash: "baseline".to_owned(),
+            target_snapshot_hash: "target".to_owned(),
+            plan_hash: "plan".to_owned(),
+            ir_diff: vec!["add R1".to_owned()],
+            evidence: Vec::new(),
+            execution: crate::ChangeSetExecutionReport {
+                verification: crate::ChangeSetStage {
+                    status: crate::ChangeSetStageStatus::Passed,
+                    detail: "verified".to_owned(),
+                },
+                ..crate::ChangeSetExecutionReport::default()
+            },
+            observed_snapshot_hash: Some("baseline".to_owned()),
+            rollback_handle: Some("rollback://cs-approval".to_owned()),
+            audit: Vec::new(),
+        };
+        storage.save_change_set(&record).expect("save changeset");
+        let entry = ChangeSetAuditEntry {
+            timestamp_unix_seconds: 1,
+            actor: "reviewer".to_owned(),
+            decision: "approved".to_owned(),
+            reason: "checked".to_owned(),
+            observed_snapshot_hash: Some("baseline".to_owned()),
+            rollback_handle: record.rollback_handle.clone(),
+        };
+        storage
+            .record_change_set_decision("cs-approval", Some("baseline"), entry)
+            .expect("approval with matching observation");
+        let loaded = storage.list_change_sets().expect("load changesets");
+        assert_eq!(loaded[0].audit.len(), 1);
+        assert_eq!(loaded[0].audit[0].rollback_handle.as_deref(), Some("rollback://cs-approval"));
+
+        let stale = ChangeSetAuditEntry {
+            timestamp_unix_seconds: 2,
+            actor: "reviewer".to_owned(),
+            decision: "approved".to_owned(),
+            reason: "stale".to_owned(),
+            observed_snapshot_hash: Some("different".to_owned()),
+            rollback_handle: None,
+        };
+        let error = storage
+            .record_change_set_decision("cs-approval", Some("different"), stale)
+            .expect_err("stale baseline must not be approved");
+        assert!(matches!(error, ProjectStorageError::ChangeSetBaselineMismatch { .. }));
+        remove_test_root(&root);
     }
 
     #[cfg(windows)]

@@ -251,6 +251,32 @@ impl crate::ProjectStorage {
         })
     }
 
+    /// Reads a managed document only after confirming that it still matches the content hash
+    /// recorded at authorization time.
+    ///
+    /// This is the integrity-scan gate for evidence indexing.  Callers must use this method,
+    /// rather than [`Self::read_document_content`], before deriving searchable evidence: a
+    /// modified, missing, or otherwise invalid managed copy must never become an evidence
+    /// source.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying read error or [`ProjectStorageError::ManagedCopyConflict`] when
+    /// the managed bytes no longer match the authorized content hash.
+    pub fn read_verified_document_content(
+        &self,
+        document: &ProjectDocument,
+    ) -> Result<Vec<u8>, ProjectStorageError> {
+        let bytes = self.read_document_content(document)?;
+        let actual_hash = format!("sha256:{:x}", Sha256::digest(&bytes));
+        if actual_hash != document.content_hash {
+            return Err(ProjectStorageError::ManagedCopyConflict {
+                path: self.resolve_relative_path(&document.relative_path)?,
+            });
+        }
+        Ok(bytes)
+    }
+
     pub(crate) fn load_document_index(&self) -> Result<DocumentIndex, ProjectStorageError> {
         let path = self.document_index_path();
         let raw = fs::read_to_string(&path).map_err(|source| {
