@@ -1,0 +1,29 @@
+{
+  "id": "jlcircuit-eda",
+  "version": "0.1.0",
+  "kind": "eda-backend",
+  "apiVersion": "circuitfabric-plugin/v1",
+  "capabilities": [
+    "inspect",
+    "preview",
+    "apply",
+    "readback",
+    "rollback",
+    "drc",
+    "visual-capture",
+    "bridge-chat",
+    "bridge-context"
+  ],
+  "requestedPermissions": [
+    "project.read",
+    "project.write",
+    "eda.bridge.connect"
+  ],
+  "versionLock": "0.1.0",
+  "signature": {
+    "status": "unsigned"
+  },
+  "isolation": "supervised-process",
+  "health": "unknown",
+  "entrypoint": "circuitfabric-jlc-bridge"
+}

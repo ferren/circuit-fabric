@@ -64,62 +64,73 @@ fn serve_connection(mut stream: TcpStream, config_path: &std::path::Path) -> Res
         let message: Value = serde_json::from_str(&raw).map_err(|error| error.to_string())?;
         match message.get("type").and_then(Value::as_str) {
             Some("hello") => {
-                let requested_project = message
+                if message
                     .get("projectId")
                     .and_then(Value::as_str)
-                    .filter(|value| !value.trim().is_empty())
-                    .ok_or_else(|| "hello requires a projectId".to_owned())?;
-                if project_id.as_deref() != Some(requested_project) {
+                    .is_none_or(|id| id.trim().is_empty())
+                {
+                    project_id = None;
                     threads.clear();
-                }
-                // A missing registry file means "no projects registered yet" —
-                // the same semantics the desktop uses — not a broken bridge.
-                let registry = match ProjectRegistry::load_or_default(
-                    config_path.with_file_name("projects.json"),
-                ) {
-                    Ok(registry) => registry,
-                    Err(error) => {
-                        let _ = send_json(
-                            &mut stream,
-                            json!({
-                                "type": "error",
-                                "message": format!("项目注册表无法读取：{error}"),
-                            }),
-                        );
-                        return Err(error.to_string());
-                    }
-                };
-                if registry.root_for(requested_project).is_none() {
-                    // Reject with an error message instead of silently dropping
-                    // the socket, so the EDA extension shows the real reason
-                    // rather than a generic "bridge not running".
-                    let known: Vec<&str> =
-                        registry.entries().map(|entry| entry.project_id.as_str()).collect();
-                    let _ = send_json(
+                    previous_snapshot = None;
+                    send_json(
                         &mut stream,
                         json!({
-                            "type": "error",
-                            "message": format!(
-                                "项目 `{requested_project}` 未注册。可用项目 ID：{}。请先在 CircuitFabric 桌面端创建或打开项目。",
-                                if known.is_empty() { "（无）".to_owned() } else { known.join(", ") }
-                            ),
+                            "type": "hello_ack", "protocolVersion": BRIDGE_PROTOCOL_VERSION,
+                            "bridge": "CircuitFabric", "projectId": null,
                         }),
-                    );
-                    return Err("项目未注册，拒绝连接".to_owned());
+                    )?;
+                    continue;
                 }
-                project_id = Some(requested_project.to_owned());
-                send_json(
+                // Keep legacy hello-with-project clients compatible.
+                select_project(
                     &mut stream,
-                    json!({
-                        "type": "hello_ack",
-                        "protocolVersion": BRIDGE_PROTOCOL_VERSION,
-                        "bridge": "CircuitFabric",
-                    }),
+                    config_path,
+                    &message,
+                    &mut project_id,
+                    &mut threads,
+                    &mut previous_snapshot,
+                    "hello_ack",
+                )?;
+            }
+            Some("list_projects") => {
+                match ProjectRegistry::load_or_default(config_path.with_file_name("projects.json"))
+                {
+                    Ok(registry) => {
+                        let projects: Vec<Value> = registry
+                            .entries()
+                            .map(|entry| {
+                                json!({
+                                    "id": entry.project_id, "name": entry.display_name,
+                                })
+                            })
+                            .collect();
+                        send_json(&mut stream, json!({"type": "projects", "projects": projects}))?;
+                    }
+                    Err(error) => send_json(
+                        &mut stream,
+                        json!({"type": "error", "requestType": "list_projects", "message": format!("项目列表读取失败：{error}")}),
+                    )?,
+                }
+            }
+            Some("select_project") => {
+                select_project(
+                    &mut stream,
+                    config_path,
+                    &message,
+                    &mut project_id,
+                    &mut threads,
+                    &mut previous_snapshot,
+                    "project_selected",
                 )?;
             }
             Some("chat") => {
-                let project_id =
-                    project_id.as_deref().ok_or_else(|| "send hello before chat".to_owned())?;
+                let Some(project_id) = project_id.as_deref() else {
+                    send_json(
+                        &mut stream,
+                        json!({"type": "error", "message": "请先从项目列表选择一个项目。"}),
+                    )?;
+                    continue;
+                };
                 let session_id = message
                     .get("sessionId")
                     .and_then(Value::as_str)
@@ -215,11 +226,8 @@ fn serve_connection(mut stream: TcpStream, config_path: &std::path::Path) -> Res
             }
             Some("ping") => send_json(&mut stream, json!({ "type": "pong" }))?,
             Some("status") => {
-                // Connection-test surface for the desktop control plane: reports the
-                // protocol version, the plugin manifest's declared capabilities, and
-                // the registered project IDs — the same registry gate the EDA
-                // extension's hello depends on, so the desktop test can explain an
-                // EDA-side connect failure instead of reporting success in isolation.
+                // Desktop connection test: protocol, capabilities, and projects
+                // available for selection after the EDA client connects.
                 let bridge_manifest = jlcircuit_eda_bridge::JlcircuitEdaBridge::default();
                 let manifest = bridge_manifest.manifest();
                 let projects: Vec<String> =
@@ -250,6 +258,73 @@ fn serve_connection(mut stream: TcpStream, config_path: &std::path::Path) -> Res
             )?,
         }
     }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn select_project(
+    stream: &mut TcpStream,
+    config_path: &std::path::Path,
+    message: &Value,
+    project_id: &mut Option<String>,
+    threads: &mut BTreeMap<String, String>,
+    previous_snapshot: &mut Option<Vec<Vec<u8>>>,
+    ack_type: &str,
+) -> Result<(), String> {
+    *project_id = None;
+    threads.clear();
+    *previous_snapshot = None;
+    let Some(requested_project) =
+        message.get("projectId").and_then(Value::as_str).filter(|value| !value.trim().is_empty())
+    else {
+        return send_json(
+            stream,
+            json!({"type": "error", "requestType": "select_project", "message": "请从项目列表选择一个项目。"}),
+        );
+    };
+    // A missing registry file means "no projects registered yet" —
+    // the same semantics the desktop uses — not a broken bridge.
+    let registry =
+        match ProjectRegistry::load_or_default(config_path.with_file_name("projects.json")) {
+            Ok(registry) => registry,
+            Err(error) => {
+                let _ = send_json(
+                    stream,
+                    json!({
+                        "type": "error", "requestType": "select_project",
+                        "message": format!("项目注册表无法读取：{error}"),
+                    }),
+                );
+                return Ok(());
+            }
+        };
+    if registry.root_for(requested_project).is_none() {
+        // Reject with an error message instead of silently dropping
+        // the socket, so the EDA extension shows the real reason
+        // rather than a generic "bridge not running".
+        let known: Vec<&str> = registry.entries().map(|entry| entry.project_id.as_str()).collect();
+        let _ = send_json(
+            stream,
+            json!({
+                "type": "error", "requestType": "select_project",
+                "message": format!(
+                    "项目 `{requested_project}` 未注册。可用项目 ID：{}。请先在 CircuitFabric 桌面端创建或打开项目。",
+                    if known.is_empty() { "（无）".to_owned() } else { known.join(", ") }
+                ),
+            }),
+        );
+        return Ok(());
+    }
+    *project_id = Some(requested_project.to_owned());
+    send_json(
+        stream,
+        json!({
+            "type": ack_type,
+            "projectId": requested_project,
+            "protocolVersion": BRIDGE_PROTOCOL_VERSION,
+            "bridge": "CircuitFabric",
+        }),
+    )?;
     Ok(())
 }
 

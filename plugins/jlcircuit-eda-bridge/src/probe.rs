@@ -23,7 +23,7 @@ pub struct BridgeStatusReport {
     pub protocol_version: u64,
     pub bridge_name: String,
     pub capabilities: Vec<String>,
-    /// Registered project IDs — the gate the EDA extension's `hello` depends on.
+    /// Registered project IDs available for selection after the EDA connects.
     pub projects: Vec<String>,
 }
 
@@ -87,8 +87,7 @@ pub fn status(address: &str, timeout: Duration) -> Result<BridgeStatusReport, St
     })
 }
 
-/// Performs the same `hello` handshake the EDA extension sends, for the exact
-/// connect path an EDA client takes.
+/// Performs the legacy `hello` handshake with a project binding.
 ///
 /// # Errors
 ///

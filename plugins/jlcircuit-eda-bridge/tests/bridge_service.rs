@@ -104,6 +104,8 @@ fn supervised_bridge_reports_status_and_stops_cleanly() {
         "no projects are registered in the temporary settings directory"
     );
 
+    verify_project_selection(&address, &dir);
+
     // The extension's connect path: hello with an unregistered project must be
     // rejected WITH an explanatory error reply — never a silent socket drop.
     let rejection = probe::hello(&address, "default-project", Duration::from_secs(3))
@@ -147,4 +149,63 @@ fn supervised_bridge_reports_status_and_stops_cleanly() {
     );
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+fn verify_project_selection(address: &str, dir: &Path) {
+    use serde_json::json;
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(address).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    stream.write_all(b"GET /bridge HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n").unwrap();
+    let mut headers = Vec::new();
+    while !headers.ends_with(b"\r\n\r\n") {
+        let mut byte = [0];
+        stream.read_exact(&mut byte).unwrap();
+        headers.push(byte[0]);
+    }
+    assert!(headers.starts_with(b"HTTP/1.1 101"));
+    let mut exchange = |message: serde_json::Value| {
+        let payload = message.to_string();
+        assert!(payload.len() < 126);
+        let length = u8::try_from(payload.len()).unwrap();
+        stream.write_all(&[0x81, 0x80 | length, 0, 0, 0, 0]).unwrap();
+        stream.write_all(payload.as_bytes()).unwrap();
+        let mut header = [0; 2];
+        stream.read_exact(&mut header).unwrap();
+        let length = if header[1] == 126 {
+            let mut bytes = [0; 2];
+            stream.read_exact(&mut bytes).unwrap();
+            usize::from(u16::from_be_bytes(bytes))
+        } else {
+            usize::from(header[1])
+        };
+        let mut reply = vec![0; length];
+        stream.read_exact(&mut reply).unwrap();
+        serde_json::from_slice::<serde_json::Value>(&reply).unwrap()
+    };
+    assert_eq!(exchange(json!({"type":"hello"}))["type"], "hello_ack");
+    assert_eq!(exchange(json!({"type":"list_projects"}))["projects"], json!([]));
+    assert_eq!(exchange(json!({"type":"chat"}))["type"], "error");
+    write_registry(dir, "first-project");
+    assert_eq!(
+        exchange(json!({"type":"list_projects"}))["projects"],
+        json!([{"id":"first-project","name":"Power Supply"}])
+    );
+    assert_eq!(
+        exchange(json!({"type":"select_project","projectId":"first-project"}))["projectId"],
+        "first-project"
+    );
+    write_registry(dir, "second-project");
+    assert_eq!(
+        exchange(json!({"type":"select_project","projectId":"second-project"}))["projectId"],
+        "second-project"
+    );
+    let rejection = exchange(json!({"type":"select_project","projectId":"missing"}));
+    assert_eq!(rejection["type"], "error");
+    assert!(rejection["message"].as_str().unwrap().contains("second-project"));
+    assert_eq!(exchange(json!({"type":"chat"}))["type"], "error");
+    assert_eq!(
+        exchange(json!({"type":"select_project","projectId":"second-project"}))["type"],
+        "project_selected"
+    );
 }

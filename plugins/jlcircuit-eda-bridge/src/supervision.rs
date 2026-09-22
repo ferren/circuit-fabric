@@ -104,7 +104,9 @@ impl BridgeProcessHandle {
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|error| format!("启动 bridge 失败（{}）：{error}", Path::new(&program).display()))?;
+            .map_err(|error| {
+                format!("启动 bridge 失败（{}）：{error}", Path::new(&program).display())
+            })?;
         let ownership = ProcessOwnership::attach(&mut child)
             .map_err(|error| format!("无法监管 bridge 进程：{error}"))?;
         Ok(Self { child, ownership: Some(ownership) })
