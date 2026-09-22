@@ -183,7 +183,13 @@ impl ToolCatalog {
         arguments: &Value,
         secrets: Option<&crate::secrets::SecretValues>,
     ) -> Result<Value, RuntimeError> {
-        self.mcp_request(id, grants, "tools/call", &json!({"name":name,"arguments":arguments}), secrets)
+        self.mcp_request(
+            id,
+            grants,
+            "tools/call",
+            &json!({"name":name,"arguments":arguments}),
+            secrets,
+        )
     }
 
     #[allow(clippy::too_many_lines)]
@@ -340,7 +346,9 @@ fn redact_value(
 ) {
     match value {
         Value::String(text) => *text = crate::execution::redact(text, "", &[server], secrets),
-        Value::Array(items) => items.iter_mut().for_each(|item| redact_value(item, server, secrets)),
+        Value::Array(items) => {
+            items.iter_mut().for_each(|item| redact_value(item, server, secrets))
+        }
         Value::Object(fields) => {
             fields.values_mut().for_each(|item| redact_value(item, server, secrets));
         }

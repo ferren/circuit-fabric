@@ -29,6 +29,81 @@ pub mod execution;
 pub mod secrets;
 pub mod tools;
 
+/// Application-wide presentation and storage preferences.
+///
+/// These values intentionally contain no credentials.  A secret-storage choice
+/// selects the source used by the desktop shell; API-key values remain either
+/// in the process environment or in the separately encrypted vault.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GlobalTheme {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GlobalLanguage {
+    #[default]
+    SimplifiedChinese,
+    English,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretStorageProvider {
+    /// Read credential values only from the process environment.
+    Environment,
+    /// Use CircuitFabric's separately encrypted local vault.
+    #[default]
+    EncryptedVault,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogLevel {
+    Error,
+    Warn,
+    #[default]
+    Info,
+    Debug,
+    Trace,
+}
+
+fn default_data_directory() -> PathBuf {
+    RuntimeSettings::default_path()
+        .parent()
+        .map_or_else(|| PathBuf::from(".circuitfabric"), Path::to_path_buf)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GlobalPreferences {
+    #[serde(default)]
+    pub theme: GlobalTheme,
+    #[serde(default)]
+    pub language: GlobalLanguage,
+    #[serde(default = "default_data_directory")]
+    pub data_directory: PathBuf,
+    #[serde(default)]
+    pub secret_storage_provider: SecretStorageProvider,
+    #[serde(default)]
+    pub log_level: LogLevel,
+}
+
+impl Default for GlobalPreferences {
+    fn default() -> Self {
+        Self {
+            theme: GlobalTheme::default(),
+            language: GlobalLanguage::default(),
+            data_directory: default_data_directory(),
+            secret_storage_provider: SecretStorageProvider::default(),
+            log_level: LogLevel::default(),
+        }
+    }
+}
+
 /// An OpenAI-compatible model provider configured by the desktop control plane.
 ///
 /// API keys are intentionally represented only by environment-variable names.
@@ -174,6 +249,8 @@ pub struct RuntimeSettings {
     pub catalog: tools::ToolCatalog,
     #[serde(default)]
     pub adapters: execution::AdapterSettings,
+    #[serde(default)]
+    pub global_preferences: GlobalPreferences,
 }
 
 impl Default for RuntimeSettings {
@@ -186,6 +263,7 @@ impl Default for RuntimeSettings {
             tools: ToolAuthorizationSettings::default(),
             catalog: tools::ToolCatalog::default(),
             adapters: execution::AdapterSettings::default(),
+            global_preferences: GlobalPreferences::default(),
         }
     }
 }
@@ -236,6 +314,11 @@ impl RuntimeSettings {
         if self.codex.working_directory.as_os_str().is_empty() {
             return Err(RuntimeError::InvalidSettings(
                 "Codex working directory must not be empty".to_owned(),
+            ));
+        }
+        if self.global_preferences.data_directory.as_os_str().is_empty() {
+            return Err(RuntimeError::InvalidSettings(
+                "data directory must not be empty".to_owned(),
             ));
         }
         if !tools::valid_env_name(&self.codex.api_key_environment_variable) {
@@ -845,6 +928,21 @@ mod tests {
         let encoded = serde_json::to_string(&settings).expect("settings serialize");
         assert!(encoded.contains("OPENAI_API_KEY"));
         assert!(!encoded.contains("sk-"));
+    }
+
+    #[test]
+    fn global_preferences_round_trip_without_credential_values() {
+        let mut settings = RuntimeSettings::default();
+        settings.global_preferences.theme = GlobalTheme::Dark;
+        settings.global_preferences.language = GlobalLanguage::English;
+        settings.global_preferences.data_directory = PathBuf::from("D:/CircuitFabric-data");
+        settings.global_preferences.secret_storage_provider = SecretStorageProvider::Environment;
+        settings.global_preferences.log_level = LogLevel::Debug;
+
+        let encoded = serde_json::to_string(&settings).expect("settings serialize");
+        let restored: RuntimeSettings = serde_json::from_str(&encoded).expect("settings parse");
+        assert_eq!(restored.global_preferences, settings.global_preferences);
+        assert!(!encoded.contains("api-key-value"));
     }
 
     #[test]

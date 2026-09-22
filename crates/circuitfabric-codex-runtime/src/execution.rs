@@ -128,16 +128,7 @@ pub fn run_task_with_options(
     working_directory: Option<&std::path::Path>,
     cancel: &Cancellation,
 ) -> Result<String, RuntimeError> {
-    run_task_with_secrets(
-        settings,
-        kind,
-        grants,
-        prompt,
-        image,
-        working_directory,
-        None,
-        cancel,
-    )
+    run_task_with_secrets(settings, kind, grants, prompt, image, working_directory, None, cancel)
 }
 
 /// Run one task with an explicit working directory plus the unlocked secrets
@@ -198,12 +189,13 @@ fn run_task_in(
             .clone()
             .ok_or_else(|| invalid("缺少 Vision 环境变量名"))?;
     }
-    let key = crate::secrets::resolve(&provider.api_key_environment_variable, secrets)
-        .ok_or_else(|| {
+    let key = crate::secrets::resolve(&provider.api_key_environment_variable, secrets).ok_or_else(
+        || {
             invalid(crate::secrets::missing_variable_message(
                 &provider.api_key_environment_variable,
             ))
-        })?;
+        },
+    )?;
     let instructions = settings.catalog.skill_instructions(grants)?;
     let servers = grants
         .authorized_mcp_server_ids
@@ -231,8 +223,17 @@ fn run_task_in(
         if let Some(path) = image {
             inputs.push(serde_json::json!({"type":"localImage","path":fs::canonicalize(path)?}));
         }
-        return run_codex(settings, &provider, &servers, &environment, grants, &inputs, secrets, cancel)
-            .map(|output| redact(&output, &key, &servers, secrets));
+        return run_codex(
+            settings,
+            &provider,
+            &servers,
+            &environment,
+            grants,
+            &inputs,
+            secrets,
+            cancel,
+        )
+        .map(|output| redact(&output, &key, &servers, secrets));
     }
     let command = if kind == AgentKind::Claude {
         claude_command(settings, &provider, &servers, &environment.home, &key, secrets)?

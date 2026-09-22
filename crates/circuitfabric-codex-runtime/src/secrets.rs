@@ -59,7 +59,10 @@ pub struct SecretValues {
 
 impl std::fmt::Debug for SecretValues {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("SecretValues").field("names", &self.names().collect::<Vec<_>>()).finish()
+        formatter
+            .debug_struct("SecretValues")
+            .field("names", &self.names().collect::<Vec<_>>())
+            .finish()
     }
 }
 
@@ -361,9 +364,7 @@ struct DerivedKey {
 fn derive_new(password: &str) -> Result<DerivedKey, RuntimeError> {
     check_password(password)?;
     let mut salt = vec![0_u8; 16];
-    SystemRandom::new()
-        .fill(&mut salt)
-        .map_err(|_| vault_error("无法生成保险库随机盐"))?;
+    SystemRandom::new().fill(&mut salt).map_err(|_| vault_error("无法生成保险库随机盐"))?;
     let key = derive_key(password, &salt, DEFAULT_KDF_ITERATIONS)?;
     Ok(DerivedKey { key, salt, iterations: DEFAULT_KDF_ITERATIONS })
 }
@@ -373,8 +374,8 @@ fn derive_key(
     salt: &[u8],
     iterations: u32,
 ) -> Result<Zeroizing<Vec<u8>>, RuntimeError> {
-    let iterations = NonZeroU32::new(iterations)
-        .ok_or_else(|| vault_error("保险库 KDF 迭代数无效"))?;
+    let iterations =
+        NonZeroU32::new(iterations).ok_or_else(|| vault_error("保险库 KDF 迭代数无效"))?;
     let password = Zeroizing::new(password.as_bytes().to_vec());
     let mut key = Zeroizing::new(vec![0_u8; 32]);
     pbkdf2::derive(PBKDF2_HMAC_SHA256, iterations, salt, &password, &mut key);
@@ -383,9 +384,7 @@ fn derive_key(
 
 fn encrypt(key: &[u8], plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>), RuntimeError> {
     let mut nonce_bytes = vec![0_u8; 12];
-    SystemRandom::new()
-        .fill(&mut nonce_bytes)
-        .map_err(|_| vault_error("无法生成保险库随机数"))?;
+    SystemRandom::new().fill(&mut nonce_bytes).map_err(|_| vault_error("无法生成保险库随机数"))?;
     let cipher = LessSafeKey::new(
         UnboundKey::new(&AES_256_GCM, key).map_err(|_| vault_error("保险库密钥无效"))?,
     );
@@ -398,17 +397,14 @@ fn encrypt(key: &[u8], plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>), RuntimeEr
     Ok((nonce_bytes, in_out))
 }
 
-fn decrypt_entries(
-    key: &[u8],
-    cipher: &CipherSection,
-) -> Result<SecretValues, RuntimeError> {
-    let wrong =
-        || vault_error("保险库密码不正确，或保险库数据已损坏");
+fn decrypt_entries(key: &[u8], cipher: &CipherSection) -> Result<SecretValues, RuntimeError> {
+    let wrong = || vault_error("保险库密码不正确，或保险库数据已损坏");
     let nonce_bytes = BASE64.decode(&cipher.nonce).map_err(|_| wrong())?;
     let mut in_out = BASE64.decode(&cipher.ciphertext).map_err(|_| wrong())?;
     let cipher_key = LessSafeKey::new(UnboundKey::new(&AES_256_GCM, key).map_err(|_| wrong())?);
     let nonce = Nonce::try_assume_unique_for_key(&nonce_bytes).map_err(|_| wrong())?;
-    let plaintext = cipher_key.open_in_place(nonce, Aad::empty(), &mut in_out).map_err(|_| wrong())?;
+    let plaintext =
+        cipher_key.open_in_place(nonce, Aad::empty(), &mut in_out).map_err(|_| wrong())?;
     let parsed: BTreeMap<String, String> =
         serde_json::from_slice(plaintext).map_err(|_| wrong())?;
     let mut entries = BTreeMap::new();
