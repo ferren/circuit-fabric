@@ -8,12 +8,25 @@ license.workspace = true
 
 [features]
 default = []
-native-ui = ["dep:gpui", "dep:gpui-component", "dep:gpui_platform", "dep:gpui-base", "dep:rfd"]
+native-ui = [
+  "dep:gpui",
+  "dep:gpui-component",
+  "dep:gpui_platform",
+  "dep:gpui-base",
+  "dep:rfd",
+  "dep:circuitfabric-document-opener",
+  "dep:circuitfabric-plugin-api",
+]
 
 [dependencies]
 circuitfabric-codex-runtime.workspace = true
 circuitfabric-contracts.workspace = true
+circuitfabric-document-opener = { workspace = true, optional = true, features = [
+  "raster-pdf",
+] }
+circuitfabric-plugin-api = { workspace = true, optional = true }
 circuitfabric-project.workspace = true
+image = "0.25"
 jlcircuit-eda-bridge.workspace = true
 serde_json.workspace = true
 serde.workspace = true

@@ -90,9 +90,11 @@ impl ControlPlaneScreen {
             self,
             Self::Overview
                 | Self::Projects
+                | Self::Documents
                 | Self::Semantics
                 | Self::EdaServices
                 | Self::AgentsAndMcp
+                | Self::SessionsAndTasks
                 | Self::Plugins
                 | Self::SecretsVault
         )
@@ -104,10 +106,7 @@ impl ControlPlaneScreen {
     #[cfg_attr(not(feature = "native-ui"), allow(dead_code))]
     #[must_use]
     pub const fn requires_project(self) -> bool {
-        matches!(
-            self,
-            Self::Semantics | Self::ChangesAndApprovals | Self::BomAndExport
-        )
+        matches!(self, Self::Semantics | Self::ChangesAndApprovals | Self::BomAndExport)
     }
 }
 
@@ -208,112 +207,6 @@ impl UiLanguage {
             },
         }
     }
-
-    #[allow(clippy::too_many_lines)]
-    const fn page_copy(
-        self,
-        screen: ControlPlaneScreen,
-    ) -> (&'static str, &'static str, &'static str) {
-        match (self, screen) {
-            (Self::SimplifiedChinese, ControlPlaneScreen::Documents) => (
-                "文档",
-                "已授权的设计证据会保留来源定位信息，供智能体进行可引用的检索。",
-                "TODO：加入文档登记、安全扫描和证据感知检索。",
-            ),
-            (Self::SimplifiedChinese, ControlPlaneScreen::Semantics) => (
-                "电路语义",
-                "快照、拓扑、约束和验证事实会完整呈现，不会隐藏不确定性。",
-                "TODO：加入快照历史、语义查询和拓扑可视化。",
-            ),
-            (Self::SimplifiedChinese, ControlPlaneScreen::EdaServices) => (
-                "EDA 服务",
-                "已连接 EDA 后端将展示能力、健康度、端点和回读状态。",
-                "TODO：加入 EDA 后端/bridge 插件列表与最后回读结果上报。",
-            ),
-            (Self::SimplifiedChinese, ControlPlaneScreen::SessionsAndTasks) => (
-                "会话与任务",
-                "此只读回放界面将展示智能体轮次、工具调用、证据与任务进度。",
-                "TODO：加入会话事件持久化和关联证据的回放时间线。",
-            ),
-            (Self::SimplifiedChinese, ControlPlaneScreen::ChangesAndApprovals) => (
-                "变更与审批",
-                "每个 ChangeSet 都会先与精确基线比对，之后才允许审批物化。",
-                "TODO：加入审批抽屉、IR Diff、审计事件和回滚策略。",
-            ),
-            (Self::SimplifiedChinese, ControlPlaneScreen::BomAndExport) => (
-                "BOM 与导出",
-                "BOM、网表和仿真导出将持续关联到可追溯的语义快照。",
-                "TODO：加入 BOM 生成以及 CSV、Excel、JSON、网表和 SPICE 导出。",
-            ),
-            (Self::SimplifiedChinese, ControlPlaneScreen::Plugins) => (
-                "插件",
-                "这里将统一治理插件 manifest、权限、签名、版本和健康状态。",
-                "TODO：加入 manifest 发现、签名校验和权限控制。",
-            ),
-            (Self::SimplifiedChinese, ControlPlaneScreen::Usage) => (
-                "用量与审计",
-                "Token 用量和不可变工程审计事件将按项目和运行时聚合。",
-                "TODO：加入用量汇总、筛选和审计导出。",
-            ),
-            (Self::SimplifiedChinese, ControlPlaneScreen::Settings) => (
-                "设置",
-                "外观、语言、数据目录、凭据提供方和日志偏好会在这里配置。",
-                "TODO：加入主题选择和其余全局偏好。",
-            ),
-            (Self::English, ControlPlaneScreen::Documents) => (
-                "Documents",
-                "Authorized design evidence will be source-addressable and ready for citation by agents.",
-                "TODO: Add document registration, safe scanning, and evidence-aware search.",
-            ),
-            (Self::English, ControlPlaneScreen::Semantics) => (
-                "Circuit semantics",
-                "Snapshots, topology, constraints, and verification facts will be presented without hiding uncertainty.",
-                "TODO: Add snapshot history, semantic queries, and topology visualization.",
-            ),
-            (Self::English, ControlPlaneScreen::EdaServices) => (
-                "EDA services",
-                "Connected EDA backends will show capabilities, health, endpoint, and readback status.",
-                "TODO: Add the EDA backend/bridge plugin list and last-readback reporting.",
-            ),
-            (Self::English, ControlPlaneScreen::SessionsAndTasks) => (
-                "Sessions & tasks",
-                "This read-only replay surface will show agent turns, tool calls, evidence, and task progress.",
-                "TODO: Add session event persistence and an evidence-linked replay timeline.",
-            ),
-            (Self::English, ControlPlaneScreen::ChangesAndApprovals) => (
-                "Changes & approvals",
-                "ChangeSets will be reviewed against their exact baseline before any materialization is approved.",
-                "TODO: Add the approval drawer, IR diff, audit events, and rollback policy.",
-            ),
-            (Self::English, ControlPlaneScreen::BomAndExport) => (
-                "BOM & export",
-                "BOM, netlist, and simulation exports will remain traceable to a semantic snapshot.",
-                "TODO: Add BOM generation plus CSV, Excel, JSON, netlist, and SPICE exporters.",
-            ),
-            (Self::English, ControlPlaneScreen::Plugins) => (
-                "Plugins",
-                "Plugin manifests, permissions, signatures, versions, and health will be governed here.",
-                "TODO: Add manifest discovery, signature verification, and permission controls.",
-            ),
-            (Self::English, ControlPlaneScreen::Usage) => (
-                "Usage & audit",
-                "Token usage and immutable engineering audit events will be grouped by project and runtime.",
-                "TODO: Add usage aggregation, filtering, and audit export.",
-            ),
-            (Self::English, ControlPlaneScreen::Settings) => (
-                "Settings",
-                "Appearance, language, data directory, credential provider, and log preferences will live here.",
-                "TODO: Add theme selection and the remaining global preferences.",
-            ),
-            (
-                _,
-                ControlPlaneScreen::Overview
-                | ControlPlaneScreen::Projects
-                | ControlPlaneScreen::AgentsAndMcp
-                | ControlPlaneScreen::SecretsVault,
-            ) => unreachable!(),
-        }
-    }
 }
 
 #[derive(Debug, Default)]
@@ -366,21 +259,31 @@ fn main() {
         AuditKindFilter, AuditRecord, UsageAuditModel, UsagePeriod, UsageRecord,
     };
     use circuitfabric_codex_runtime::secrets::{SecretSource, UnlockedVault, secret_source};
+    use circuitfabric_codex_runtime::tools::BUNDLED_JEV_SERVER_ID;
     use circuitfabric_codex_runtime::{
         CodexAppServerHandle, GlobalPreferences, GlobalTheme, LlmProviderSettings, LogLevel,
         RuntimeSettings, SecretStorageProvider, ToolAuthorizationKind, ToolAuthorizationSettings,
     };
-    use circuitfabric_contracts::{FactStatus, LogicalCircuitSnapshot, Project, SnapshotAuthority};
+    use circuitfabric_contracts::{
+        DatasheetExtraction, DocumentKind, FactStatus, LogicalCircuitSnapshot, Project,
+        SnapshotAuthority,
+    };
+    use circuitfabric_document_opener::{DocumentOpenerRegistry, extract_datasheet_with_agent};
+    use circuitfabric_plugin_api::{
+        DocumentBlockKind, DocumentOpenDenial, DocumentSpanStyle, DocumentView, DocumentViewBody,
+    };
     use circuitfabric_project::{
         ChangeSetAuditEntry, ChangeSetStageStatus, DocumentCategory, ProjectDocument,
         ProjectRegistry, ProjectStorage, ProjectWorkspace, SessionActor, SessionEvent,
         SessionEventKind, SessionListing, SessionReplay, SessionSeed, SessionStatus, SessionUsage,
-        StoredChangeSet, is_text_extractable, rfc3339,
+        StoredChangeSet, is_evidence_indexable, rfc3339,
     };
     use gpui::{
-        AppContext, Context, Entity, FontWeight, Image, ImageFormat, InteractiveElement,
-        IntoElement, KeystrokeEvent, ParentElement, Render, StatefulInteractiveElement, Styled,
-        Window, WindowOptions, div, img, prelude::FluentBuilder as _, px, rgb as gpui_rgb, rgba,
+        AnyElement, AppContext, ClickEvent, Context, Div, DragMoveEvent, Entity, FontStyle,
+        FontWeight, HighlightStyle, Image, ImageFormat, InteractiveElement, IntoElement,
+        KeystrokeEvent, ParentElement, Render, Size, StatefulInteractiveElement,
+        StrikethroughStyle, Styled, StyledText, Window, WindowOptions, div, img,
+        prelude::FluentBuilder as _, px, rgb as gpui_rgb, rgba,
     };
     use gpui_base::{InputBase, input::InputEditorStyle};
     use gpui_component::{
@@ -522,6 +425,7 @@ fn main() {
         Runtime(RuntimeAdapter),
         Provider,
         SkillsAndMcp,
+        BundledJev,
     }
 
     /// One manageable EDA backend service on the EDA services page. The list
@@ -742,6 +646,10 @@ fn main() {
     #[derive(Clone, Default)]
     struct ProjectWorkspaceData {
         documents: Vec<ProjectDocument>,
+        /// Integrity verdicts (`read_verified_document_content`) computed when this listing
+        /// was loaded — never per render. Re-hashing every managed copy on every frame was
+        /// the root cause of the whole-window lag while the preview pane was open.
+        document_integrity: std::collections::BTreeMap<String, bool>,
         session_listing: SessionListing,
         semantic_snapshots: Vec<LogicalCircuitSnapshot>,
         change_sets: Vec<StoredChangeSet>,
@@ -751,6 +659,89 @@ fn main() {
     struct SessionReplaySelection {
         project_id: ProjectId,
         replay: SessionReplay,
+    }
+
+    /// Default width of the docked document-preview pane; the window grows by this much when
+    /// the preview opens, mirroring the extend-to-the-right behavior of document tools. The
+    /// user can then drag the divider to resize the pane within the clamp range below.
+    const DOCUMENT_PREVIEW_WIDTH: f32 = 480.;
+    const DOCUMENT_PREVIEW_MIN_WIDTH: f32 = 320.;
+    const DOCUMENT_PREVIEW_MAX_WIDTH: f32 = 1040.;
+    /// Preview-pane render caps: the scroll pane lays out every element each frame, so a
+    /// huge document must not become thousands of text nodes inside the pane.
+    const PREVIEW_MAX_RENDERED_PAGES: usize = 20;
+    const PREVIEW_MAX_RENDERED_BLOCKS: usize = 120;
+    const PREVIEW_MAX_RENDERED_ROWS: usize = 40;
+
+    /// Marker for the drag value carried while the preview divider is being dragged.
+    struct DraggedPreviewSplit;
+
+    /// One page bitmap converted to a GPUI render image, built once at open time.
+    #[derive(Clone)]
+    struct DocumentRasterPreviewPage {
+        number: u32,
+        image: std::sync::Arc<gpui::RenderImage>,
+        width: u32,
+        height: u32,
+    }
+
+    /// Pre-built page images for a rasterized document (pdfium-backed PDF preview).
+    #[derive(Clone)]
+    struct DocumentRasterPreview {
+        pages: Vec<DocumentRasterPreviewPage>,
+        page_count: usize,
+        truncated: bool,
+    }
+
+    /// What the preview pane shows for one selected document.
+    #[derive(Clone)]
+    enum DocumentPreviewState {
+        Loading,
+        /// The opener plugin produced a read-only embeddable view, shared via `Arc` so
+        /// per-frame rendering never clones the whole body. `raster` holds page bitmaps
+        /// already converted to GPUI images when the view carried them.
+        Loaded {
+            view: std::sync::Arc<DocumentView>,
+            raster: Option<DocumentRasterPreview>,
+        },
+        /// The open gate refused the request before any opener ran.
+        Refused {
+            denial: DocumentOpenDenial,
+        },
+        /// The opener plugin explicitly reported unsupported or corrupt content.
+        Unavailable {
+            reason: String,
+        },
+    }
+
+    /// Background full-text indexing of one PDF.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum PdfIndexState {
+        Running,
+        Failed,
+    }
+
+    /// Completed steps of an interrupted datasheet extraction. "Continue" reuses them while
+    /// the document content is unchanged: a complete model reply skips the model call, and
+    /// finished Jev batches are not re-evaluated.
+    #[derive(Clone, Debug, Default)]
+    struct DatasheetCheckpoint {
+        content_hash: String,
+        model_response: Option<String>,
+        /// `(arguments, result)` per finished Jev batch, in call order.
+        jev_results: Vec<(serde_json::Value, serde_json::Value)>,
+    }
+
+    /// The document currently shown in the right-hand preview pane.
+    #[derive(Clone)]
+    struct DocumentPreviewSelection {
+        project_id: ProjectId,
+        file_name: String,
+        document_id: String,
+        state: DocumentPreviewState,
+        /// The persisted structured datasheet extraction, when one exists for this exact
+        /// content. Shared via `Arc` so per-frame rendering never clones the payload.
+        extraction: Option<std::sync::Arc<DatasheetExtraction>>,
     }
 
     // One GPUI view struct accumulates the whole control plane's UI state; the
@@ -781,10 +772,34 @@ fn main() {
         project_storages: BTreeMap<ProjectId, ProjectStorage>,
         project_data: BTreeMap<ProjectId, ProjectWorkspaceData>,
         session_replay: Option<SessionReplaySelection>,
+        session_project_filter: Option<ProjectId>,
+        // Docked document preview: the selection and, when the pane widened the window on
+        // open, the size to restore when it closes. `document_preview_width` follows the
+        // divider drag.
+        document_preview: Option<DocumentPreviewSelection>,
+        document_preview_width: f32,
+        // Whether the preview pane shows the structured datasheet tab instead of the
+        // rendered document.
+        preview_show_data: bool,
+        datasheet_extracting: bool,
+        datasheet_feedback: Option<String>,
+        // Live log of the latest extraction (stage lines plus the streamed model reply),
+        // keyed by the document it belongs to.
+        datasheet_stream: Option<(ProjectId, String, std::sync::Arc<std::sync::Mutex<String>>)>,
+        datasheet_extract_started: Option<Instant>,
+        datasheet_cancel: Option<circuitfabric_codex_runtime::execution::Cancellation>,
+        datasheet_checkpoint: Option<(ProjectId, String, DatasheetCheckpoint)>,
+        // Background PDF full-text indexing per (project, document); indexed documents
+        // leave the map, failed ones stay so they are not retried every time.
+        pdf_index_state: BTreeMap<(ProjectId, String), PdfIndexState>,
+        datasheet_rows_visible: usize,
+        pre_preview_window_size: Option<Size<gpui::Pixels>>,
         usage_period: UsagePeriod,
         usage_filter: Entity<InputState>,
         audit_kind_filter: AuditKindFilter,
         audit_filter: Entity<InputState>,
+        // Short-lived cache for the usage/audit projection; see `usage_audit_model`.
+        usage_audit_cached: Option<(Instant, UsageAuditModel)>,
         evidence_query: Entity<InputState>,
         semantic_query: Entity<InputState>,
         semantic_query_scope: SemanticQueryScope,
@@ -823,6 +838,8 @@ fn main() {
         catalog_source: Entity<InputState>,
         catalog_args: Entity<InputState>,
         catalog_env: Entity<InputState>,
+        // Masked TYPESAFE_API_KEY entry on the bundled Jev settings page.
+        jev_api_key: Entity<InputState>,
         adapters: circuitfabric_codex_runtime::execution::AdapterSettings,
         adapter_command: Entity<InputState>,
         adapter_provider: Entity<InputState>,
@@ -887,6 +904,7 @@ fn main() {
             }
             let documents =
                 storage.list_documents().map_err(|error| format!("文档索引未读取：{error}"))?;
+            let document_integrity = Self::compute_document_integrity(&storage, &documents);
             let session_listing =
                 storage.list_sessions().map_err(|error| format!("会话记录未读取：{error}"))?;
             let semantic_snapshots = storage
@@ -897,6 +915,7 @@ fn main() {
                 project_id.clone(),
                 ProjectWorkspaceData {
                     documents,
+                    document_integrity,
                     session_listing,
                     semantic_snapshots,
                     change_sets,
@@ -904,6 +923,24 @@ fn main() {
             );
             storages.insert(project_id, storage);
             Ok(())
+        }
+
+        /// One-shot integrity verification for a document listing.
+        ///
+        /// The documents page used to re-read and re-hash every managed copy on every
+        /// render; with hover states on the cards that became a hash storm per frame.
+        /// Verification now happens when a listing is (re)loaded — attach, refresh,
+        /// import — and the render path reads these cached verdicts.
+        fn compute_document_integrity(
+            storage: &ProjectStorage,
+            documents: &[ProjectDocument],
+        ) -> BTreeMap<String, bool> {
+            documents
+                .iter()
+                .map(|document| {
+                    (document.id.clone(), storage.read_verified_document_content(document).is_ok())
+                })
+                .collect()
         }
 
         fn restore_project_workspace(
@@ -1101,6 +1138,8 @@ fn main() {
             let vault_password_confirm = Self::masked_input(window, "再次输入密码", cx);
             let secret_name = Self::input(window, String::new(), "OPENAI_API_KEY", cx);
             let secret_value = Self::masked_input(window, "粘贴密钥值，保存后不再回显", cx);
+            let jev_api_key =
+                Self::masked_input(window, "粘贴 TYPESAFE_API_KEY，保存后不再回显", cx);
             for input in [
                 &project_search,
                 &evidence_query,
@@ -1121,6 +1160,16 @@ fn main() {
                 })
                 .detach();
             }
+            let restored_projects: Vec<ProjectId> = project_storages.keys().cloned().collect();
+            cx.spawn(async move |view, cx| {
+                view.update(cx, |view, cx| {
+                    for project_id in &restored_projects {
+                        view.schedule_pdf_indexing(project_id, cx);
+                    }
+                })
+                .ok();
+            })
+            .detach();
             let status = if let Some(error) = load_error {
                 format!("运行时配置读取失败，请修复配置后重新打开：{error}")
             } else if project_restore_diagnostics.is_empty() {
@@ -1182,10 +1231,24 @@ fn main() {
                 project_storages,
                 project_data,
                 session_replay: None,
+                session_project_filter: None,
+                document_preview: None,
+                document_preview_width: DOCUMENT_PREVIEW_WIDTH,
+                preview_show_data: false,
+                datasheet_extracting: false,
+                datasheet_feedback: None,
+                datasheet_stream: None,
+                datasheet_extract_started: None,
+                datasheet_cancel: None,
+                datasheet_checkpoint: None,
+                pdf_index_state: BTreeMap::new(),
+                datasheet_rows_visible: 40,
+                pre_preview_window_size: None,
                 usage_period: UsagePeriod::All,
                 usage_filter,
                 audit_kind_filter: AuditKindFilter::All,
                 audit_filter,
+                usage_audit_cached: None,
                 evidence_query,
                 semantic_query,
                 semantic_query_scope: SemanticQueryScope::Components,
@@ -1222,6 +1285,7 @@ fn main() {
                 catalog_source,
                 catalog_args,
                 catalog_env,
+                jev_api_key,
                 adapters: settings.adapters,
                 adapter_command,
                 adapter_provider,
@@ -1512,7 +1576,7 @@ fn main() {
                 return;
             };
             if let Err(error) = settings.save(&self.settings_path) {
-                self.status = format!("未启动：设置未保存（{error}）。");
+                self.status = format!("未启动：设置未保存（{error}）");
                 cx.notify();
                 return;
             }
@@ -1619,7 +1683,7 @@ fn main() {
             }
             let settings = self.runtime_settings_from_form(cx);
             if let Err(error) = settings.save(&self.settings_path) {
-                self.status = format!("未启动：设置未保存（{error}）。");
+                self.status = format!("未启动：设置未保存（{error}）");
                 cx.notify();
                 return;
             }
@@ -2133,6 +2197,7 @@ fn main() {
                 self.status = format!("项目已打开，但未能保存项目注册表：{error}");
             }
             self.selected_project = Some(project_id);
+            self.session_project_filter = None;
             self.project_tab = ProjectDetailTab::Overview;
             self.session_replay = None;
             self.selected_semantic_snapshot = None;
@@ -2159,6 +2224,46 @@ fn main() {
             }
         }
 
+        /// Extracts the full text of this project's not-yet-indexed PDFs off the UI thread
+        /// and registers it as evidence. Each document is attempted once per session.
+        fn schedule_pdf_indexing(&mut self, project_id: &str, cx: &mut Context<Self>) {
+            let Some(storage) = self.project_storages.get(project_id).cloned() else {
+                return;
+            };
+            let Ok(pending) = self.workspace.pending_pdf_documents(project_id, &storage) else {
+                return;
+            };
+            for document in pending {
+                let key = (project_id.to_owned(), document.id.clone());
+                if self.pdf_index_state.contains_key(&key) {
+                    continue;
+                }
+                self.pdf_index_state.insert(key.clone(), PdfIndexState::Running);
+                let work = cx.background_spawn({
+                    let storage = storage.clone();
+                    let document = document.clone();
+                    async move { circuitfabric_project::extract_pdf_pages(&storage, &document) }
+                });
+                cx.spawn(async move |view, cx| {
+                    let pages = work.await;
+                    view.update(cx, |view, cx| {
+                        let indexed = pages.is_some_and(|pages| {
+                            view.workspace.register_pdf_pages(&key.0, &document, &pages).is_ok()
+                        });
+                        if indexed {
+                            view.pdf_index_state.remove(&key);
+                        } else {
+                            view.pdf_index_state.insert(key, PdfIndexState::Failed);
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+            cx.notify();
+        }
+
         /// Reloads one project's cached document, session, and semantic projections from its root.
         fn refresh_project_data(&mut self, project_id: &str) -> Result<(), String> {
             let storage = self
@@ -2167,12 +2272,15 @@ fn main() {
                 .ok_or_else(|| "项目根目录未打开".to_owned())?;
             let documents =
                 storage.list_documents().map_err(|error| format!("文档索引未读取：{error}"))?;
+            let document_integrity = Self::compute_document_integrity(storage, &documents);
             let session_listing =
                 storage.list_sessions().map_err(|error| format!("会话记录未读取：{error}"))?;
             let semantic_snapshots = storage
                 .list_logical_snapshots()
                 .map_err(|error| format!("语义快照未读取：{error}"))?;
             self.project_data.entry(project_id.to_owned()).or_default().documents = documents;
+            self.project_data.entry(project_id.to_owned()).or_default().document_integrity =
+                document_integrity;
             self.project_data.entry(project_id.to_owned()).or_default().session_listing =
                 session_listing;
             self.project_data.entry(project_id.to_owned()).or_default().semantic_snapshots =
@@ -2184,12 +2292,33 @@ fn main() {
 
         /// Builds the two read-only dashboard projections from persisted session records.
         /// Usage summaries and audit events intentionally do not share a mutable UI model.
-        fn usage_audit_model(&self) -> UsageAuditModel {
+        ///
+        /// The result is cached for a few seconds: rebuilding it reads every session replay
+        /// from disk, and this projection is consulted on every render of the usage page —
+        /// re-reading all session files per frame made the whole window feel sluggish.
+        fn usage_audit_model(&mut self) -> UsageAuditModel {
+            const CACHE_TTL: Duration = Duration::from_secs(5);
+            let fresh = self
+                .usage_audit_cached
+                .as_ref()
+                .is_some_and(|(cached_at, _)| cached_at.elapsed() < CACHE_TTL);
+            if !fresh {
+                let model =
+                    Self::build_usage_audit_model(&self.project_data, &self.project_storages);
+                self.usage_audit_cached = Some((Instant::now(), model));
+            }
+            self.usage_audit_cached.as_ref().expect("the cache was just populated").1.clone()
+        }
+
+        fn build_usage_audit_model(
+            project_data: &BTreeMap<ProjectId, ProjectWorkspaceData>,
+            project_storages: &BTreeMap<ProjectId, ProjectStorage>,
+        ) -> UsageAuditModel {
             let mut model = UsageAuditModel::default();
-            for (project_id, data) in &self.project_data {
+            for (project_id, data) in project_data {
                 for summary in &data.session_listing.sessions {
                     model.usage.push(UsageRecord::from(&summary.metadata));
-                    if let Some(storage) = self.project_storages.get(project_id)
+                    if let Some(storage) = project_storages.get(project_id)
                         && let Ok(replay) = storage.load_session(&summary.metadata.session_id)
                     {
                         model.audit.extend(AuditRecord::from_session(&replay));
@@ -2283,22 +2412,22 @@ fn main() {
                                         document.category.label(),
                                     );
                                 } else {
-                                    let searchable = is_text_extractable(&document.document_kind);
+                                    let searchable = match document.document_kind {
+                                        DocumentKind::Pdf => "，正在后台提取全文以供证据检索",
+                                        kind if is_evidence_indexable(&kind) => "，文本可证据检索",
+                                        _ => "，暂不参与文本检索",
+                                    };
                                     if let Err(error) = view.refresh_project_data(&project_id) {
                                         view.status = format!("文档已导入，但列表未刷新：{error}");
                                     } else {
                                         view.status = format!(
-                                            "已导入 `{}`（{}，{}…）{}。",
+                                            "已导入 `{}`（{}，{}…）{searchable}。",
                                             document.original_file_name,
                                             document.id,
                                             &document.content_hash[..23],
-                                            if searchable {
-                                                "，文本可证据检索"
-                                            } else {
-                                                "，暂不参与文本检索"
-                                            },
                                         );
                                     }
+                                    view.schedule_pdf_indexing(&project_id, cx);
                                 }
                             }
                             Err(error) => view.status = format!("未导入文档：{error}"),
@@ -2312,10 +2441,12 @@ fn main() {
             .detach();
         }
 
-        fn open_session_replay(&mut self, session_id: String, cx: &mut Context<Self>) {
-            let Some(project_id) = self.selected_project.clone() else {
-                return;
-            };
+        fn open_session_replay(
+            &mut self,
+            project_id: ProjectId,
+            session_id: String,
+            cx: &mut Context<Self>,
+        ) {
             let Some(storage) = self.project_storages.get(&project_id) else {
                 self.status = "未打开会话：项目根目录未打开。".to_owned();
                 cx.notify();
@@ -2332,6 +2463,493 @@ fn main() {
 
         fn close_session_replay(&mut self, cx: &mut Context<Self>) {
             self.session_replay = None;
+            cx.notify();
+        }
+
+        /// Opens the docked preview for one document.
+        ///
+        /// The gate (`prepare_document_open`) and the opener registry run synchronously; the
+        /// pane shows the read-only view, or the explicit refusal/unsupported reason. The
+        /// first open widens the window to the right by the pane width, mirroring how
+        /// document tools extend their window for a preview; closing restores the size.
+        fn open_document_preview(
+            &mut self,
+            project_id: ProjectId,
+            document: &ProjectDocument,
+            window: &mut Window,
+            cx: &mut Context<Self>,
+        ) {
+            let storage = self.project_storages.get(&project_id).cloned();
+            let document_id = document.id.clone();
+            if self.document_preview.is_none() && !window.is_fullscreen() && !window.is_maximized()
+            {
+                let previous = window.bounds().size;
+                self.pre_preview_window_size = Some(previous);
+                window.resize(Size {
+                    width: previous.width + px(self.document_preview_width),
+                    height: previous.height,
+                });
+            }
+            self.preview_show_data = false;
+            self.datasheet_feedback = None;
+            self.datasheet_rows_visible = 40;
+            self.document_preview = Some(DocumentPreviewSelection {
+                project_id: project_id.clone(),
+                file_name: document.original_file_name.clone(),
+                document_id: document_id.clone(),
+                state: DocumentPreviewState::Loading,
+                extraction: None,
+            });
+            let completed_project = project_id.clone();
+            let completed_document = document_id.clone();
+            let work = cx.background_spawn(async move {
+                let Some(storage) = storage else {
+                    return (
+                        DocumentPreviewState::Refused { denial: DocumentOpenDenial::NotFound },
+                        None,
+                    );
+                };
+                let state = match storage.prepare_document_open(&project_id, &document_id) {
+                    Ok(request) => match DocumentOpenerRegistry::with_builtin_openers()
+                        .open(&request)
+                    {
+                        circuitfabric_plugin_api::DocumentOpenerOutcome::Loaded { view } => {
+                            let view = std::sync::Arc::new(view);
+                            let raster = Self::raster_preview(&view);
+                            DocumentPreviewState::Loaded { view, raster }
+                        }
+                        circuitfabric_plugin_api::DocumentOpenerOutcome::Unsupported { reason }
+                        | circuitfabric_plugin_api::DocumentOpenerOutcome::Failed { reason } => {
+                            DocumentPreviewState::Unavailable { reason }
+                        }
+                    },
+                    Err(denial) => DocumentPreviewState::Refused { denial },
+                };
+                let extraction = if matches!(state, DocumentPreviewState::Loaded { .. }) {
+                    storage
+                        .load_datasheet_extraction(&document_id)
+                        .ok()
+                        .flatten()
+                        .map(std::sync::Arc::new)
+                } else {
+                    None
+                };
+                (state, extraction)
+            });
+            cx.spawn_in(window, async move |view, cx| {
+                let (state, extraction) = work.await;
+                cx.update(|_, cx| {
+                    view.update(cx, |view, cx| {
+                        if let Some(selection) = view.document_preview.as_mut()
+                            && selection.project_id == completed_project
+                            && selection.document_id == completed_document
+                        {
+                            selection.state = state;
+                            if selection.extraction.is_none() {
+                                selection.extraction = extraction;
+                            }
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+                })
+                .ok();
+            })
+            .detach();
+            cx.notify();
+        }
+
+        /// Extracts the structured datasheet projection for the previewed document through
+        /// the open gate (verified bytes only), persists it, and switches to the data tab.
+        ///
+        /// With `resume`, the checkpoint left by a stopped or failed run of the same
+        /// document is reused; otherwise any such checkpoint is discarded.
+        #[allow(clippy::too_many_lines)]
+        fn extract_datasheet_for_preview(
+            &mut self,
+            clear_existing: bool,
+            resume: bool,
+            window: &mut Window,
+            cx: &mut Context<Self>,
+        ) {
+            if self.datasheet_extracting {
+                return;
+            }
+            let Some(preview) = self.document_preview.as_ref() else {
+                return;
+            };
+            let project_id = preview.project_id.clone();
+            let document_id = preview.document_id.clone();
+            let previous_extraction = preview.extraction.clone();
+            let completed_project = project_id.clone();
+            let completed_document = document_id.clone();
+            let Some(storage) = self.project_storages.get(&project_id).cloned() else {
+                return;
+            };
+            let settings = self.runtime_settings_from_form(cx);
+            let catalog = self.catalog.clone();
+            let grants = self.effective_grants_for(&project_id);
+            if !grants.authorized_mcp_server_ids.iter().any(|id| id == BUNDLED_JEV_SERVER_ID) {
+                let reason = if self
+                    .tool_authorizations
+                    .authorized_mcp_server_ids
+                    .iter()
+                    .any(|id| id == BUNDLED_JEV_SERVER_ID)
+                {
+                    "当前项目尚未授权 Jev；请到 Jev 页面授权当前项目后再提取。"
+                } else {
+                    "Jev 尚未获得全局授权；请到 Jev 页面先授权全局及当前项目。"
+                };
+                self.datasheet_feedback = Some(reason.to_owned());
+                self.status = reason.to_owned();
+                cx.notify();
+                return;
+            }
+            let secrets = self.vault.as_ref().map(|vault| vault.values().clone());
+            self.datasheet_feedback = None;
+            self.datasheet_extracting = true;
+            let stream = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+            self.datasheet_stream = Some((project_id.clone(), document_id.clone(), stream.clone()));
+            self.datasheet_extract_started = Some(Instant::now());
+            let cancel = circuitfabric_codex_runtime::execution::Cancellation::default();
+            self.datasheet_cancel = Some(cancel.clone());
+            let resume_from = self
+                .datasheet_checkpoint
+                .take_if(|(checkpoint_project, checkpoint_document, _)| {
+                    *checkpoint_project == project_id && *checkpoint_document == document_id
+                })
+                .filter(|_| resume)
+                .map(|(_, _, checkpoint)| checkpoint);
+            let checkpoint =
+                std::sync::Arc::new(std::sync::Mutex::new(resume_from.unwrap_or_default()));
+            let final_checkpoint = checkpoint.clone();
+            let run_cancel = cancel.clone();
+            let stopped = move || cancel.0.load(std::sync::atomic::Ordering::SeqCst);
+            let log = move |text: &str| {
+                if let Ok(mut buffer) = stream.lock() {
+                    buffer.push_str(text);
+                }
+            };
+            if clear_existing {
+                if let Some(selection) = self.document_preview.as_mut() {
+                    selection.extraction = None;
+                }
+                self.datasheet_rows_visible = 40;
+                self.status = "正在清空旧数据并重新提取…".to_owned();
+            } else {
+                self.status = "正在后台提取候选数据；随后调用 Jev evaluate…".to_owned();
+            }
+            let work = cx.background_spawn(async move {
+                let mut cleared = false;
+                let mut jev_evaluate_calls = 0_usize;
+                let mut jev_evaluate_responses = 0_usize;
+                let result = (|| -> Result<DatasheetExtraction, String> {
+                    let request = storage
+                        .prepare_document_open(&project_id, &document_id)
+                        .map_err(|error| error.to_string())?;
+                    let tools = catalog
+                        .list_tools_with_secrets(BUNDLED_JEV_SERVER_ID, &grants, secrets.as_ref())
+                        .map_err(|error| error.to_string())?;
+                    if !tools["tools"]
+                        .as_array()
+                        .is_some_and(|tools| tools.iter().any(|tool| tool["name"] == "evaluate"))
+                    {
+                        return Err("Jev MCP 未提供 evaluate 工具".to_owned());
+                    }
+                    settings.validate().map_err(|error| error.to_string())?;
+                    if circuitfabric_codex_runtime::execution::selected_provider(
+                        &settings,
+                        circuitfabric_codex_runtime::execution::AgentKind::Codex,
+                    )
+                    .is_none()
+                    {
+                        return Err("请先配置 Codex Provider".to_owned());
+                    }
+                    if clear_existing {
+                        storage
+                            .clear_datasheet_extraction(&document_id)
+                            .map_err(|error| error.to_string())?;
+                        cleared = true;
+                    }
+                    {
+                        let mut checkpoint =
+                            checkpoint.lock().map_err(|error| error.to_string())?;
+                        if checkpoint.content_hash != request.content_hash {
+                            *checkpoint = DatasheetCheckpoint {
+                                content_hash: request.content_hash.clone(),
+                                ..DatasheetCheckpoint::default()
+                            };
+                        } else if checkpoint.model_response.is_some() {
+                            log(&format!(
+                                "▶ 继续上次提取：复用模型响应及 {} 批 Jev 结果\n",
+                                checkpoint.jev_results.len()
+                            ));
+                        }
+                    }
+                    log("▶ 正在读取 PDF 文本…\n");
+                    let mut jev_batch = 0_usize;
+                    let mut extraction = extract_datasheet_with_agent(
+                        &request,
+                        |prompt| {
+                            use circuitfabric_codex_runtime::{
+                                TurnDelta,
+                                execution::{AgentKind, run_task_streaming},
+                            };
+                            if stopped() {
+                                return Err("已停止".to_owned());
+                            }
+                            let cached = checkpoint
+                                .lock()
+                                .ok()
+                                .and_then(|checkpoint| checkpoint.model_response.clone());
+                            if let Some(response) = cached {
+                                log("▶ 复用上次完整的模型响应，跳过模型调用\n");
+                                return Ok(response);
+                            }
+                            log(&format!(
+                                "▶ 已发送提示（{} 字符），等待模型响应…\n",
+                                prompt.chars().count()
+                            ));
+                            let mut current_stream = None;
+                            let response = run_task_streaming(
+                                &settings,
+                                AgentKind::Codex,
+                                &ToolAuthorizationSettings::default(),
+                                prompt,
+                                None,
+                                None,
+                                secrets.as_ref(),
+                                &run_cancel,
+                                &mut |kind, delta| {
+                                    if current_stream != Some(kind) {
+                                        current_stream = Some(kind);
+                                        log(match kind {
+                                            TurnDelta::Reasoning => "\n[思考]\n",
+                                            TurnDelta::Answer => "\n[输出]\n",
+                                        });
+                                    }
+                                    log(delta);
+                                },
+                            )
+                            .map_err(|error| error.to_string());
+                            log(match &response {
+                                Ok(_) => "\n▶ 模型响应完成，正在校验证据行…\n",
+                                Err(_) if stopped() => "\n▶ 模型调用已停止\n",
+                                Err(_) => "\n▶ 模型调用失败\n",
+                            });
+                            if let (Ok(response), Ok(mut checkpoint)) =
+                                (&response, checkpoint.lock())
+                            {
+                                checkpoint.model_response = Some(response.clone());
+                            }
+                            response
+                        },
+                        |arguments| {
+                            let batch = jev_batch;
+                            jev_batch += 1;
+                            let cached =
+                                checkpoint.lock().ok().and_then(|mut checkpoint| match checkpoint
+                                    .jev_results
+                                    .get(batch)
+                                {
+                                    Some((cached_arguments, result))
+                                        if cached_arguments == arguments =>
+                                    {
+                                        Some(result.clone())
+                                    }
+                                    _ => {
+                                        checkpoint.jev_results.truncate(batch);
+                                        None
+                                    }
+                                });
+                            if let Some(result) = cached {
+                                log(&format!("▶ 复用第 {} 批 Jev 结果\n", batch + 1));
+                                return Ok(result);
+                            }
+                            if stopped() {
+                                return Err("已停止".to_owned());
+                            }
+                            jev_evaluate_calls += 1;
+                            log(&format!("▶ Jev evaluate 第 {jev_evaluate_calls} 次…\n"));
+                            let response = catalog
+                                .call_tool_with_secrets(
+                                    BUNDLED_JEV_SERVER_ID,
+                                    &grants,
+                                    "evaluate",
+                                    arguments,
+                                    secrets.as_ref(),
+                                )
+                                .map_err(|error| error.to_string());
+                            if let Ok(value) = &response
+                                && value["isError"] != true
+                            {
+                                jev_evaluate_responses += 1;
+                                if let Ok(mut checkpoint) = checkpoint.lock()
+                                    && checkpoint.jev_results.len() == batch
+                                {
+                                    checkpoint.jev_results.push((arguments.clone(), value.clone()));
+                                }
+                            }
+                            response
+                        },
+                    )?;
+                    extraction.notes.push(format!("Jev evaluate MCP calls: {jev_evaluate_calls}"));
+                    let current = storage
+                        .prepare_document_open(&project_id, &document_id)
+                        .map_err(|error| error.to_string())?;
+                    if current.content_hash != extraction.content_hash {
+                        return Err("文档在提取过程中发生变化".to_owned());
+                    }
+                    storage
+                        .save_datasheet_extraction(&extraction)
+                        .map_err(|error| error.to_string())?;
+                    Ok(extraction)
+                })();
+                (result, cleared, jev_evaluate_calls, jev_evaluate_responses)
+            });
+            // Repaint while the log grows; stops once the extraction settles.
+            cx.spawn_in(window, async move |view, cx| {
+                loop {
+                    cx.background_executor().timer(std::time::Duration::from_millis(200)).await;
+                    let extracting = cx
+                        .update(|_, cx| {
+                            view.update(cx, |view, cx| {
+                                cx.notify();
+                                view.datasheet_extracting
+                            })
+                            .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if !extracting {
+                        break;
+                    }
+                }
+            })
+            .detach();
+            cx.spawn_in(window, async move |view, cx| {
+                let (result, cleared, jev_evaluate_calls, jev_evaluate_responses) = work.await;
+                cx.update(|_, cx| {
+                    view.update(cx, |view, cx| {
+                        view.datasheet_extracting = false;
+                        let stopped = view.datasheet_cancel.take().is_some_and(|cancel| {
+                            cancel.0.load(std::sync::atomic::Ordering::SeqCst)
+                        });
+                        let showing_document = view.document_preview.as_ref().is_some_and(|selection| {
+                            selection.project_id == completed_project
+                                && selection.document_id == completed_document
+                        });
+                        match result {
+                            Ok(extraction) => {
+                                if showing_document {
+                                    view.datasheet_feedback = Some(format!(
+                                        "Jev evaluate 已调用 {jev_evaluate_calls} 次；候选行判断结果见下方解析诊断。"
+                                    ));
+                                }
+                                let document = view.project_data.get(&completed_project).and_then(
+                                    |data| {
+                                        data.documents
+                                            .iter()
+                                            .find(|document| document.id == completed_document)
+                                            .cloned()
+                                    },
+                                );
+                                let evidence_rows = document.map_or(0, |document| {
+                                    view.workspace
+                                        .register_datasheet_evidence(
+                                            &completed_project,
+                                            &document,
+                                            &extraction,
+                                        )
+                                        .unwrap_or(0)
+                                });
+                                view.status = format!(
+                                    "已提取并验证：{} 个引脚、{} 条参数；{evidence_rows} 行已登记为证据。",
+                                    extraction.pins.len(),
+                                    extraction.absolute_maximum_ratings.len()
+                                        + extraction.electrical_characteristics.len()
+                                        + extraction.operating_conditions.len()
+                                );
+                                if let Some(selection) = view.document_preview.as_mut()
+                                    && selection.project_id == completed_project
+                                    && selection.document_id == completed_document
+                                {
+                                    selection.extraction = Some(std::sync::Arc::new(extraction));
+                                    view.preview_show_data = true;
+                                }
+                            }
+                            Err(error) => {
+                                if clear_existing && !cleared {
+                                    if let Some(selection) = view.document_preview.as_mut()
+                                        && selection.project_id == completed_project
+                                        && selection.document_id == completed_document
+                                    {
+                                        selection.extraction = previous_extraction;
+                                    }
+                                }
+                                if cleared {
+                                    view.workspace.clear_datasheet_evidence(
+                                        &completed_project,
+                                        &completed_document,
+                                    );
+                                }
+                                let checkpoint = final_checkpoint
+                                    .lock()
+                                    .map(|checkpoint| checkpoint.clone())
+                                    .unwrap_or_default();
+                                view.datasheet_checkpoint = Some((
+                                    completed_project.clone(),
+                                    completed_document.clone(),
+                                    checkpoint,
+                                ));
+                                view.status = if stopped {
+                                    format!(
+                                        "已停止提取{}；点击“继续”可复用已完成的步骤。",
+                                        if cleared { "（旧数据已清空）" } else { "" }
+                                    )
+                                } else if cleared {
+                                    format!("旧数据已清空；重新提取失败：{error}（Jev evaluate 发起 {jev_evaluate_calls} 次，收到 {jev_evaluate_responses} 次成功响应）")
+                                } else {
+                                    format!("数据提取失败，旧结果未清空：{error}（Jev evaluate 发起 {jev_evaluate_calls} 次，收到 {jev_evaluate_responses} 次成功响应）")
+                                };
+                                if showing_document {
+                                    view.datasheet_feedback = Some(view.status.clone());
+                                }
+                            }
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .ok();
+            })
+            .detach();
+            cx.notify();
+        }
+
+        /// Requests a stop: the model call is cancelled at once (its process is killed); a
+        /// Jev call already in flight finishes first. Completed steps stay resumable.
+        fn stop_datasheet_extraction(&mut self, cx: &mut Context<Self>) {
+            let Some(cancel) = &self.datasheet_cancel else {
+                return;
+            };
+            cancel.cancel();
+            if let Some((_, _, stream)) = &self.datasheet_stream
+                && let Ok(mut buffer) = stream.lock()
+            {
+                buffer.push_str("\n▶ 已请求停止…\n");
+            }
+            "正在停止提取…".clone_into(&mut self.status);
+            cx.notify();
+        }
+
+        fn close_document_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+            self.document_preview = None;
+            if let Some(previous) = self.pre_preview_window_size.take()
+                && !window.is_fullscreen()
+                && !window.is_maximized()
+            {
+                window.resize(previous);
+            }
             cx.notify();
         }
 
@@ -2411,6 +3029,7 @@ fn main() {
                         } else {
                             view.status = format!("已打开项目 `{}`：{opened_root}。", project.id);
                         }
+                        view.schedule_pdf_indexing(&project.id, cx);
                         view.selected_project = Some(project.id);
                         view.project_tab = ProjectDetailTab::Overview;
                         cx.notify();
@@ -3235,7 +3854,84 @@ fn main() {
                 }
                 AgentsSelection::Provider => self.render_provider_detail(cx).into_any_element(),
                 AgentsSelection::SkillsAndMcp => self.render_skills_detail(cx).into_any_element(),
+                AgentsSelection::BundledJev => {
+                    self.render_bundled_jev_detail(cx).into_any_element()
+                }
             };
+
+            let jev_selected = self.agents_selection == AgentsSelection::BundledJev;
+            let jev_summary = match self
+                .catalog
+                .mcp_servers
+                .iter()
+                .find(|server| server.id == BUNDLED_JEV_SERVER_ID)
+            {
+                Some(server) => {
+                    let granted = self
+                        .tool_authorizations
+                        .authorized_mcp_server_ids
+                        .iter()
+                        .any(|id| id == BUNDLED_JEV_SERVER_ID);
+                    language.choose_owned(
+                        format!(
+                            "{} · {}",
+                            if server.enabled { "已启用" } else { "已停用" },
+                            if granted { "已授权" } else { "未授权" }
+                        ),
+                        format!(
+                            "{} · {}",
+                            if server.enabled { "enabled" } else { "disabled" },
+                            if granted { "authorized" } else { "not authorized" }
+                        ),
+                    )
+                }
+                None => language.choose("未注册", "not registered").to_owned(),
+            };
+            let jev_selector = entity.clone();
+            let jev_card = div()
+                .id("jev-card")
+                .v_flex()
+                .gap_1()
+                .p_3()
+                .rounded_lg()
+                .border_1()
+                .border_color(rgb(if jev_selected { ACCENT } else { BORDER }))
+                .bg(rgb(if jev_selected { 0x00f0_f9ff } else { CARD_BG }))
+                .cursor_pointer()
+                .hover(|this| this.border_color(rgb(ACCENT_SOFT)))
+                .on_click(move |_, _, cx| {
+                    jev_selector.update(cx, |view, cx| {
+                        view.agents_selection = AgentsSelection::BundledJev;
+                        cx.notify();
+                    });
+                })
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(if jev_selected {
+                                    FontWeight::SEMIBOLD
+                                } else {
+                                    FontWeight::MEDIUM
+                                })
+                                .child(language.choose("Jev 判断工具", "Jev judgments")),
+                        )
+                        .child(
+                            div()
+                                .ml_auto()
+                                .text_xs()
+                                .text_color(rgb(TEXT_MUTED))
+                                .child(jev_summary),
+                        ),
+                )
+                .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(language.choose(
+                    "内置 TypeSafe System One 判断服务器（evaluate）",
+                    "Bundled TypeSafe System One judgment server (evaluate)",
+                )));
 
             let save_runtime = entity.clone();
             let add_provider = entity.clone();
@@ -3314,7 +4010,8 @@ fn main() {
                                 .child(Self::agents_group_label(
                                     language.choose("技能与 MCP", "Skills & MCP"),
                                 ))
-                                .child(tools_card),
+                                .child(tools_card)
+                                .child(jev_card),
                         )
                         .child(detail),
                 )
@@ -3979,19 +4676,25 @@ fn main() {
         /// Global tool grants narrowed by the selected project's allowlist.
         ///
         /// A project can only restrict what the global runtime already authorized, never expand
-        /// it; without a project configuration the global grants apply unchanged.
+        /// it; a missing project configuration grants no project tools.
         fn effective_grants(&self) -> ToolAuthorizationSettings {
+            let Some(project_id) = self.selected_project.as_ref() else {
+                return self.tool_authorizations.clone();
+            };
+            self.effective_grants_for(project_id)
+        }
+
+        fn effective_grants_for(&self, project_id: &ProjectId) -> ToolAuthorizationSettings {
             let mut grants = self.tool_authorizations.clone();
-            if let Some(configuration) =
-                self.selected_project.as_ref().and_then(|id| self.workspace.configuration(id))
-            {
-                grants
-                    .authorized_skill_ids
-                    .retain(|id| configuration.enabled_skill_ids.contains(id));
-                grants
-                    .authorized_mcp_server_ids
-                    .retain(|id| configuration.enabled_mcp_server_ids.contains(id));
-            }
+            let Some(configuration) = self.workspace.configuration(project_id) else {
+                grants.authorized_skill_ids.clear();
+                grants.authorized_mcp_server_ids.clear();
+                return grants;
+            };
+            grants.authorized_skill_ids.retain(|id| configuration.enabled_skill_ids.contains(id));
+            grants
+                .authorized_mcp_server_ids
+                .retain(|id| configuration.enabled_mcp_server_ids.contains(id));
             grants
         }
 
@@ -5206,6 +5909,435 @@ fn main() {
             cx.notify();
         }
 
+        /// Enable/disable switch for the bundled Jev server definition.
+        fn toggle_jev_enabled(&mut self, cx: &mut Context<Self>) {
+            let previous = self.catalog.clone();
+            if let Some(server) = self
+                .catalog
+                .mcp_servers
+                .iter_mut()
+                .find(|server| server.id == BUNDLED_JEV_SERVER_ID)
+            {
+                server.enabled = !server.enabled;
+            }
+            self.persist_catalog(previous, cx);
+        }
+
+        /// Global-scope grant for the bundled Jev server, mirroring
+        /// `authorize_tool`/`revoke_tool` for one fixed id.
+        fn set_jev_authorization(&mut self, authorized: bool, cx: &mut Context<Self>) {
+            let previous = self.tool_authorizations.clone();
+            {
+                let list = &mut self.tool_authorizations.authorized_mcp_server_ids;
+                if authorized {
+                    if !list.iter().any(|id| id == BUNDLED_JEV_SERVER_ID) {
+                        list.push(BUNDLED_JEV_SERVER_ID.to_owned());
+                        list.sort();
+                    }
+                } else {
+                    list.retain(|id| id != BUNDLED_JEV_SERVER_ID);
+                }
+            }
+            match self.runtime_settings_from_form(cx).save(&self.settings_path) {
+                Ok(()) => {
+                    if let Some(cancel) = &self.task_cancel {
+                        cancel.cancel();
+                    }
+                    self.status = if authorized {
+                        format!("已全局授权 {BUNDLED_JEV_SERVER_ID}；当前任务已请求取消。")
+                    } else {
+                        format!("已撤销 {BUNDLED_JEV_SERVER_ID} 的全局授权；当前任务已请求取消。")
+                    };
+                }
+                Err(error) => {
+                    self.tool_authorizations = previous;
+                    self.status = format!("未保存：{error}");
+                }
+            }
+            cx.notify();
+        }
+
+        fn set_jev_project_authorization(&mut self, authorized: bool, cx: &mut Context<Self>) {
+            let Some(project_id) = self.selected_project.clone() else {
+                self.status = "请先选择项目。".to_owned();
+                cx.notify();
+                return;
+            };
+            let Some(storage) = self.project_storages.get(&project_id) else {
+                self.status = "当前项目尚未打开。".to_owned();
+                cx.notify();
+                return;
+            };
+            let mut configuration =
+                self.workspace.configuration(&project_id).cloned().unwrap_or_default();
+            let list = &mut configuration.enabled_mcp_server_ids;
+            if authorized {
+                if !list.iter().any(|id| id == BUNDLED_JEV_SERVER_ID) {
+                    list.push(BUNDLED_JEV_SERVER_ID.to_owned());
+                    list.sort();
+                }
+            } else {
+                list.retain(|id| id != BUNDLED_JEV_SERVER_ID);
+            }
+            match storage.save_configuration(&configuration) {
+                Ok(()) => match self.workspace.set_configuration(&project_id, configuration) {
+                    Ok(()) => {
+                        self.status = format!(
+                            "项目 `{project_id}` Jev 授权已{}。",
+                            if authorized { "开启" } else { "撤销" }
+                        )
+                    }
+                    Err(error) => self.status = format!("项目配置已保存，但内存未刷新：{error}"),
+                },
+                Err(error) => self.status = format!("项目 Jev 授权未保存：{error}"),
+            }
+            cx.notify();
+        }
+
+        /// Store `TYPESAFE_API_KEY` into the unlocked vault; the value never
+        /// lands in configuration files.
+        fn save_jev_api_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+            let value = self.jev_api_key.read(cx).value().trim().to_owned();
+            if value.is_empty() {
+                "未保存：请粘贴 TYPESAFE_API_KEY 的值。".clone_into(&mut self.status);
+                cx.notify();
+                return;
+            }
+            let Some(vault) = self.vault.as_mut() else {
+                "未保存：请先在「密钥保险库」页解锁保险库，或改用同名环境变量。"
+                    .clone_into(&mut self.status);
+                cx.notify();
+                return;
+            };
+            match vault.set("TYPESAFE_API_KEY", &value) {
+                Ok(()) => {
+                    self.vault_index = vault.values().names().cloned().collect();
+                    self.jev_api_key.update(cx, |state, cx| state.set_value("", window, cx));
+                    "已保存 TYPESAFE_API_KEY（值已加密写入保险库）。".clone_into(&mut self.status);
+                }
+                Err(error) => {
+                    self.status = format!("未保存：{error}");
+                }
+            }
+            cx.notify();
+        }
+
+        /// Re-run bundled binary detection after the catalog entry was removed
+        /// or the binary was built after the app started.
+        fn reregister_jev(&mut self, cx: &mut Context<Self>) {
+            let previous = self.catalog.clone();
+            self.catalog.ensure_bundled();
+            if self.catalog.mcp_servers.iter().any(|server| server.id == BUNDLED_JEV_SERVER_ID) {
+                self.persist_catalog(previous, cx);
+            } else {
+                concat!(
+                    "未找到 evaluate 二进制：请先运行 scripts/build-typesafe-mcp.ps1，",
+                    "或设置 CIRCUITFABRIC_TYPESAFE_MCP_PATH 指向它。"
+                )
+                .clone_into(&mut self.status);
+                cx.notify();
+            }
+        }
+
+        /// The bundled `TypeSafe` Jev judgment server page: the definition ships
+        /// with the app; this page manages the enable switch, the global
+        /// authorization and the `TYPESAFE_API_KEY` vault entry.
+        fn render_bundled_jev_detail(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+            let entity = cx.entity().clone();
+            let language = self.language;
+            let server = self
+                .catalog
+                .mcp_servers
+                .iter()
+                .find(|server| server.id == BUNDLED_JEV_SERVER_ID)
+                .cloned();
+            let authorized = self
+                .tool_authorizations
+                .authorized_mcp_server_ids
+                .iter()
+                .any(|id| id == BUNDLED_JEV_SERVER_ID);
+            let project_authorized = self
+                .selected_project
+                .as_ref()
+                .and_then(|id| self.workspace.configuration(id))
+                .is_some_and(|configuration| {
+                    configuration
+                        .enabled_mcp_server_ids
+                        .iter()
+                        .any(|id| id == BUNDLED_JEV_SERVER_ID)
+                });
+            let has_project = self.selected_project.is_some();
+
+            let body = if let Some(server) = server {
+                let binary_found = std::path::Path::new(&server.command).is_file();
+                let definition_line = if server.args.is_empty() {
+                    server.command.clone()
+                } else {
+                    format!("{} {}", server.command, server.args.join(" "))
+                };
+                let toggler = entity.clone();
+                let grant_toggle = entity.clone();
+                let project_grant_toggle = entity.clone();
+                let tester = entity.clone();
+                let saver = entity.clone();
+                div()
+                        .v_flex()
+                        .gap_4()
+                        .child(
+                            div()
+                                .v_flex()
+                                .gap_2()
+                                .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(
+                                    language.choose("定义与二进制", "Definition & binary"),
+                                ))
+                                .child(
+                                    div().text_xs().text_color(rgb(TEXT_MUTED)).child(format!(
+                                        "{BUNDLED_JEV_SERVER_ID} · {definition_line}"
+                                    )),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(if binary_found {
+                                            0x0016_a34a
+                                        } else {
+                                            0x00dc_2626
+                                        }))
+                                        .child(if binary_found {
+                                            language.choose(
+                                                "✔ 二进制已就绪（由 scripts/build-typesafe-mcp.ps1 构建）",
+                                                "✔ Binary ready (built by scripts/build-typesafe-mcp.ps1)",
+                                            )
+                                        } else {
+                                            language.choose(
+                                                "✘ 未找到二进制：请运行 scripts/build-typesafe-mcp.ps1",
+                                                "✘ Binary not found: run scripts/build-typesafe-mcp.ps1",
+                                            )
+                                        }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_3()
+                                .child(div().text_sm().child(language.choose(
+                                    if server.enabled { "状态：已启用" } else { "状态：已停用" },
+                                    if server.enabled { "Status: enabled" } else { "Status: disabled" },
+                                )))
+                                .child(
+                                    Button::new("jev-toggle-enabled")
+                                        .label(language.choose(
+                                            if server.enabled { "停用" } else { "启用" },
+                                            if server.enabled { "Disable" } else { "Enable" },
+                                        ))
+                                        .on_click(move |_, _, cx| {
+                                            toggler.update(cx, |view, cx| {
+                                                view.toggle_jev_enabled(cx);
+                                            });
+                                        }),
+                                )
+                                .child(div().text_sm().child(language.choose(
+                                    if authorized { "全局授权：已授权" } else { "全局授权：未授权" },
+                                    if authorized {
+                                        "Global grant: authorized"
+                                    } else {
+                                        "Global grant: not authorized"
+                                    },
+                                )))
+                                .child(
+                                    Button::new("jev-toggle-authorization")
+                                        .label(language.choose(
+                                            if authorized { "撤销全局授权" } else { "授权（全局作用域）" },
+                                            if authorized {
+                                                "Revoke global grant"
+                                            } else {
+                                                "Authorize (global scope)"
+                                            },
+                                        ))
+                                        .on_click(move |_, _, cx| {
+                                            grant_toggle.update(cx, |view, cx| {
+                                                view.set_jev_authorization(!authorized, cx);
+                                            });
+                                        }),
+                                ),
+                        )
+                        .child(
+                            div().flex().items_center().gap_3()
+                                .child(div().text_sm().child(language.choose(
+                                    if !has_project { "项目授权：请先选择项目" } else if project_authorized { "当前项目：已授权" } else { "当前项目：未授权" },
+                                    if !has_project { "Project grant: select a project" } else if project_authorized { "Current project: authorized" } else { "Current project: not authorized" },
+                                )))
+                                .child(Button::new("jev-toggle-project-authorization")
+                                    .disabled(!has_project)
+                                    .label(language.choose(
+                                        if project_authorized { "撤销项目授权" } else { "授权当前项目" },
+                                        if project_authorized { "Revoke project grant" } else { "Authorize current project" },
+                                    ))
+                                    .on_click(move |_, _, cx| {
+                                        project_grant_toggle.update(cx, |view, cx| {
+                                            view.set_jev_project_authorization(!project_authorized, cx);
+                                        });
+                                    })),
+                        )
+                        .child(
+                            div()
+                                .v_flex()
+                                .gap_2()
+                                .child(Self::labeled_field(
+                                    "TYPESAFE_API_KEY",
+                                    "jev-api-key",
+                                    None,
+                                    &self.jev_api_key,
+                                ))
+                                .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(
+                                    language.choose(
+                                        "值只写入密钥保险库或进程环境变量，绝不保存在配置文件中；保存前请先在「密钥保险库」页解锁。",
+                                        "The value goes only to the secrets vault or a process environment variable, never into configuration files; unlock the vault page before saving.",
+                                    ),
+                                ))
+                                .children(self.secret_source_hint("TYPESAFE_API_KEY", &entity))
+                                .child(
+                                    Button::new("jev-save-key")
+                                        .primary()
+                                        .label(language.choose("保存到密钥保险库", "Save to vault"))
+                                        .on_click(move |_, window, cx| {
+                                            saver.update(cx, |view, cx| {
+                                                view.save_jev_api_key(window, cx);
+                                            });
+                                        }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_3()
+                                .child(
+                                    Button::new("jev-test")
+                                        .label(language.choose(
+                                            "连接并发现工具",
+                                            "Connect and discover tools",
+                                        ))
+                                        .on_click(move |_, window, cx| {
+                                            tester.update(cx, |view, cx| {
+                                                let catalog = view.catalog.clone();
+                                                let grants = view.effective_grants();
+                                                let secrets = view
+                                                    .vault
+                                                    .as_ref()
+                                                    .map(|vault| vault.values().clone());
+                                                let id = BUNDLED_JEV_SERVER_ID.to_owned();
+                                                view.status = "正在连接 MCP…".into();
+                                                let work = cx.background_spawn(async move {
+                                                    catalog
+                                                        .list_tools_with_secrets(
+                                                            &id,
+                                                            &grants,
+                                                            secrets.as_ref(),
+                                                        )
+                                                        .map(|value| value.to_string())
+                                                        .map_err(|error| error.to_string())
+                                                });
+                                                cx.spawn_in(window, async move |view, cx| {
+                                                    let result = work.await;
+                                                    cx.update(|_, cx| {
+                                                        view.update(cx, |view, cx| {
+                                                            view.status = match result {
+                                                                Ok(tools) => format!(
+                                                                    "MCP 已连接，工具：{tools}"
+                                                                ),
+                                                                Err(error) => {
+                                                                    format!("MCP 连接失败：{error}")
+                                                                }
+                                                            };
+                                                            cx.notify();
+                                                        })
+                                                        .ok();
+                                                    })
+                                                    .ok();
+                                                })
+                                                .detach();
+                                                cx.notify();
+                                            });
+                                        }),
+                                )
+                                .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(
+                                    language.choose(
+                                        "仅执行 initialize 与 tools/list，不发起计费判断调用。",
+                                        "Runs initialize and tools/list only; no billable judgment call is made.",
+                                    ),
+                                )),
+                        )
+                        .child(
+                            div()
+                                .v_flex()
+                                .gap_1()
+                                .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(
+                                    language.choose("使用要点", "Usage notes"),
+                                ))
+                                .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(
+                                    language.choose(
+                                        "evaluate 返回类型化判断：noul（0~1 是/否概率）、choice（多选一+概率分布）、score（量表评分）；接近 0.5 表示不确定而非中等。",
+                                        "evaluate returns typed judgments: noul (0~1 yes/no probability), choice (one option + distribution), score (rubric scale); near 0.5 means uncertain, not medium.",
+                                    ),
+                                ))
+                                .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(
+                                    language.choose(
+                                        "阈值判断（例如 noul > 0.8 才放行）应写在工作流代码里，而不是依赖模型自觉。",
+                                        "Threshold decisions (e.g. proceed only when noul > 0.8) belong in workflow code, not in the model's discretion.",
+                                    ),
+                                )),
+                        )
+                        .into_any_element()
+            } else {
+                let register = entity.clone();
+                div()
+                        .v_flex()
+                        .gap_3()
+                        .child(div().text_sm().text_color(rgb(TEXT_MUTED)).child(language.choose(
+                            "尚未注册：未检测到随附的 evaluate 二进制。构建后会自动注册，也可以手动重新检测。",
+                            "Not registered yet: the bundled evaluate binary was not detected. It registers automatically once built; you can also re-detect manually.",
+                        )))
+                        .child(
+                            Button::new("jev-reregister")
+                                .label(language.choose("重新检测并注册", "Re-detect and register"))
+                                .on_click(move |_, _, cx| {
+                                    register.update(cx, |view, cx| {
+                                        view.reregister_jev(cx);
+                                    });
+                                }),
+                        )
+                        .into_any_element()
+            };
+
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .v_flex()
+                .gap_4()
+                .p_5()
+                .rounded_xl()
+                .border_1()
+                .border_color(rgb(BORDER))
+                .bg(rgb(CARD_BG))
+                .child(
+                    div()
+                        .v_flex()
+                        .gap_1()
+                        .child(div().text_xl().font_weight(FontWeight::SEMIBOLD).child(
+                            language.choose("Jev 判断工具", "Jev judgment tool"),
+                        ))
+                        .child(div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(
+                            language.choose(
+                                "内置的 TypeSafe Jev（System One）服务器，通过 MCP 暴露 evaluate 工具：输入状态与问题，返回带校准概率的类型化判断，供智能体按阈值在代码里分支。",
+                                "The bundled TypeSafe Jev (System One) server exposes evaluate over MCP: state and questions in, typed judgments with calibrated probabilities out, so agents branch in code on thresholds.",
+                            ),
+                        )),
+                )
+                .child(body)
+        }
+
         fn render_skills_detail(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
             let entity = cx.entity().clone();
             let language = self.language;
@@ -6235,10 +7367,10 @@ fn main() {
         ) -> impl IntoElement {
             let entity = cx.entity().clone();
             let language = self.language;
-            let documents = self
+            let (documents, document_integrity) = self
                 .project_data
                 .get(&project.id)
-                .map(|data| data.documents.clone())
+                .map(|data| (data.documents.clone(), data.document_integrity.clone()))
                 .unwrap_or_default();
             let evidence_ready = documents
                 .iter()
@@ -6324,26 +7456,79 @@ fn main() {
             }
 
             let mut list = div().v_flex().gap_2();
+            list = list.child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(language.choose(
+                "点击文档卡片，窗口向右展开并在右侧显示只读预览。",
+                "Click a document card: the window extends right and shows a read-only preview.",
+            )));
             for document in &documents {
                 let integrity_verified =
-                    self.project_storages.get(&project.id).is_some_and(|storage| {
-                        storage.read_verified_document_content(&document).is_ok()
-                    });
+                    document_integrity.get(&document.id).copied().unwrap_or(false);
                 let evidence_available = integrity_verified
                     && self.workspace.is_document_evidence_available(&project.id, &document.id);
+                let index_state =
+                    self.pdf_index_state.get(&(project.id.clone(), document.id.clone())).copied();
+                let evidence_label = if evidence_available {
+                    if self.workspace.has_verified_datasheet_evidence(&project.id, &document.id) {
+                        language.choose(
+                            "可作证据 · 含已校验数据",
+                            "Evidence ready — incl. verified data",
+                        )
+                    } else {
+                        language.choose("已索引，可作证据", "Indexed — evidence ready")
+                    }
+                } else if index_state == Some(PdfIndexState::Running) {
+                    language.choose("正在提取全文…", "Extracting full text…")
+                } else if index_state == Some(PdfIndexState::Failed) {
+                    language
+                        .choose("全文提取失败，不可作证据", "Text extraction failed — not evidence")
+                } else if is_evidence_indexable(&document.document_kind) {
+                    language.choose("待索引，不可作证据", "Pending index — not evidence")
+                } else {
+                    language.choose("等待提取器，不可作证据", "Awaiting extractor — not evidence")
+                };
+                let previewed = self.document_preview.as_ref().is_some_and(|preview| {
+                    preview.project_id == project.id && preview.document_id == document.id
+                });
                 let category_style = match document.category {
                     DocumentCategory::Datasheet => (0x00e0_f2fe, 0x000e_7490),
                     DocumentCategory::ReferenceDesign => (0x00f3_e8ff, 0x0076_2b_a3),
                 };
+                let opener = entity.clone();
+                let click_project_id = project.id.clone();
+                let click_document_id = document.id.clone();
                 list = list.child(
                     div()
+                        .id(format!("document-card-{}", document.id))
                         .v_flex()
                         .gap_1()
                         .p_3()
                         .rounded_lg()
                         .border_1()
-                        .border_color(rgb(BORDER))
+                        .border_color(rgb(if previewed { ACCENT } else { BORDER }))
                         .bg(rgb(CARD_BG))
+                        .cursor_pointer()
+                        .hover(|this| this.border_color(rgb(ACCENT_SOFT)))
+                        .on_click(move |_, window, cx| {
+                            opener.update(cx, |view, cx| {
+                                // Re-read the record at click time so the preview reflects
+                                // the current index, not this render's snapshot.
+                                let document =
+                                    view.project_data.get(&click_project_id).and_then(|data| {
+                                        data.documents
+                                            .iter()
+                                            .find(|document| document.id == click_document_id)
+                                            .cloned()
+                                    });
+                                if let Some(document) = document {
+                                    view.open_document_preview(
+                                        click_project_id.clone(),
+                                        &document,
+                                        window,
+                                        cx,
+                                    );
+                                }
+                            });
+                        })
                         .child(
                             div()
                                 .flex()
@@ -6406,22 +7591,7 @@ fn main() {
                                         } else {
                                             TEXT_MUTED
                                         }))
-                                        .child(if evidence_available {
-                                            language.choose(
-                                                "已索引，可作证据",
-                                                "Indexed — evidence ready",
-                                            )
-                                        } else if is_text_extractable(&document.document_kind) {
-                                            language.choose(
-                                                "待索引，不可作证据",
-                                                "Pending index — not evidence",
-                                            )
-                                        } else {
-                                            language.choose(
-                                                "等待提取器，不可作证据",
-                                                "Awaiting extractor — not evidence",
-                                            )
-                                        }),
+                                        .child(evidence_label),
                                 )
                                 .child(
                                     div().ml_auto().text_xs().text_color(rgb(TEXT_MUTED)).child(
@@ -6449,16 +7619,16 @@ fn main() {
                 self.workspace.retrieve_document_evidence(&project.id, &query).ok().map(
                     |mut package| {
                         // The document service contains indexed text in memory.  Re-check the
-                        // managed copy before displaying it so a document subsequently found
-                        // invalid is never presented as usable evidence in this UI.
+                        // cached integrity verdict before displaying it so a document
+                        // subsequently found invalid is never presented as usable evidence in
+                        // this UI.
                         package.fragments.retain(|fragment| {
                             documents.iter().any(|document| {
                                 document.id == fragment.document_id
-                                    && self.project_storages.get(&project.id).is_some_and(
-                                        |storage| {
-                                            storage.read_verified_document_content(document).is_ok()
-                                        },
-                                    )
+                                    && document_integrity
+                                        .get(&document.id)
+                                        .copied()
+                                        .unwrap_or(false)
                                     && self
                                         .workspace
                                         .is_document_evidence_available(&project.id, &document.id)
@@ -6540,6 +7710,1289 @@ fn main() {
                 .child(list)
                 .child(search_panel)
                 .into_any_element()
+        }
+
+        /// Top-level Documents navigation.  The evidence UI is project-scoped, but the
+        /// navigation entry itself remains available so its empty state can explain the
+        /// required next step instead of sending users to an unrelated TODO placeholder.
+        fn render_documents_page(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+            let entity = cx.entity().clone();
+            let language = self.language;
+            let selected_project =
+                self.selected_project.as_deref().and_then(|id| self.workspace.project(id)).cloned();
+
+            if let Some(project) = selected_project {
+                let project_name = project.name.clone();
+                let project_id = project.id.clone();
+                let chooser = entity.clone();
+                return div()
+                    .size_full()
+                    .v_flex()
+                    .gap_4()
+                    .p_6()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .v_flex()
+                                    .gap_1()
+                                    .child(div().text_xl().font_weight(FontWeight::SEMIBOLD).child(
+                                        language.choose(
+                                            "已索引，可作证据",
+                                            "Authorized documents & evidence",
+                                        ),
+                                    ))
+                                    .child(div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(
+                                        language.choose_owned(
+                                            format!("当前项目：{project_name} · {project_id}"),
+                                            format!(
+                                                "Current project: {project_name} · {project_id}"
+                                            ),
+                                        ),
+                                    )),
+                            )
+                            .child(
+                                Button::new("documents-choose-project")
+                                    .label(language.choose("切换项目", "Choose project"))
+                                    .on_click(move |_, _, cx| {
+                                        chooser.update(cx, |view, cx| {
+                                            view.screen = ControlPlaneScreen::Projects;
+                                            cx.notify();
+                                        });
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div().flex_1().min_h(px(0.)).child(self.render_documents_tab(&project, cx)),
+                    )
+                    .into_any_element();
+            }
+
+            let opener = entity;
+            div()
+                .size_full()
+                .v_flex()
+                .items_center()
+                .justify_center()
+                .gap_3()
+                .p_8()
+                .child(
+                    div()
+                        .text_xl()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(language.choose("先选择项目", "Select a project first")),
+                )
+                .child(
+                    div()
+                        .max_w(px(560.))
+                        .text_sm()
+                        .text_color(rgb(TEXT_SECONDARY))
+                        .whitespace_normal()
+                        .child(language.choose(
+                            "用量汇总和审计事件是分离的只读投影；审计行始终保留项目、Provider、运行时和会话来源。",
+                            "Authorized documents, source registration, and evidence retrieval are project-scoped. Create or open a project, then select it from the project list.",
+                        )),
+                )
+                .child(
+                    Button::new("documents-open-projects")
+                        .primary()
+                        .label(language.choose("打开项目", "Open projects"))
+                        .on_click(move |_, _, cx| {
+                            opener.update(cx, |view, cx| {
+                                view.screen = ControlPlaneScreen::Projects;
+                                cx.notify();
+                            });
+                        }),
+                )
+                .into_any_element()
+        }
+
+        /// Spreadsheet numbers keep their cached precision but drop a bare `.0` tail.
+        // The truncating cast is guarded: only integral values below 1e15 reach it.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+        fn format_number_cell(value: f64) -> String {
+            if value.fract() == 0. && value.abs() < 1e15 {
+                format!("{}", value as i64)
+            } else {
+                format!("{value}")
+            }
+        }
+
+        /// Converts one tight RGBA bitmap into a GPUI render image.
+        ///
+        /// GPUI consumes BGRA, the opener protocol carries RGBA, so each pixel's red and
+        /// blue channels swap here. `None` means the page could not be converted and is
+        /// skipped rather than blanking the preview.
+        fn render_image_from_rgba(
+            width: u32,
+            height: u32,
+            rgba: Vec<u8>,
+        ) -> Option<std::sync::Arc<gpui::RenderImage>> {
+            let mut bgra = rgba;
+            for pixel in bgra.as_chunks_mut::<4>().0 {
+                pixel.swap(0, 2);
+            }
+            let buffer = image::RgbaImage::from_raw(width, height, bgra)?;
+            Some(std::sync::Arc::new(gpui::RenderImage::new(vec![image::Frame::new(buffer)])))
+        }
+
+        /// Builds the page-image set for a rasterized view body, once, at open time.
+        fn raster_preview(view: &DocumentView) -> Option<DocumentRasterPreview> {
+            let circuitfabric_plugin_api::DocumentViewBody::RasterPages {
+                pages,
+                page_count,
+                truncated,
+            } = &view.body
+            else {
+                return None;
+            };
+            let converted = pages
+                .iter()
+                .filter_map(|page| {
+                    Some(DocumentRasterPreviewPage {
+                        number: page.number,
+                        image: Self::render_image_from_rgba(
+                            page.width,
+                            page.height,
+                            page.rgba.clone(),
+                        )?,
+                        width: page.width,
+                        height: page.height,
+                    })
+                })
+                .collect();
+            Some(DocumentRasterPreview {
+                pages: converted,
+                page_count: *page_count,
+                truncated: *truncated,
+            })
+        }
+
+        /// The docked right-hand preview pane.
+        ///
+        /// Rendered beside the scrollable page content (not inside it), so it keeps the full
+        /// window height and scrolls independently of the page behind it.
+        fn render_document_preview_pane(&self, cx: &mut Context<Self>) -> AnyElement {
+            let entity = cx.entity().clone();
+            let language = self.language;
+            let pane_width = self.document_preview_width;
+            let Some(preview) = &self.document_preview else {
+                return div().into_any_element();
+            };
+
+            let (state_label, state_colors) = match &preview.state {
+                DocumentPreviewState::Loading => {
+                    (language.choose("加载中", "Loading"), (0x00f0_f9ff, 0x000e_7490))
+                }
+                DocumentPreviewState::Loaded { .. } => {
+                    (language.choose("已加载", "Loaded"), (0x00dc_fce7, 0x0016_a34a))
+                }
+                DocumentPreviewState::Refused { .. } => {
+                    (language.choose("已拒绝", "Refused"), (0x00fe_f2f2, 0x00b9_1c1c))
+                }
+                DocumentPreviewState::Unavailable { .. } => {
+                    (language.choose("不可预览", "Unavailable"), (0x00ff_f7ed, 0x00b4_5309))
+                }
+            };
+
+            let is_pdf = preview.file_name.to_lowercase().ends_with(".pdf");
+            let show_data = self.preview_show_data && is_pdf;
+            let header_closer = entity.clone();
+            let header =
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .p_3()
+                    .border_b_1()
+                    .border_color(rgb(BORDER))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .v_flex()
+                            .gap_0p5()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .whitespace_normal()
+                                    .child(preview.file_name.clone()),
+                            )
+                            .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(format!(
+                                "{} · {}",
+                                preview.project_id, preview.document_id
+                            ))),
+                    )
+                    .child(
+                        div()
+                            .px_1p5()
+                            .py_0p5()
+                            .rounded_sm()
+                            .text_xs()
+                            .flex_none()
+                            .bg(rgb(state_colors.0))
+                            .text_color(rgb(state_colors.1))
+                            .child(state_label),
+                    )
+                    .child(
+                        Button::new("close-document-preview")
+                            .ghost()
+                            .label(language.choose("关闭", "Close"))
+                            .on_click(move |_, window, cx| {
+                                header_closer.update(cx, |view, cx| {
+                                    view.close_document_preview(window, cx);
+                                });
+                            }),
+                    );
+
+            // Datasheet PDFs get a second tab with the structured extraction.
+            let tabs = if is_pdf {
+                let preview_tab = entity.clone();
+                let data_tab = entity.clone();
+                Some(
+                    div()
+                        .flex()
+                        .gap_1()
+                        .px_3()
+                        .py_1()
+                        .border_b_1()
+                        .border_color(rgb(BORDER))
+                        .child(
+                            Button::new("preview-tab-document")
+                                .when(!show_data, Button::primary)
+                                .when(show_data, Button::ghost)
+                                .label(language.choose("文档", "Document"))
+                                .on_click(move |_, _, cx| {
+                                    preview_tab.update(cx, |view, cx| {
+                                        view.preview_show_data = false;
+                                        cx.notify();
+                                    });
+                                }),
+                        )
+                        .child(
+                            Button::new("preview-tab-data")
+                                .when(show_data, Button::primary)
+                                .when(!show_data, Button::ghost)
+                                .label(language.choose("数据", "Data"))
+                                .on_click(move |_, _, cx| {
+                                    data_tab.update(cx, |view, cx| {
+                                        view.preview_show_data = true;
+                                        cx.notify();
+                                    });
+                                }),
+                        ),
+                )
+            } else {
+                None
+            };
+
+            let mut body = div().v_flex().gap_2();
+            if show_data {
+                let stream_log = self
+                    .datasheet_stream
+                    .as_ref()
+                    .filter(|(project_id, document_id, _)| {
+                        *project_id == preview.project_id && *document_id == preview.document_id
+                    })
+                    .and_then(|(_, _, stream)| stream.lock().ok().map(|buffer| buffer.clone()));
+                body = body.child(Self::render_datasheet_data(
+                    preview,
+                    language,
+                    &entity,
+                    self.datasheet_rows_visible,
+                    self.datasheet_extracting,
+                    self.datasheet_feedback.as_deref(),
+                    stream_log,
+                    self.datasheet_extract_started
+                        .filter(|_| self.datasheet_extracting)
+                        .map(|started| started.elapsed().as_secs()),
+                    self.datasheet_checkpoint.as_ref().is_some_and(
+                        |(project_id, document_id, _)| {
+                            *project_id == preview.project_id && *document_id == preview.document_id
+                        },
+                    ),
+                ));
+            } else {
+                match &preview.state {
+                    DocumentPreviewState::Loading => {
+                        body = body.child(
+                            div()
+                                .p_3()
+                                .child(language.choose("正在加载文档…", "Loading document…")),
+                        );
+                    }
+                    DocumentPreviewState::Loaded { view, raster } => {
+                        body = body
+                            .child(
+                                div()
+                                    .v_flex()
+                                    .gap_0p5()
+                                    .p_2()
+                                    .rounded_md()
+                                    .bg(rgb(SURFACE_BG))
+                                    .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(
+                                        format!(
+                                            "{} · {}",
+                                            &view.content_hash[..view.content_hash.len().min(19)],
+                                            view.opener_id
+                                        ),
+                                    ))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(TEXT_MUTED))
+                                            .whitespace_normal()
+                                            .child(format!("source: {}", view.source_locator)),
+                                    ),
+                            )
+                            .child(match raster {
+                                Some(raster) => {
+                                    Self::render_document_raster_pages(raster, language, pane_width)
+                                }
+                                None => Self::render_document_view_body(&view.body, language),
+                            });
+                    }
+                    DocumentPreviewState::Refused { denial } => {
+                        body = body.child(
+                        div()
+                            .v_flex()
+                            .gap_1()
+                            .p_3()
+                            .rounded_lg()
+                            .bg(rgb(0x00fe_f2f2))
+                            .text_color(rgb(0x00b9_1c1c))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(language.choose(
+                                        "该文档未通过打开门，不能被打开或作为证据源。",
+                                        "This document did not pass the open gate and cannot be opened or cited.",
+                                    )),
+                            )
+                            .child(
+                                div().text_xs().whitespace_normal().child(denial.to_string()),
+                            ),
+                    );
+                    }
+                    DocumentPreviewState::Unavailable { reason } => {
+                        body = body.child(
+                        div()
+                            .v_flex()
+                            .gap_1()
+                            .p_3()
+                            .rounded_lg()
+                            .bg(rgb(0x00ff_f7ed))
+                            .text_color(rgb(0x00b4_5309))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(language.choose(
+                                        "预览不可用：没有打开器支持该格式，或内容已损坏。",
+                                        "Preview unavailable: no opener supports this format, or the content is corrupt.",
+                                    )),
+                            )
+                            .child(div().text_xs().whitespace_normal().child(reason.clone())),
+                    );
+                    }
+                }
+            }
+
+            div()
+                .flex_none()
+                .w(px(pane_width))
+                .h_full()
+                .v_flex()
+                .bg(rgb(CARD_BG))
+                .border_l_1()
+                .border_color(rgb(BORDER))
+                .child(header)
+                .when_some(tabs, ParentElement::child)
+                .child(
+                    div()
+                        .id("document-preview-scroll")
+                        .flex_1()
+                        .min_h(px(0.))
+                        .overflow_y_scrollbar()
+                        .v_flex()
+                        .gap_2()
+                        .p_3()
+                        .child(body),
+                )
+                .into_any_element()
+        }
+
+        /// The structured datasheet tab: the persisted extraction, or the action to create
+        /// one. Extraction always runs through the open gate, so only verified bytes are
+        /// parsed.
+        #[allow(clippy::too_many_arguments)]
+        fn render_datasheet_data(
+            preview: &DocumentPreviewSelection,
+            language: UiLanguage,
+            entity: &Entity<Self>,
+            visible_rows: usize,
+            extracting: bool,
+            feedback: Option<&str>,
+            stream_log: Option<String>,
+            elapsed_seconds: Option<u64>,
+            can_resume: bool,
+        ) -> Div {
+            let extractor = entity.clone();
+            let stopper = entity.clone();
+            let resumer = entity.clone();
+            let clear_existing = preview.extraction.is_some();
+            let extract_button = div()
+                .flex()
+                .flex_wrap()
+                .gap_2()
+                .when(extracting, |row| {
+                    row.child(
+                        Button::new("stop-datasheet-extraction")
+                            .danger()
+                            .label(language.choose("停止", "Stop"))
+                            .on_click(move |_, _, cx| {
+                                stopper.update(cx, Self::stop_datasheet_extraction);
+                            }),
+                    )
+                })
+                .when(!extracting && can_resume, |row| {
+                    row.child(
+                        Button::new("resume-datasheet-extraction")
+                            .primary()
+                            .label(language.choose("继续", "Continue"))
+                            .on_click(move |_, window, cx| {
+                                resumer.update(cx, |view, cx| {
+                                    view.extract_datasheet_for_preview(
+                                        clear_existing,
+                                        true,
+                                        window,
+                                        cx,
+                                    );
+                                });
+                            }),
+                    )
+                })
+                .child(
+                    Button::new("extract-datasheet-data")
+                        .when(!clear_existing, Button::primary)
+                        .when(clear_existing, Button::danger)
+                        .disabled(extracting)
+                        .label(if extracting {
+                            language.choose("正在提取…", "Extracting…")
+                        } else if clear_existing {
+                            language.choose("清空并重新提取", "Clear and re-extract")
+                        } else {
+                            language.choose("提取结构化数据", "Extract structured data")
+                        })
+                        .on_click(move |_, window, cx| {
+                            extractor.update(cx, |view, cx| {
+                                view.extract_datasheet_for_preview(
+                                    clear_existing,
+                                    false,
+                                    window,
+                                    cx,
+                                );
+                            });
+                        }),
+                );
+
+            let feedback_note =
+                feedback.map(|message| Self::render_preview_truncation_note(message.to_owned()));
+            let stream_window = stream_log
+                .map(|log| Self::render_datasheet_stream(&log, elapsed_seconds, language));
+            let Some(extraction) = &preview.extraction else {
+                return div().v_flex().gap_3().p_3().children(feedback_note).children(stream_window).child(
+                    div()
+                        .v_flex()
+                        .gap_2()
+                        .p_3()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(language.choose(
+                                    "尚无结构化数据",
+                                    "No structured data yet",
+                                )),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(TEXT_MUTED))
+                                .whitespace_normal()
+                                .child(language.choose(
+                                    "从该数据手册中提取器件标识、引脚表与关键参数表，结构化保存在项目内。",
+                                    "Extract part identity, the pin table, and key parameter tables from this datasheet, stored structurally in the project.",
+                                )),
+                        )
+                        .child(extract_button),
+                );
+            };
+
+            // A stale extraction (content changed since it was made) is shown, never hidden,
+            // together with the reminder to re-extract.
+            let stale = match &preview.state {
+                DocumentPreviewState::Loaded { view, .. } => {
+                    view.content_hash != extraction.content_hash
+                }
+                _ => false,
+            };
+
+            let mut content = div().v_flex().gap_2();
+            content = content.children(feedback_note).children(stream_window);
+            if !extraction.notes.iter().any(|note| note.starts_with("Jev accepted ")) {
+                content = content.child(Self::render_preview_truncation_note(
+                    language.choose(
+                        "这是旧版提取结果，没有 Jev evaluate 验证记录；请清空并重新提取。",
+                        "This extraction has no Jev evaluate verification record; clear and re-extract.",
+                    ).to_owned(),
+                ));
+            }
+            if stale {
+                content = content.child(Self::render_preview_truncation_note(
+                    language
+                        .choose(
+                            "文档内容在提取后发生变化，以下数据可能过期，建议重新提取。",
+                            "The document changed after extraction; the data below may be stale — re-extract.",
+                        )
+                        .to_owned(),
+                ));
+            }
+
+            // Overview card.
+            let overview = &extraction.overview;
+            let mut overview_card =
+                div().v_flex().gap_1().p_3().rounded_lg().bg(rgb(SURFACE_BG)).child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .whitespace_normal()
+                        .child(overview.title.clone()),
+                );
+            let identity_line = [
+                overview.manufacturer.clone(),
+                (!overview.part_numbers.is_empty()).then(|| overview.part_numbers.join(" / ")),
+                (!overview.packages.is_empty()).then(|| overview.packages.join(", ")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" · ");
+            if !identity_line.is_empty() {
+                overview_card = overview_card.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(TEXT_MUTED))
+                        .whitespace_normal()
+                        .child(identity_line),
+                );
+            }
+            if !overview.features.is_empty() {
+                overview_card = overview_card.child(
+                    div()
+                        .v_flex()
+                        .gap_0p5()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(rgb(0x000e_7490))
+                                .child(language.choose("特性", "Features")),
+                        )
+                        .children(overview.features.iter().map(|feature| {
+                            div()
+                                .text_xs()
+                                .text_color(rgb(TEXT_PRIMARY))
+                                .whitespace_normal()
+                                .child(format!("• {feature}"))
+                        })),
+                );
+            }
+            if !overview.description.is_empty() {
+                overview_card = overview_card.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(TEXT_SECONDARY))
+                        .whitespace_normal()
+                        .child(overview.description.clone()),
+                );
+            }
+            content = content.child(overview_card);
+
+            content = content.child(Self::render_datasheet_pin_table(
+                &extraction.pins,
+                language,
+                visible_rows,
+            ));
+            content = content.child(Self::render_datasheet_parameter_table(
+                language.choose("绝对最大额定值", "Absolute Maximum Ratings"),
+                &extraction.absolute_maximum_ratings,
+                language,
+                visible_rows,
+                0x00fe_f2f2,
+                0x00b9_1c1c,
+            ));
+            content = content.child(Self::render_datasheet_parameter_table(
+                language.choose("电特性", "Electrical Characteristics"),
+                &extraction.electrical_characteristics,
+                language,
+                visible_rows,
+                0x00e0_f2fe,
+                0x000e_7490,
+            ));
+            content = content.child(Self::render_datasheet_parameter_table(
+                language.choose("工作条件", "Operating Conditions"),
+                &extraction.operating_conditions,
+                language,
+                visible_rows,
+                0x00f3_e8ff,
+                0x0076_2ba3,
+            ));
+
+            if [
+                extraction.pins.len(),
+                extraction.absolute_maximum_ratings.len(),
+                extraction.electrical_characteristics.len(),
+                extraction.operating_conditions.len(),
+            ]
+            .into_iter()
+            .any(|count| count > visible_rows)
+            {
+                let loader = entity.clone();
+                content = content.child(
+                    Button::new("show-more-datasheet-rows")
+                        .label(language.choose("显示更多行", "Show more rows"))
+                        .on_click(move |_, _, cx| {
+                            loader.update(cx, |view, cx| {
+                                view.datasheet_rows_visible =
+                                    view.datasheet_rows_visible.saturating_add(40);
+                                cx.notify();
+                            });
+                        }),
+                );
+            }
+
+            if !extraction.notes.is_empty() {
+                content = content.child(
+                    div().v_flex().gap_0p5().p_2().rounded_md().bg(rgb(SURFACE_BG)).children(
+                        extraction.notes.iter().map(|note| {
+                            div()
+                                .text_xs()
+                                .text_color(rgb(TEXT_MUTED))
+                                .whitespace_normal()
+                                .child(format!("· {note}"))
+                        }),
+                    ),
+                );
+            }
+            content.child(extract_button)
+        }
+
+        /// The pin table: number, name, classified kind, and description.
+        fn render_datasheet_pin_table(
+            pins: &[circuitfabric_contracts::DatasheetPin],
+            language: UiLanguage,
+            visible_rows: usize,
+        ) -> Div {
+            let mut table = div().v_flex().gap_1().child(
+                div().text_sm().font_weight(FontWeight::SEMIBOLD).child(language.choose_owned(
+                    format!("引脚（{}）", pins.len()),
+                    format!("Pins ({})", pins.len()),
+                )),
+            );
+            if pins.is_empty() {
+                return table.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(TEXT_MUTED))
+                        .child(language.choose("未解析到引脚行。", "No pin rows parsed.")),
+                );
+            }
+            let header_row = |label: &str, flex: f32| {
+                div()
+                    .flex_none()
+                    .w(px(flex))
+                    .text_xs()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(TEXT_MUTED))
+                    .child(label.to_owned())
+            };
+            table = table.child(
+                div()
+                    .flex()
+                    .gap_1()
+                    .p_1()
+                    .rounded_sm()
+                    .bg(rgb(SURFACE_BG))
+                    .child(header_row(language.choose("引脚", "Pin"), 34.0))
+                    .child(header_row(language.choose("名称", "Name"), 76.0))
+                    .child(header_row(language.choose("类型", "Kind"), 52.0))
+                    .child(header_row(language.choose("说明", "Description"), 0.0))
+                    .child(div().flex_1()),
+            );
+            for pin in pins.iter().take(visible_rows) {
+                table = table.child(
+                    div()
+                        .flex()
+                        .gap_1()
+                        .child(
+                            div()
+                                .flex_none()
+                                .w(px(34.0))
+                                .text_xs()
+                                .text_color(rgb(TEXT_PRIMARY))
+                                .child(pin.number.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .w(px(76.0))
+                                .text_xs()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(rgb(TEXT_PRIMARY))
+                                .child(pin.name.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .w(px(52.0))
+                                .text_xs()
+                                .text_color(rgb(0x000e_7490))
+                                .child(pin.kind.as_str().to_owned()),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .text_xs()
+                                .text_color(rgb(TEXT_SECONDARY))
+                                .whitespace_normal()
+                                .child(pin.description.clone()),
+                        ),
+                );
+            }
+            table
+        }
+
+        /// One parameter table with min/typ/max/unit columns.
+        fn render_datasheet_parameter_table(
+            title: &str,
+            parameters: &[circuitfabric_contracts::DatasheetParameter],
+            language: UiLanguage,
+            visible_rows: usize,
+            accent: u32,
+            accent_text: u32,
+        ) -> Div {
+            let mut table = div().v_flex().gap_1().child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .px_1p5()
+                            .py_0p5()
+                            .rounded_sm()
+                            .text_xs()
+                            .flex_none()
+                            .bg(rgb(accent))
+                            .text_color(rgb(accent_text))
+                            .child(title.to_owned()),
+                    )
+                    .child(div().ml_auto().text_xs().text_color(rgb(TEXT_MUTED)).child(
+                        language.choose_owned(
+                            format!("{} 行", parameters.len()),
+                            format!("{} rows", parameters.len()),
+                        ),
+                    )),
+            );
+            if parameters.is_empty() {
+                return table.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(TEXT_MUTED))
+                        .child(language.choose("未解析到参数行。", "No parameter rows parsed.")),
+                );
+            }
+            let header_row = |label: &str, flex: f32| {
+                div()
+                    .flex_none()
+                    .w(px(flex))
+                    .text_xs()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(TEXT_MUTED))
+                    .child(label.to_owned())
+            };
+            table = table.child(
+                div()
+                    .flex()
+                    .gap_1()
+                    .p_1()
+                    .rounded_sm()
+                    .bg(rgb(SURFACE_BG))
+                    .child(header_row(language.choose("参数", "Parameter"), 0.0))
+                    .child(div().flex_1())
+                    .child(header_row(language.choose("符号", "Symbol"), 52.0))
+                    .child(header_row(language.choose("最小", "Min"), 46.0))
+                    .child(header_row(language.choose("典型", "Typ"), 46.0))
+                    .child(header_row(language.choose("最大", "Max"), 46.0))
+                    .child(header_row(language.choose("单位", "Unit"), 34.0)),
+            );
+            for parameter in parameters.iter().take(visible_rows) {
+                let cell = |value: &Option<String>, emphasized: bool| {
+                    div()
+                        .flex_none()
+                        .w(px(if emphasized { 46.0 } else { 0.0 }))
+                        .text_xs()
+                        .text_color(rgb(TEXT_PRIMARY))
+                        .child(value.clone().unwrap_or_else(|| "—".to_owned()))
+                };
+                table = table.child(
+                    div()
+                        .flex()
+                        .gap_1()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .text_xs()
+                                .text_color(rgb(TEXT_PRIMARY))
+                                .whitespace_normal()
+                                .child(parameter.parameter.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .w(px(52.0))
+                                .text_xs()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(rgb(0x000e_7490))
+                                .whitespace_normal()
+                                .child(parameter.symbol.clone().unwrap_or_else(|| "—".to_owned())),
+                        )
+                        .child(cell(&parameter.min, true))
+                        .child(cell(&parameter.typ, true))
+                        .child(cell(&parameter.max, true))
+                        .child(
+                            div()
+                                .flex_none()
+                                .w(px(34.0))
+                                .text_xs()
+                                .text_color(rgb(TEXT_MUTED))
+                                .whitespace_normal()
+                                .child(parameter.unit.clone().unwrap_or_else(|| "—".to_owned())),
+                        )
+                        .when_some(parameter.conditions.clone(), |row, conditions| {
+                            row.child(
+                                div()
+                                    .flex_none()
+                                    .max_w(px(120.0))
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_MUTED))
+                                    .whitespace_normal()
+                                    .child(format!("({conditions})")),
+                            )
+                        }),
+                );
+            }
+            table
+        }
+
+        /// Displays rendered page bitmaps: a scrollable, reader-like PDF preview.
+        fn render_document_raster_pages(
+            raster: &DocumentRasterPreview,
+            language: UiLanguage,
+            pane_width: f32,
+        ) -> Div {
+            // Page bitmaps follow the divider: pane width minus the body padding, the page
+            // card's own padding, and its border.
+            let bitmap_width = (pane_width - 34.0).max(240.0);
+            let mut content = div().v_flex().gap_2().child(
+                div().text_xs().text_color(rgb(TEXT_MUTED)).child(language.choose_owned(
+                    format!("共 {} 页（整页渲染，滚动查看）", raster.page_count),
+                    format!("{} pages — full-page rendering, scroll to read", raster.page_count),
+                )),
+            );
+            if raster.truncated {
+                content = content.child(Self::render_preview_truncation_note(
+                    language
+                        .choose(
+                            "页数较多，仅渲染前 {first} 页。",
+                            "Long document; the first {first} pages are rendered.",
+                        )
+                        .replace("{first}", &raster.pages.len().to_string()),
+                ));
+            }
+            for page in &raster.pages {
+                let display_height = if page.width > 0 {
+                    bitmap_width * page.height as f32 / page.width as f32
+                } else {
+                    bitmap_width * 1.3
+                };
+                content = content.child(
+                    div()
+                        .v_flex()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(rgb(0x000e_7490))
+                                .child(language.choose_owned(
+                                    format!("第 {} 页", page.number),
+                                    format!("Page {}", page.number),
+                                )),
+                        )
+                        .child(
+                            div()
+                                .p_1()
+                                .rounded_sm()
+                                .border_1()
+                                .border_color(rgb(BORDER))
+                                .bg(rgb(SURFACE_BG))
+                                .child(
+                                    img(page.image.clone())
+                                        .w(px(bitmap_width))
+                                        .h(px(display_height)),
+                                ),
+                        ),
+                );
+            }
+            content
+        }
+
+        /// Renders one opener view body as read-only embeddable content.
+        fn render_document_view_body(view_body: &DocumentViewBody, language: UiLanguage) -> Div {
+            let mut content = div().v_flex().gap_2();
+            match view_body {
+                // Rasterized views are rendered by `render_document_raster_pages` before
+                // this function is reached; this arm keeps the match exhaustive for any
+                // body handed over directly.
+                DocumentViewBody::RasterPages { .. } => {}
+                DocumentViewBody::PagedText { pages, truncated } => {
+                    if *truncated {
+                        content = content.child(Self::render_preview_truncation_note(
+                            language
+                                .choose(
+                                    "页数较多，仅显示前 {first} 页。",
+                                    "Long document; showing the first {first} pages.",
+                                )
+                                .replace("{first}", &pages.len().to_string()),
+                        ));
+                    }
+                    if pages.len() > PREVIEW_MAX_RENDERED_PAGES {
+                        content = content.child(Self::render_preview_truncation_note(
+                            language
+                                .choose(
+                                    "为保持界面流畅，预览面板仅渲染前 {first} 页。",
+                                    "For smooth scrolling the pane renders the first {first} pages.",
+                                )
+                                .replace("{first}", &PREVIEW_MAX_RENDERED_PAGES.to_string()),
+                        ));
+                    }
+                    for page in pages.iter().take(PREVIEW_MAX_RENDERED_PAGES) {
+                        content = content.child(
+                            div()
+                                .v_flex()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(rgb(0x000e_7490))
+                                        .child(language.choose_owned(
+                                            format!("第 {} 页", page.number),
+                                            format!("Page {}", page.number),
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .p_2()
+                                        .rounded_md()
+                                        .bg(rgb(SURFACE_BG))
+                                        .text_sm()
+                                        .text_color(rgb(TEXT_PRIMARY))
+                                        .whitespace_normal()
+                                        .child(page.text.clone()),
+                                ),
+                        );
+                    }
+                }
+                DocumentViewBody::Blocks { blocks, truncated } => {
+                    if *truncated {
+                        content = content.child(Self::render_preview_truncation_note(
+                            language
+                                .choose(
+                                    "内容较多，仅显示前 {first} 个块。",
+                                    "Long document; showing the first {first} blocks.",
+                                )
+                                .replace("{first}", &blocks.len().to_string()),
+                        ));
+                    }
+                    if blocks.len() > PREVIEW_MAX_RENDERED_BLOCKS {
+                        content = content.child(Self::render_preview_truncation_note(
+                            language
+                                .choose(
+                                    "为保持界面流畅，预览面板仅渲染前 {first} 个块。",
+                                    "For smooth scrolling the pane renders the first {first} blocks.",
+                                )
+                                .replace("{first}", &PREVIEW_MAX_RENDERED_BLOCKS.to_string()),
+                        ));
+                    }
+                    for block in blocks.iter().take(PREVIEW_MAX_RENDERED_BLOCKS) {
+                        content = content.child(Self::render_document_block(block));
+                    }
+                }
+                DocumentViewBody::Sheets { sheets } => {
+                    for sheet in sheets {
+                        let mut sheet_block = div().v_flex().gap_1().child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child(sheet.name.clone()),
+                                )
+                                .child(
+                                    div().ml_auto().text_xs().text_color(rgb(TEXT_MUTED)).child(
+                                        language.choose_owned(
+                                            format!("{} 行", sheet.row_count),
+                                            format!("{} rows", sheet.row_count),
+                                        ),
+                                    ),
+                                ),
+                        );
+                        if sheet.truncated {
+                            sheet_block = sheet_block.child(Self::render_preview_truncation_note(
+                                language
+                                    .choose(
+                                        "工作表较大，仅显示前 {first} 行。",
+                                        "Large sheet; showing the first {first} rows.",
+                                    )
+                                    .replace("{first}", &sheet.rows.len().to_string()),
+                            ));
+                        }
+                        if sheet.rows.len() > PREVIEW_MAX_RENDERED_ROWS {
+                            sheet_block = sheet_block.child(Self::render_preview_truncation_note(
+                                language
+                                    .choose(
+                                        "为保持界面流畅，预览面板仅渲染前 {first} 行。",
+                                        "For smooth scrolling the pane renders the first {first} rows.",
+                                    )
+                                    .replace("{first}", &PREVIEW_MAX_RENDERED_ROWS.to_string()),
+                            ));
+                        }
+                        for (row_index, row) in
+                            sheet.rows.iter().enumerate().take(PREVIEW_MAX_RENDERED_ROWS)
+                        {
+                            let mut row_element = div().flex().gap_1();
+                            if row_index == 0 {
+                                row_element = row_element
+                                    .p_1()
+                                    .rounded_sm()
+                                    .bg(rgb(SURFACE_BG))
+                                    .font_weight(FontWeight::MEDIUM);
+                            }
+                            for cell in row {
+                                let label = match cell {
+                                    circuitfabric_plugin_api::DocumentCell::Empty => String::new(),
+                                    circuitfabric_plugin_api::DocumentCell::Text(text) => {
+                                        text.clone()
+                                    }
+                                    circuitfabric_plugin_api::DocumentCell::Number(value) => {
+                                        Self::format_number_cell(*value)
+                                    }
+                                    circuitfabric_plugin_api::DocumentCell::Boolean(value) => {
+                                        value.to_string()
+                                    }
+                                };
+                                row_element = row_element.child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .text_xs()
+                                        .whitespace_normal()
+                                        .child(label),
+                                );
+                            }
+                            sheet_block = sheet_block.child(row_element);
+                        }
+                        content = content.child(sheet_block);
+                    }
+                }
+                DocumentViewBody::PlainText { text } => {
+                    for line in text.lines() {
+                        content = content.child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(TEXT_PRIMARY))
+                                .whitespace_normal()
+                                .child(line.to_owned()),
+                        );
+                    }
+                }
+            }
+            content
+        }
+
+        fn render_document_block(block: &circuitfabric_plugin_api::DocumentBlock) -> Div {
+            let inline = Self::render_inline_spans(&block.spans, &block.text);
+            match &block.kind {
+                DocumentBlockKind::Heading { level } => {
+                    let heading = if *level <= 2 {
+                        div().text_lg()
+                    } else if *level <= 4 {
+                        div().text_base()
+                    } else {
+                        div().text_sm()
+                    };
+                    heading
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(TEXT_PRIMARY))
+                        .child(inline)
+                }
+                DocumentBlockKind::Paragraph => {
+                    div().text_sm().text_color(rgb(TEXT_PRIMARY)).child(inline)
+                }
+                DocumentBlockKind::Code { .. } => div()
+                    .text_xs()
+                    .p_2()
+                    .rounded_md()
+                    .bg(rgb(SURFACE_BG))
+                    .text_color(rgb(TEXT_PRIMARY))
+                    .child(inline),
+                DocumentBlockKind::ListItem { depth } => div()
+                    .flex()
+                    .gap_1p5()
+                    .ml(px(f32::from(*depth) * 14.))
+                    .child(div().text_sm().text_color(rgb(0x000e_7490)).child("•"))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .text_sm()
+                            .text_color(rgb(TEXT_PRIMARY))
+                            .child(inline),
+                    ),
+                DocumentBlockKind::Quote => div()
+                    .border_l_2()
+                    .border_color(rgb(ACCENT_SOFT))
+                    .pl_2()
+                    .text_sm()
+                    .text_color(rgb(TEXT_SECONDARY))
+                    .child(inline),
+            }
+        }
+
+        /// One block's inline content: a single styled-text element with per-span highlights
+        /// when the opener provided formatting runs, otherwise the plain text. Keeping it one
+        /// text element means words wrap normally across style changes.
+        fn render_inline_spans(
+            spans: &[circuitfabric_plugin_api::DocumentSpan],
+            fallback: &str,
+        ) -> AnyElement {
+            if spans.is_empty() {
+                return div().whitespace_normal().child(fallback.to_owned()).into_any_element();
+            }
+            let mut text = String::new();
+            let mut highlights = Vec::new();
+            for span in spans {
+                let start = text.len();
+                text.push_str(&span.text);
+                let end = text.len();
+                let style = match span.style {
+                    DocumentSpanStyle::Plain => continue,
+                    DocumentSpanStyle::Strong => HighlightStyle {
+                        font_weight: Some(FontWeight::BOLD),
+                        ..HighlightStyle::default()
+                    },
+                    DocumentSpanStyle::Emphasis => HighlightStyle {
+                        font_style: Some(FontStyle::Italic),
+                        ..HighlightStyle::default()
+                    },
+                    DocumentSpanStyle::Code => HighlightStyle {
+                        background_color: Some(rgb(SURFACE_BG).into()),
+                        ..HighlightStyle::default()
+                    },
+                    DocumentSpanStyle::Strikethrough => HighlightStyle {
+                        strikethrough: Some(StrikethroughStyle::default()),
+                        ..HighlightStyle::default()
+                    },
+                };
+                highlights.push((start..end, style));
+            }
+            StyledText::new(text).with_highlights(highlights).into_any_element()
+        }
+
+        fn render_preview_truncation_note(message: String) -> Div {
+            div()
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .bg(rgb(0x00ff_f7ed))
+                .text_xs()
+                .text_color(rgb(0x00b4_5309))
+                .child(message)
+        }
+
+        /// The live extraction log: stage lines plus the model reply as it streams. Only the
+        /// tail is rendered, bottom-aligned, so the newest output stays in view.
+        fn render_datasheet_stream(
+            log: &str,
+            elapsed_seconds: Option<u64>,
+            language: UiLanguage,
+        ) -> Div {
+            const TAIL_CHARS: usize = 2000;
+            let skip = log.chars().count().saturating_sub(TAIL_CHARS);
+            let tail: String = log.chars().skip(skip).collect();
+            div()
+                .v_flex()
+                .gap_1()
+                .p_2()
+                .rounded_md()
+                .border_1()
+                .border_color(rgb(BORDER))
+                .bg(rgb(SURFACE_BG))
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(rgb(TEXT_SECONDARY))
+                        .child(match elapsed_seconds {
+                            Some(seconds) => language.choose_owned(
+                                format!("模型输出（进行中… {seconds}s）"),
+                                format!("Model output (running… {seconds}s)"),
+                            ),
+                            None => language
+                                .choose("模型输出（已结束）", "Model output (finished)")
+                                .to_owned(),
+                        }),
+                )
+                .child(
+                    div()
+                        .v_flex()
+                        .justify_end()
+                        .h(px(180.))
+                        .overflow_hidden()
+                        .text_xs()
+                        .text_color(rgb(TEXT_MUTED))
+                        .whitespace_normal()
+                        .child(tail),
+                )
         }
 
         #[allow(clippy::too_many_lines)]
@@ -6697,6 +9150,7 @@ fn main() {
             let mut rows = div().v_flex().gap_2();
             for summary in &listing.sessions {
                 let metadata = &summary.metadata;
+                let project_id = project.id.clone();
                 let session_id = metadata.session_id.clone();
                 let opener = entity.clone();
                 let (status_bg, status_fg) = match metadata.status.as_str() {
@@ -6718,7 +9172,11 @@ fn main() {
                         .hover(|this| this.border_color(rgb(ACCENT_SOFT)))
                         .on_click(move |_, _, cx| {
                             opener.update(cx, |view, cx| {
-                                view.open_session_replay(session_id.clone(), cx);
+                                view.open_session_replay(
+                                    project_id.clone(),
+                                    session_id.clone(),
+                                    cx,
+                                );
                             });
                         })
                         .child(
@@ -6792,6 +9250,145 @@ fn main() {
             }
 
             div().v_flex().gap_3().size_full().child(rows).into_any_element()
+        }
+
+        /// The sidebar route uses the same persisted replay as the project detail tab.
+        /// Filtering and opening a record only read project storage; neither starts a session.
+        fn render_sessions_page(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+            let language = self.language;
+            let entity = cx.entity().clone();
+            let projects = self.workspace.projects().into_iter().cloned().collect::<Vec<_>>();
+            let selected = self
+                .session_project_filter
+                .as_ref()
+                .and_then(|id| projects.iter().find(|project| &project.id == id))
+                .or_else(|| {
+                    self.selected_project
+                        .as_ref()
+                        .and_then(|id| projects.iter().find(|project| &project.id == id))
+                })
+                .or_else(|| projects.first())
+                .cloned();
+
+            let mut filters = div().flex().flex_wrap().gap_2();
+            for project in &projects {
+                let project_id = project.id.clone();
+                let active = selected.as_ref().is_some_and(|current| current.id == project_id);
+                let chooser = entity.clone();
+                filters = filters.child(
+                    Button::new(format!("session-project-{project_id}"))
+                        .label(project.name.clone())
+                        .when(active, |button| button.primary())
+                        .on_click(move |_, _, cx| {
+                            chooser.update(cx, |view, cx| {
+                                view.session_project_filter = Some(project_id.clone());
+                                view.session_replay = None;
+                                cx.notify();
+                            });
+                        }),
+                );
+            }
+
+            let content = if let Some(project) = selected {
+                let project_id = project.id.clone();
+                let refresher = entity.clone();
+                div()
+                    .v_flex()
+                    .gap_3()
+                    .size_full()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(
+                                language.choose_owned(
+                                    format!("当前项目：{} · {}", project.name, project.id),
+                                    format!("Current project: {} · {}", project.name, project.id),
+                                ),
+                            ))
+                            .child(
+                                Button::new("refresh-session-list")
+                                    .ghost()
+                                    .label(language.choose("刷新", "Refresh"))
+                                    .on_click(move |_, _, cx| {
+                                        refresher.update(cx, |view, cx| {
+                                            if let Err(error) =
+                                                view.refresh_project_data(&project_id)
+                                            {
+                                                view.status = format!("会话列表未刷新：{error}");
+                                            }
+                                            cx.notify();
+                                        });
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("sessions-page-body")
+                            .flex_1()
+                            .min_h(px(0.))
+                            .overflow_y_scroll()
+                            .child(self.render_sessions_tab(&project, cx)),
+                    )
+                    .into_any_element()
+            } else {
+                let opener = entity.clone();
+                div()
+                    .v_flex()
+                    .gap_3()
+                    .items_center()
+                    .justify_center()
+                    .h_full()
+                    .child(language.choose("还没有项目", "No projects yet"))
+                    .child(
+                        Button::new("sessions-open-projects")
+                            .primary()
+                            .label(language.choose("打开项目", "Open projects"))
+                            .on_click(move |_, _, cx| {
+                                opener.update(cx, |view, cx| {
+                                    view.screen = ControlPlaneScreen::Projects;
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                    .into_any_element()
+            };
+
+            let canceller = entity;
+            div()
+                .size_full()
+                .v_flex()
+                .gap_4()
+                .p_6()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_xl()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(language.choose("会话与任务", "Sessions & tasks")),
+                        )
+                        .when(self.task_cancel.is_some(), |this| {
+                            this.child(
+                                Button::new("sessions-cancel-task")
+                                    .label(language.choose("取消当前任务", "Cancel current task"))
+                                    .on_click(move |_, _, cx| {
+                                        canceller.update(cx, |view, cx| {
+                                            if let Some(cancel) = &view.task_cancel {
+                                                cancel.cancel();
+                                            }
+                                            cx.notify();
+                                        });
+                                    }),
+                            )
+                        }),
+                )
+                .child(filters)
+                .child(div().flex_1().min_h(px(0.)).child(content))
         }
 
         fn project_empty_state(title: &'static str, description: &'static str) -> impl IntoElement {
@@ -8861,69 +11458,6 @@ fn main() {
                 .into_any_element()
         }
 
-        fn section_page(language: UiLanguage, screen: ControlPlaneScreen) -> impl IntoElement {
-            let (title, description, next_step) = language.page_copy(screen);
-            div().size_full().v_flex().justify_center().items_center().p_8().child(
-                div()
-                    .w_full()
-                    .max_w(px(680.))
-                    .v_flex()
-                    .gap_4()
-                    .p_6()
-                    .bg(rgb(CARD_BG))
-                    .rounded_xl()
-                    .border_1()
-                    .border_color(rgb(BORDER))
-                    .shadow_sm()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(div().w(px(4.)).h(px(22.)).rounded_full().bg(rgb(ACCENT)))
-                            .child(
-                                div()
-                                    .text_xl()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(TEXT_PRIMARY))
-                                    .child(title),
-                            ),
-                    )
-                    .child(div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(description))
-                    .child(
-                        div()
-                            .flex()
-                            .items_start()
-                            .gap_2p5()
-                            .p_3()
-                            .bg(rgb(SURFACE_BG))
-                            .rounded_lg()
-                            .border_1()
-                            .border_color(rgb(BORDER))
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_0p5()
-                                    .rounded_sm()
-                                    .text_xs()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(0x000e_7490))
-                                    .bg(rgb(0x00e0_f2fe))
-                                    .child("TODO"),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.))
-                                    .whitespace_normal()
-                                    .text_sm()
-                                    .text_color(rgb(TEXT_SECONDARY))
-                                    .child(next_step),
-                            ),
-                    ),
-            )
-        }
-
         /// Renders only state that the control plane has loaded or observed. A missing
         /// ChangeSet store is not represented as zero pending approvals, because zero would
         /// imply a readback that has not occurred.
@@ -10224,6 +12758,11 @@ fn main() {
                 } else {
                     None
                 };
+            let document_preview_pane = if self.document_preview.is_some() {
+                Some(self.render_document_preview_pane(cx))
+            } else {
+                None
+            };
             let entity = cx.entity().clone();
             let active_screen = self.screen;
             let language = self.language;
@@ -10344,11 +12883,15 @@ fn main() {
                 ControlPlaneScreen::Projects => {
                     self.render_projects_page(window, cx).into_any_element()
                 }
+                ControlPlaneScreen::Documents => self.render_documents_page(cx).into_any_element(),
                 ControlPlaneScreen::EdaServices => {
                     self.render_eda_services_page(window, cx).into_any_element()
                 }
                 ControlPlaneScreen::AgentsAndMcp => {
                     self.render_agents_page(window, cx).into_any_element()
+                }
+                ControlPlaneScreen::SessionsAndTasks => {
+                    self.render_sessions_page(cx).into_any_element()
                 }
                 ControlPlaneScreen::SecretsVault => {
                     self.render_secrets_page(window, cx).into_any_element()
@@ -10361,7 +12904,6 @@ fn main() {
                     self.render_changes_approvals_page(cx).into_any_element()
                 }
                 ControlPlaneScreen::Settings => self.render_settings_page(cx).into_any_element(),
-                screen => Self::section_page(language, screen).into_any_element(),
             };
 
             div()
@@ -10559,17 +13101,73 @@ fn main() {
                                 ),
                         )
                         .child(
-                            // Scrollable content. Vertical-only scrolling keeps
-                            // the page width locked to the viewport, so text
-                            // nodes receive a definite wrap width and reflow
-                            // instead of stretching the workspace sideways.
+                            // Scrollable content plus the docked document preview, when one
+                            // is open. Vertical-only scrolling keeps the page width locked to
+                            // the viewport, so text nodes receive a definite wrap width and
+                            // reflow instead of stretching the workspace sideways; the
+                            // preview pane sits beside the scroll host, not inside it, and
+                            // scrolls independently at full window height. The divider
+                            // between them is draggable and resizes the pane.
                             div()
+                                .flex()
                                 .flex_1()
-                                .min_w(px(0.))
-                                .overflow_y_scrollbar()
-                                .id("main-content-scroll")
-                                .bg(rgb(SURFACE_BG))
-                                .child(page),
+                                .min_h(px(0.))
+                                .on_drag_move::<DraggedPreviewSplit>(cx.listener(
+                                    |view, event: &DragMoveEvent<DraggedPreviewSplit>, _, cx| {
+                                        let row_right = f32::from(event.bounds.right());
+                                        let row_width =
+                                            f32::from(event.bounds.right() - event.bounds.left());
+                                        let pointer_x = f32::from(event.event.position.x);
+                                        let upper =
+                                            (row_width * 0.8).min(DOCUMENT_PREVIEW_MAX_WIDTH);
+                                        view.document_preview_width = (row_right - pointer_x)
+                                            .clamp(
+                                                DOCUMENT_PREVIEW_MIN_WIDTH,
+                                                upper.max(DOCUMENT_PREVIEW_MIN_WIDTH),
+                                            );
+                                        cx.notify();
+                                    },
+                                ))
+                                .on_drop::<DraggedPreviewSplit>(cx.listener(
+                                    |_view, _event, _window, cx| {
+                                        cx.notify();
+                                    },
+                                ))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .overflow_y_scrollbar()
+                                        .id("main-content-scroll")
+                                        .bg(rgb(SURFACE_BG))
+                                        .child(page),
+                                )
+                                .when_some(document_preview_pane, |row, pane| {
+                                    row.child(
+                                        div()
+                                            .id("document-preview-split-handle")
+                                            .w(px(6.))
+                                            .flex_none()
+                                            .h_full()
+                                            .cursor_col_resize()
+                                            .bg(rgb(BORDER))
+                                            .hover(|this| this.bg(rgb(ACCENT_SOFT)))
+                                            .block_mouse_except_scroll()
+                                            .on_click(cx.listener(
+                                                |view, event: &ClickEvent, _window, cx| {
+                                                    if event.click_count() >= 2 {
+                                                        view.document_preview_width =
+                                                            DOCUMENT_PREVIEW_WIDTH;
+                                                        cx.notify();
+                                                    }
+                                                },
+                                            ))
+                                            .on_drag(DraggedPreviewSplit, |_, _, _, cx| {
+                                                cx.new(|_| gpui::Empty)
+                                            }),
+                                    )
+                                    .child(pane)
+                                }),
                         )
                         .child(
                             // Status bar
@@ -10662,6 +13260,12 @@ mod tests {
     }
 
     #[test]
+    fn delivered_record_pages_are_navigation_screens() {
+        assert!(!ControlPlaneScreen::Documents.is_todo());
+        assert!(!ControlPlaneScreen::SessionsAndTasks.is_todo());
+    }
+
+    #[test]
     fn only_project_scoped_screens_require_a_project() {
         let project_independent = [
             ControlPlaneScreen::Overview,
@@ -10686,19 +13290,13 @@ mod tests {
             ControlPlaneScreen::ChangesAndApprovals,
             ControlPlaneScreen::BomAndExport,
         ] {
-            assert!(
-                screen.requires_project(),
-                "{screen:?} should require a selected project"
-            );
+            assert!(screen.requires_project(), "{screen:?} should require a selected project");
         }
     }
 
     #[test]
     fn window_title_names_the_selected_project() {
         assert_eq!(app_window_title(None), "CircuitFabric");
-        assert_eq!(
-            app_window_title(Some("信号链原型")),
-            "CircuitFabric — 信号链原型"
-        );
+        assert_eq!(app_window_title(None), "CircuitFabric");
     }
 }
