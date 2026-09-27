@@ -3,7 +3,8 @@
 //! Imports copy user-selected files into the managed `documents/` tree as content-addressed
 //! copies. Provenance (original file name and source locator) lives in
 //! `.circuitfabric/document-index.json`; identical content is stored once while each index
-//! record keeps its own authorization and source.
+//! record keeps its own authorization and source. Directory structure (see [`DocumentDirectory`])
+//! is persisted in the same index so the tree survives restarts unchanged.
 
 use std::{
     fs,
@@ -16,6 +17,17 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::ProjectStorageError;
+
+/// Schema version of `document-index.json`.
+///
+/// Version 2 added `directories` and per-document directory membership plus scan status; the
+/// loader accepts legacy version-1 indexes and migrates them in memory.
+pub const DOCUMENT_INDEX_SCHEMA_VERSION: u32 = 2;
+
+/// Stable ID of the built-in `documents/datasheets` directory record.
+pub const DATASHEETS_DIRECTORY_ID: &str = "dir-datasheets";
+/// Stable ID of the built-in `documents/reference-designs` directory record.
+pub const REFERENCE_DESIGNS_DIRECTORY_ID: &str = "dir-reference-designs";
 
 /// The managed document categories, each mapped to a stable directory under `documents/`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -41,6 +53,47 @@ impl DocumentCategory {
             Self::ReferenceDesign => "reference-design",
         }
     }
+
+    #[must_use]
+    pub const fn system_directory_id(self) -> &'static str {
+        match self {
+            Self::Datasheet => DATASHEETS_DIRECTORY_ID,
+            Self::ReferenceDesign => REFERENCE_DESIGNS_DIRECTORY_ID,
+        }
+    }
+}
+
+/// Content-scan lifecycle of a managed document.
+///
+/// Importing hashes the bytes, so newly imported documents start as [`ScanStatus::Scanned`].
+/// A future malware scanner may instead admit documents as [`ScanStatus::Pending`] until it
+/// clears them; only [`ScanStatus::Scanned`] documents may be opened or indexed as evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ScanStatus {
+    Pending,
+    Scanned,
+    Rejected,
+}
+
+/// Legacy records predate scan status; import-time hashing has always been the admission scan.
+fn scanned_by_default() -> ScanStatus {
+    ScanStatus::Scanned
+}
+
+/// One directory in the managed `documents/` tree.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocumentDirectory {
+    pub id: String,
+    /// Single path segment; never a nested or traversal path.
+    pub name: String,
+    /// Parent directory record; `None` anchors the directory directly under `documents/`.
+    pub parent_id: Option<String>,
+    /// Built-in category roots are always present and cannot be renamed or moved.
+    #[serde(default)]
+    pub system: bool,
+    pub created_at_unix_seconds: u64,
 }
 
 /// One authorized document record persisted in the project document index.
@@ -60,6 +113,11 @@ pub struct ProjectDocument {
     pub source_locator: String,
     pub authorized: bool,
     pub imported_at_unix_seconds: u64,
+    /// Owning directory record; `None` means the document sits directly under `documents/`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory_id: Option<String>,
+    #[serde(default = "scanned_by_default")]
+    pub scan_status: ScanStatus,
 }
 
 /// Serializes relative paths with `/` separators and accepts either separator on read.
@@ -82,7 +140,29 @@ mod relative_path_serde {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DocumentIndex {
     pub schema_version: u32,
+    #[serde(default)]
+    pub directories: Vec<DocumentDirectory>,
     pub documents: Vec<ProjectDocument>,
+}
+
+/// The built-in, immutable directory records every project index carries.
+pub(crate) fn system_directories() -> Vec<DocumentDirectory> {
+    vec![
+        DocumentDirectory {
+            id: DATASHEETS_DIRECTORY_ID.to_owned(),
+            name: "datasheets".to_owned(),
+            parent_id: None,
+            system: true,
+            created_at_unix_seconds: 0,
+        },
+        DocumentDirectory {
+            id: REFERENCE_DESIGNS_DIRECTORY_ID.to_owned(),
+            name: "reference-designs".to_owned(),
+            parent_id: None,
+            system: true,
+            created_at_unix_seconds: 0,
+        },
+    ]
 }
 
 /// Classifies a document kind from its original file name.
@@ -100,7 +180,8 @@ pub fn classify_document_kind(file_name: &str) -> DocumentKind {
         "pdf" => DocumentKind::Pdf,
         "doc" | "docx" | "rtf" | "odt" => DocumentKind::Word,
         "md" | "markdown" => DocumentKind::Markdown,
-        "csv" | "xls" | "xlsx" => DocumentKind::Bom,
+        "xls" | "xlsx" => DocumentKind::Excel,
+        "csv" => DocumentKind::Bom,
         "net" | "cir" | "spice" => DocumentKind::Netlist,
         _ => DocumentKind::Text,
     }
@@ -108,13 +189,21 @@ pub fn classify_document_kind(file_name: &str) -> DocumentKind {
 
 /// Whether a kind's managed copy can be read as UTF-8 text for evidence retrieval.
 ///
-/// Word processing formats and PDFs need an extractor that is not part of this layer yet.
+/// PDFs are indexed through [`crate::extract_pdf_pages`] instead; word processing and
+/// spreadsheet formats have no evidence extractor yet.
 #[must_use]
 pub const fn is_text_extractable(kind: &DocumentKind) -> bool {
     matches!(
         kind,
         DocumentKind::Markdown | DocumentKind::Bom | DocumentKind::Netlist | DocumentKind::Text
     )
+}
+
+/// Whether a kind can become full-text evidence at all: UTF-8 text directly, PDFs after
+/// their text has been extracted.
+#[must_use]
+pub const fn is_evidence_indexable(kind: &DocumentKind) -> bool {
+    is_text_extractable(kind) || matches!(kind, DocumentKind::Pdf)
 }
 
 /// The outcome of one document import.
@@ -129,11 +218,8 @@ pub struct DocumentImport {
 impl crate::ProjectStorage {
     /// Imports a user-selected file as an authorized, managed copy in this project root.
     ///
-    /// The bytes are hashed with SHA-256 and stored under `documents/<category>/` with a
-    /// content-addressed file name. Re-importing the same source file is idempotent: the
-    /// existing record is returned with `created: false` and no new record appears. Distinct
-    /// sources with identical content share the managed copy but keep separate records with
-    /// their own source locator and authorization.
+    /// Equivalent to [`Self::import_document_into`] with `directory_id: None`, which places
+    /// the copy in the category's built-in directory.
     ///
     /// # Errors
     ///
@@ -143,6 +229,30 @@ impl crate::ProjectStorage {
         &self,
         source: impl AsRef<Path>,
         category: DocumentCategory,
+        source_locator: impl Into<String>,
+    ) -> Result<DocumentImport, ProjectStorageError> {
+        self.import_document_into(source, category, None, source_locator)
+    }
+
+    /// Imports a user-selected file into a chosen directory of the managed `documents/` tree.
+    ///
+    /// The bytes are hashed with SHA-256 and stored with a content-addressed file name.
+    /// `directory_id: None` targets the category's built-in directory; `Some(id)` must name an
+    /// existing directory record (see [`crate::ProjectStorage::create_document_directory`]).
+    /// Re-importing the same source file is idempotent: the existing record is returned with
+    /// `created: false` and no new record appears. Distinct sources with identical content
+    /// share a managed copy while it lives in the same directory, and each keeps its own
+    /// source locator and authorization.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the source cannot be read, the index is missing or unreadable,
+    /// `directory_id` does not name a directory, or the managed copy cannot be written.
+    pub fn import_document_into(
+        &self,
+        source: impl AsRef<Path>,
+        category: DocumentCategory,
+        directory_id: Option<&str>,
         source_locator: impl Into<String>,
     ) -> Result<DocumentImport, ProjectStorageError> {
         let source = source.as_ref();
@@ -164,6 +274,7 @@ impl crate::ProjectStorage {
         let content_hash = format!("sha256:{digest}");
 
         let mut index = self.load_document_index()?;
+        let target = crate::directories::resolve_import_target(&index, category, directory_id)?;
         if let Some(existing) = index.documents.iter().find(|document| {
             document.content_hash == content_hash
                 && (document.source_locator == source_locator
@@ -172,17 +283,17 @@ impl crate::ProjectStorage {
             self.verify_managed_copy(&existing.relative_path, &content_hash)?;
             return Ok(DocumentImport { document: existing.clone(), created: false });
         }
-        let existing_copy = index
-            .documents
-            .iter()
-            .find(|document| document.content_hash == content_hash)
-            .map(|document| document.relative_path.clone());
-        let relative_path = if let Some(path) = existing_copy {
-            self.verify_managed_copy(&path, &content_hash)?;
-            path
+        // Reuse an existing copy only when it already lives in the target directory; a copy in
+        // another directory stays where it is so each directory remains self-contained.
+        let existing_copy = index.documents.iter().find(|document| {
+            document.content_hash == content_hash && document.directory_id == target.directory_id
+        });
+        let relative_path = if let Some(existing) = existing_copy {
+            self.verify_managed_copy(&existing.relative_path, &content_hash)?;
+            existing.relative_path.clone()
         } else {
-            let path = Path::new("documents")
-                .join(category.directory())
+            let path = target
+                .relative_directory
                 .join(format!("{digest}.{}", managed_extension(&original_file_name)));
             let absolute = self.resolve_relative_path(&path)?;
             if absolute.exists() {
@@ -219,6 +330,8 @@ impl crate::ProjectStorage {
             source_locator,
             authorized: true,
             imported_at_unix_seconds: now_unix_seconds(),
+            directory_id: target.directory_id,
+            scan_status: ScanStatus::Scanned,
         };
         index.documents.push(document.clone());
         self.save_document_index(&index)?;
@@ -290,15 +403,24 @@ impl crate::ProjectStorage {
                 }
             }
         })?;
-        let index = serde_json::from_str::<DocumentIndex>(&raw).map_err(|source| {
+        let mut index = serde_json::from_str::<DocumentIndex>(&raw).map_err(|source| {
             ProjectStorageError::ParseDocumentIndex { path: path.clone(), source }
         })?;
-        if index.schema_version != crate::PROJECT_STORAGE_SCHEMA_VERSION {
-            return Err(ProjectStorageError::UnsupportedDocumentIndexSchema {
-                path,
-                found: index.schema_version,
-                expected: crate::PROJECT_STORAGE_SCHEMA_VERSION,
-            });
+        match index.schema_version {
+            DOCUMENT_INDEX_SCHEMA_VERSION => normalize_index(&mut index)?,
+            // Version 1 predates directories and scan status; migrate in memory so reads of a
+            // legacy project work unchanged and the next write persists version 2.
+            1 => {
+                index.schema_version = DOCUMENT_INDEX_SCHEMA_VERSION;
+                normalize_index(&mut index)?;
+            }
+            found => {
+                return Err(ProjectStorageError::UnsupportedDocumentIndexSchema {
+                    path,
+                    found,
+                    expected: DOCUMENT_INDEX_SCHEMA_VERSION,
+                });
+            }
         }
         Ok(index)
     }
@@ -311,7 +433,7 @@ impl crate::ProjectStorage {
     }
 
     /// Confirms an existing managed copy really holds the expected content before reuse.
-    fn verify_managed_copy(
+    pub(crate) fn verify_managed_copy(
         &self,
         relative_path: &Path,
         expected_hash: &str,
@@ -365,6 +487,30 @@ fn now_unix_seconds() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
+/// Normalizes a loaded index in memory: guarantees the built-in system directories, and fills
+/// directory membership for legacy records whose relative path already implies it.
+///
+/// Fails only when the directory records form a parent cycle.
+fn normalize_index(index: &mut DocumentIndex) -> Result<(), ProjectStorageError> {
+    for directory in system_directories() {
+        if !index.directories.iter().any(|existing| existing.id == directory.id) {
+            index.directories.push(directory);
+        }
+    }
+    let paths = crate::directories::directory_paths(&index.directories)?;
+    for document in &mut index.documents {
+        if document.directory_id.is_some() {
+            continue;
+        }
+        let parent = document
+            .relative_path
+            .parent()
+            .map_or_else(|| PathBuf::from("documents"), ToOwned::to_owned);
+        document.directory_id = paths.ids_by_path.get(&parent).cloned();
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -372,7 +518,7 @@ mod tests {
     use circuitfabric_contracts::Project;
 
     use super::*;
-    use crate::{PROJECT_STORAGE_SCHEMA_VERSION, ProjectStorage};
+    use crate::ProjectStorage;
 
     fn project(id: &str) -> Project {
         Project { id: id.to_owned(), name: format!("Project {id}"), description: None }
@@ -418,7 +564,7 @@ mod tests {
         let index: serde_json::Value =
             serde_json::from_slice(&fs::read(storage.document_index_path()).expect("read index"))
                 .expect("parse index");
-        assert_eq!(index["schemaVersion"], PROJECT_STORAGE_SCHEMA_VERSION);
+        assert_eq!(index["schemaVersion"], DOCUMENT_INDEX_SCHEMA_VERSION);
         let relative = index["documents"][0]["relativePath"].as_str().expect("relative path");
         assert!(
             relative.starts_with("documents/datasheets/"),
@@ -475,13 +621,19 @@ mod tests {
 
         assert!(first.created);
         assert!(second.created, "a different source is its own document record");
-        assert_eq!(first.document.relative_path, second.document.relative_path);
+        // Each category directory stays self-contained: identical content imported into two
+        // categories keeps one copy per directory instead of cross-linking them.
+        assert_ne!(first.document.relative_path, second.document.relative_path);
+        assert!(first.document.relative_path.starts_with("documents/datasheets"));
+        assert!(second.document.relative_path.starts_with("documents/reference-designs"));
         assert_ne!(first.document.id, second.document.id);
         assert_eq!(second.document.category, DocumentCategory::ReferenceDesign);
         assert_eq!(second.document.original_file_name, "b.md");
         assert_eq!(storage.list_documents().expect("list").len(), 2);
         let datasheets = storage.root().join("documents/datasheets");
         assert_eq!(fs::read_dir(datasheets).expect("list datasheets").count(), 1);
+        let reference_designs = storage.root().join("documents/reference-designs");
+        assert_eq!(fs::read_dir(reference_designs).expect("list reference designs").count(), 1);
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -514,10 +666,12 @@ mod tests {
         assert_eq!(classify_document_kind("mcu.pdf"), DocumentKind::Pdf);
         assert_eq!(classify_document_kind("notes.docx"), DocumentKind::Word);
         assert_eq!(classify_document_kind("notes.md"), DocumentKind::Markdown);
+        assert_eq!(classify_document_kind("bom.xlsx"), DocumentKind::Excel);
         assert_eq!(classify_document_kind("bom.csv"), DocumentKind::Bom);
         assert_eq!(classify_document_kind("board.net"), DocumentKind::Netlist);
         assert_eq!(classify_document_kind("readme.txt"), DocumentKind::Text);
         assert!(!is_text_extractable(&DocumentKind::Pdf));
+        assert!(!is_text_extractable(&DocumentKind::Excel));
         assert!(is_text_extractable(&DocumentKind::Markdown));
     }
 }

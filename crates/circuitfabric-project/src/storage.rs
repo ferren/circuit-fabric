@@ -156,6 +156,34 @@ pub enum ProjectStorageError {
     UnsupportedDocumentIndexSchema { path: PathBuf, found: u32, expected: u32 },
     #[error("managed document copy `{path}` exists with different content")]
     ManagedCopyConflict { path: PathBuf },
+    #[error("document directory `{id}` does not exist")]
+    DocumentDirectoryNotFound { id: String },
+    #[error("document directory name `{name}` is invalid: {reason}")]
+    InvalidDocumentDirectoryName { name: String, reason: &'static str },
+    #[error("document directory `{path}` already exists")]
+    DocumentDirectoryNameConflict { path: PathBuf },
+    #[error("built-in document directory `{id}` cannot be renamed or moved")]
+    SystemDirectoryImmutable { id: String },
+    #[error("document directory records form a parent cycle at `{id}`")]
+    DocumentDirectoryCycle { id: String },
+    #[error("document directory `{id}` cannot be moved: {reason}")]
+    InvalidDirectoryMove { id: String, reason: &'static str },
+    #[error("document `{id}` does not exist in this project")]
+    DocumentNotFound { id: String },
+    #[error("file name `{name}` is invalid for a managed document")]
+    InvalidDocumentFileName { name: String },
+    #[error("managed copy of document `{document_id}` does not live in its recorded directory")]
+    ManagedCopyMisplaced { document_id: String },
+    #[error("datasheet extraction for document `{document_id}` is stale: content hash changed")]
+    DatasheetExtractionStale { document_id: String },
+    #[error("cannot parse datasheet extraction `{path}`: {source}")]
+    ParseDatasheetExtraction { path: PathBuf, source: serde_json::Error },
+    #[error(
+        "datasheet extraction `{path}` uses unsupported schema version {found}; expected {expected}"
+    )]
+    UnsupportedDatasheetExtractionSchema { path: PathBuf, found: u32, expected: u32 },
+    #[error("datasheet document ID `{id}` is invalid")]
+    InvalidDatasheetDocumentId { id: String },
     #[error("session ID `{session_id}` is invalid")]
     InvalidSessionId { session_id: String },
     #[error("session file `{path}` already exists")]
@@ -228,7 +256,8 @@ impl ProjectStorage {
         Self::write_json_atomically(
             &storage.document_index_path(),
             &crate::documents::DocumentIndex {
-                schema_version: PROJECT_STORAGE_SCHEMA_VERSION,
+                schema_version: crate::documents::DOCUMENT_INDEX_SCHEMA_VERSION,
+                directories: crate::documents::system_directories(),
                 documents: Vec::new(),
             },
         )?;
@@ -332,7 +361,7 @@ impl ProjectStorage {
             .collect()
     }
 
-    /// Lists persisted ChangeSets in stable path order.  The control plane only reads these
+    /// Lists persisted `ChangeSets` in stable path order.  The control plane only reads these
     /// records; materializers are responsible for creating their proposed plans.
     pub fn list_change_sets(&self) -> Result<Vec<StoredChangeSet>, ProjectStorageError> {
         let directory = self.resolve_relative_path("logic/changesets")?;
@@ -371,7 +400,7 @@ impl ProjectStorage {
             .collect()
     }
 
-    /// Atomically writes a ChangeSet record supplied by a materialization backend.
+    /// Atomically writes a `ChangeSet` record supplied by a materialization backend.
     pub fn save_change_set(&self, record: &StoredChangeSet) -> Result<(), ProjectStorageError> {
         validate_change_set_id(&record.id)?;
         if record.schema_version != CHANGESET_SCHEMA_VERSION {
@@ -382,7 +411,7 @@ impl ProjectStorage {
 
     /// Appends an immutable approval or rejection audit entry and persists it atomically.
     /// Approval is rejected unless the actual current observation and recorded readback both
-    /// match the ChangeSet baseline; callers should disable the UI action on the same predicate.
+    /// match the `ChangeSet` baseline; callers should disable the UI action on the same predicate.
     pub fn record_change_set_decision(
         &self,
         id: &str,

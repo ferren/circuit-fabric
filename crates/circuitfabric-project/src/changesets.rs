@@ -1,4 +1,4 @@
-//! Persisted, auditable ChangeSet records used by materialization backends and the desktop UI.
+//! Persisted, auditable `ChangeSet` records used by materialization backends and the desktop UI.
 
 use serde::{Deserialize, Serialize};
 

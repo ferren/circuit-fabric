@@ -6,6 +6,14 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+pub mod datasheet;
+
+pub use datasheet::{
+    DATASHEET_EXTRACTION_SCHEMA_VERSION, DatasheetExtraction, DatasheetOverview,
+    DatasheetParameter, DatasheetPin, DatasheetPinKind, MAX_DATASHEET_FEATURES,
+    MAX_DATASHEET_PARAMETERS, MAX_DATASHEET_PINS,
+};
+
 pub const LOGICAL_CIRCUIT_SCHEMA_VERSION: u32 = 1;
 
 pub type ComponentId = String;
@@ -155,12 +163,13 @@ pub struct ChangeSet {
     pub approved: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DocumentKind {
     Pdf,
     Word,
     Markdown,
+    Excel,
     Bom,
     Netlist,
     Text,

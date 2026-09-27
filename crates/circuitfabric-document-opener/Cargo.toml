@@ -1,0 +1,33 @@
+[package]
+name = "circuitfabric-document-opener"
+version = "0.1.0"
+description = "Managed document opener plugins and registry for CircuitFabric."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+# Rasterize PDF pages to bitmaps through a dynamically loaded pdfium library
+# (see native/README.md). Without the feature — or without the library at
+# runtime — PDFs fall back to in-process text extraction.
+raster-pdf = ["dep:pdfium-render"]
+
+[dependencies]
+calamine.workspace = true
+circuitfabric-contracts.workspace = true
+circuitfabric-plugin-api.workspace = true
+pdf-extract.workspace = true
+pdfium-render = { workspace = true, optional = true }
+pulldown-cmark.workspace = true
+roxmltree.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+zip.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+sha2.workspace = true
+
+[lints]
+workspace = true

@@ -3,6 +3,16 @@
 use circuitfabric_contracts::{ProjectId, SessionId, SnapshotHash};
 use serde::{Deserialize, Serialize};
 
+pub mod openers;
+
+pub use openers::{
+    DocumentBlock, DocumentBlockKind, DocumentCell, DocumentLoadState, DocumentOpenDenial,
+    DocumentOpener, DocumentOpenerOutcome, DocumentOpenerRequest, DocumentPage, DocumentRasterPage,
+    DocumentSheet, DocumentSpan, DocumentSpanStyle, DocumentView, DocumentViewBody,
+    MAX_DOCUMENT_VIEW_BLOCKS, MAX_DOCUMENT_VIEW_PAGES, MAX_DOCUMENT_VIEW_ROWS_PER_SHEET,
+    MAX_DOCUMENT_VIEW_TEXT, OpenerCapability, VerifiedDocumentCopy,
+};
+
 pub const PLUGIN_API_VERSION: &str = "circuitfabric-plugin/v1";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -10,6 +20,7 @@ pub const PLUGIN_API_VERSION: &str = "circuitfabric-plugin/v1";
 pub enum PluginKind {
     AgentRuntime,
     EdaBackend,
+    DocumentOpener,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

@@ -8,13 +8,19 @@
 
 use std::{collections::BTreeMap, path::Path};
 
-use circuitfabric_contracts::{DocumentKind, DocumentRecord, EvidencePackage, Project, ProjectId};
+use circuitfabric_contracts::{
+    DatasheetExtraction, DocumentFragment, DocumentKind, DocumentRecord, EvidencePackage, Project,
+    ProjectId,
+};
 use circuitfabric_document::{DocumentError, DocumentService};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 mod changesets;
+mod datasheets;
+mod directories;
 mod documents;
+mod opening;
 mod sessions;
 mod storage;
 
@@ -22,8 +28,11 @@ pub use changesets::{
     ChangeSetAuditEntry, ChangeSetEvidenceRef, ChangeSetExecutionReport, ChangeSetStage,
     ChangeSetStageStatus, StoredChangeSet,
 };
+pub use directories::{DocumentConsistencyReport, DocumentDirectoryNode, DocumentDirectoryTree};
 pub use documents::{
-    DocumentCategory, DocumentImport, ProjectDocument, classify_document_kind, is_text_extractable,
+    DATASHEETS_DIRECTORY_ID, DOCUMENT_INDEX_SCHEMA_VERSION, DocumentCategory, DocumentDirectory,
+    DocumentImport, ProjectDocument, REFERENCE_DESIGNS_DIRECTORY_ID, ScanStatus,
+    classify_document_kind, is_evidence_indexable, is_text_extractable,
 };
 pub use sessions::{
     SESSION_MARKDOWN_SCHEMA_VERSION, SessionActor, SessionEvent, SessionEventKind, SessionListing,
@@ -166,11 +175,104 @@ impl ProjectWorkspace {
         Ok(self.documents.retrieve(project_id, query))
     }
 
-    /// Returns whether an authorized document passed integrity verification and was indexed
-    /// into citation-ready text for this project.
+    /// Returns whether an authorized document passed integrity verification and is citable in
+    /// this project: its full text is indexed, or verified datasheet rows are registered.
     #[must_use]
     pub fn is_document_evidence_available(&self, project_id: &str, document_id: &str) -> bool {
         self.documents.is_indexed(project_id, document_id)
+            || self.documents.has_verified_fragments(project_id, document_id)
+    }
+
+    /// Returns whether verified datasheet rows of this document are registered as evidence.
+    #[must_use]
+    pub fn has_verified_datasheet_evidence(&self, project_id: &str, document_id: &str) -> bool {
+        self.documents.has_verified_fragments(project_id, document_id)
+    }
+
+    /// Authorized, scanned PDFs of this project whose full text is not indexed yet.
+    ///
+    /// Their text is extracted off the UI thread with [`extract_pdf_pages`] and then
+    /// registered through [`Self::register_pdf_pages`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::NotFound`] for an unknown project, or propagates storage errors.
+    pub fn pending_pdf_documents(
+        &self,
+        project_id: &str,
+        storage: &ProjectStorage,
+    ) -> Result<Vec<ProjectDocument>, ProjectError> {
+        self.require_project(project_id)?;
+        Ok(storage
+            .list_documents()?
+            .into_iter()
+            .filter(|document| {
+                document.document_kind == DocumentKind::Pdf
+                    && document.authorized
+                    && document.scan_status == ScanStatus::Scanned
+                    && !self.documents.is_indexed(project_id, &document.id)
+            })
+            .collect())
+    }
+
+    /// Registers the page texts produced by [`extract_pdf_pages`] as citable fragments
+    /// (`#page=<n>&line=<m>`). Registering an already indexed document is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::NotFound`] for an unknown project.
+    pub fn register_pdf_pages(
+        &mut self,
+        project_id: &str,
+        document: &ProjectDocument,
+        pages: &[String],
+    ) -> Result<(), ProjectError> {
+        self.require_project(project_id)?;
+        match self.documents.register_pages(
+            project_id.to_owned(),
+            document.id.clone(),
+            document.document_kind,
+            document.original_file_name.clone(),
+            document.relative_path.to_string_lossy().replace('\\', "/"),
+            pages,
+        ) {
+            Ok(_) | Err(DocumentError::AlreadyExists(_)) => Ok(()),
+        }
+    }
+
+    /// Registers the verified rows of a datasheet extraction as evidence, replacing any
+    /// earlier rows of this document, and returns how many were registered.
+    ///
+    /// Only rows carrying their verified source line are used, and only that line becomes
+    /// the fragment text (cited as `#datasheet=<section>/<row>`); derived cells never do.
+    /// An extraction that does not match the document's current content hash withdraws the
+    /// document's rows instead. Callers are responsible for the managed copy's integrity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::NotFound`] for an unknown project.
+    pub fn register_datasheet_evidence(
+        &mut self,
+        project_id: &str,
+        document: &ProjectDocument,
+        extraction: &DatasheetExtraction,
+    ) -> Result<usize, ProjectError> {
+        self.require_project(project_id)?;
+        let fragments = if extraction.document_id == document.id
+            && extraction.content_hash == document.content_hash
+        {
+            datasheet_fragments(document, extraction)
+        } else {
+            Vec::new()
+        };
+        let count = fragments.len();
+        self.documents.set_verified_fragments(project_id, &document.id, fragments);
+        Ok(count)
+    }
+
+    /// Withdraws the verified datasheet rows of one document.
+    pub fn clear_datasheet_evidence(&mut self, project_id: &str, document_id: &str) {
+        self.documents.set_verified_fragments(project_id, document_id, Vec::new());
     }
 
     /// Imports a user-selected file as an authorized document of this project's root and
@@ -190,9 +292,30 @@ impl ProjectWorkspace {
         source: impl AsRef<Path>,
         category: DocumentCategory,
     ) -> Result<DocumentImport, ProjectError> {
+        self.import_project_document_into(project_id, storage, source, category, None)
+    }
+
+    /// Imports a user-selected file into a chosen directory of the project's `documents/` tree.
+    ///
+    /// `directory_id: None` places the copy in the category's built-in directory; `Some(id)`
+    /// must name a directory created through [`ProjectStorage::create_document_directory`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::NotFound`] for an unknown project or directory, or propagates
+    /// storage errors.
+    pub fn import_project_document_into(
+        &mut self,
+        project_id: &str,
+        storage: &ProjectStorage,
+        source: impl AsRef<Path>,
+        category: DocumentCategory,
+        directory_id: Option<&str>,
+    ) -> Result<DocumentImport, ProjectError> {
         self.require_project(project_id)?;
         let source_locator = source.as_ref().display().to_string();
-        let imported = storage.import_document(&source, category, source_locator)?;
+        let imported =
+            storage.import_document_into(&source, category, directory_id, source_locator)?;
         self.register_indexed_text(project_id, storage, &imported.document);
         Ok(imported)
     }
@@ -214,7 +337,14 @@ impl ProjectWorkspace {
         self.require_project(project_id)?;
         let mut available = 0;
         for document in storage.list_documents()? {
-            if document.authorized && self.register_indexed_text(project_id, storage, &document) {
+            // Authorization and a completed content scan are both prerequisites for a
+            // document to act as an evidence source.
+            if !document.authorized || document.scan_status != ScanStatus::Scanned {
+                continue;
+            }
+            let text = self.register_indexed_text(project_id, storage, &document);
+            let rows = self.register_stored_datasheet_rows(project_id, storage, &document)?;
+            if text || rows {
                 available += 1;
             }
         }
@@ -246,7 +376,7 @@ impl ProjectWorkspace {
             self.documents.register_text(
                 project_id.to_owned(),
                 document.id.clone(),
-                document.document_kind.clone(),
+                document.document_kind,
                 document.original_file_name.clone(),
                 document.relative_path.to_string_lossy().replace('\\', "/"),
                 text,
@@ -255,12 +385,85 @@ impl ProjectWorkspace {
         )
     }
 
+    /// Registers the verified rows of a persisted extraction; `false` when there is none,
+    /// it is stale, or the managed copy fails verification.
+    fn register_stored_datasheet_rows(
+        &mut self,
+        project_id: &str,
+        storage: &ProjectStorage,
+        document: &ProjectDocument,
+    ) -> Result<bool, ProjectError> {
+        let Ok(Some(extraction)) = storage.load_datasheet_extraction(&document.id) else {
+            return Ok(false);
+        };
+        if storage.read_verified_document_content(document).is_err() {
+            return Ok(false);
+        }
+        Ok(self.register_datasheet_evidence(project_id, document, &extraction)? > 0)
+    }
+
     fn require_project(&self, project_id: &str) -> Result<(), ProjectError> {
         self.projects
             .contains_key(project_id)
             .then_some(())
             .ok_or_else(|| ProjectError::NotFound(project_id.to_owned()))
     }
+}
+
+/// Extracts the per-page text of an authorized PDF from its hash-verified managed copy.
+///
+/// CPU-heavy (seconds for large datasheets), so call it off the UI thread and hand the
+/// result to [`ProjectWorkspace::register_pdf_pages`]. `None` when the document is not an
+/// authorized, scanned PDF, fails verification, has no readable text, or cannot be parsed;
+/// parser panics on malformed files are contained.
+#[must_use]
+pub fn extract_pdf_pages(
+    storage: &ProjectStorage,
+    document: &ProjectDocument,
+) -> Option<Vec<String>> {
+    if document.document_kind != DocumentKind::Pdf
+        || !document.authorized
+        || document.scan_status != ScanStatus::Scanned
+    {
+        return None;
+    }
+    let bytes = storage.read_verified_document_content(document).ok()?;
+    let pages = std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem_by_pages(&bytes))
+        .ok()?
+        .ok()?;
+    pages.iter().any(|page| !page.trim().is_empty()).then_some(pages)
+}
+
+/// One fragment per extraction row that carries its verified source line.
+fn datasheet_fragments(
+    document: &ProjectDocument,
+    extraction: &DatasheetExtraction,
+) -> Vec<DocumentFragment> {
+    let locator = document.relative_path.to_string_lossy().replace('\\', "/");
+    let parameters = |rows: &[circuitfabric_contracts::DatasheetParameter]| {
+        rows.iter().map(|row| row.evidence.clone()).collect::<Vec<_>>()
+    };
+    let sections = [
+        ("pins", extraction.pins.iter().map(|row| row.evidence.clone()).collect()),
+        ("absoluteMaximumRatings", parameters(&extraction.absolute_maximum_ratings)),
+        ("electricalCharacteristics", parameters(&extraction.electrical_characteristics)),
+        ("operatingConditions", parameters(&extraction.operating_conditions)),
+    ];
+    sections
+        .into_iter()
+        .flat_map(|(section, lines)| {
+            let locator = &locator;
+            lines.into_iter().enumerate().filter_map(move |(index, line)| {
+                let text = line?.trim().to_owned();
+                (!text.is_empty()).then(|| DocumentFragment {
+                    document_id: document.id.clone(),
+                    content_hash: extraction.content_hash.clone(),
+                    locator: format!("{locator}#datasheet={section}/{}", index + 1),
+                    text,
+                })
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -439,6 +642,148 @@ mod tests {
         assert_eq!(workspace.hydrate_project_documents("binary", &storage).expect("hydrate"), 0);
         let evidence = workspace.retrieve_document_evidence("binary", "PDF").expect("retrieve");
         assert!(evidence.fragments.is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A small but structurally valid single-page PDF with the given text lines.
+    fn minimal_pdf(lines: &[&str]) -> Vec<u8> {
+        use std::fmt::Write as _;
+        let mut content = String::from("BT /F1 12 Tf 72 720 Td\n");
+        for (index, line) in lines.iter().enumerate() {
+            if index > 0 {
+                content.push_str("0 -18 Td\n");
+            }
+            let _ = writeln!(content, "({line}) Tj");
+        }
+        content.push_str("ET");
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_owned(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_owned(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>".to_owned(),
+            format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len()),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_owned(),
+        ];
+        let mut pdf = String::from("%PDF-1.4\n");
+        let mut offsets = Vec::new();
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            let _ = writeln!(pdf, "{} 0 obj\n{object}\nendobj", index + 1);
+        }
+        let xref_start = pdf.len();
+        let _ = writeln!(pdf, "xref\n0 {}", objects.len() + 1);
+        pdf.push_str("0000000000 65535 f \n");
+        for offset in offsets {
+            let _ = writeln!(pdf, "{offset:010} 00000 n ");
+        }
+        let _ = writeln!(
+            pdf,
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF",
+            objects.len() + 1
+        );
+        pdf.into_bytes()
+    }
+
+    #[test]
+    fn pdf_full_text_is_extracted_and_cited_by_page() {
+        let root = test_root("evidence-pdf");
+        let storage = ProjectStorage::create(&root, project("pdf")).expect("project");
+        let mut workspace = ProjectWorkspace::default();
+        workspace.create_project(project("pdf")).expect("project");
+        let source = root.join("lm317.pdf");
+        fs::write(&source, minimal_pdf(&["LM317 regulator", "Requires a 1uF capacitor"]))
+            .expect("write source");
+        let document = workspace
+            .import_project_document("pdf", &storage, &source, DocumentCategory::Datasheet)
+            .expect("import")
+            .document;
+        assert!(!workspace.is_document_evidence_available("pdf", &document.id));
+
+        let pending = workspace.pending_pdf_documents("pdf", &storage).expect("pending");
+        assert_eq!(pending, std::slice::from_ref(&document));
+        let pages = extract_pdf_pages(&storage, &document).expect("readable PDF text");
+        workspace.register_pdf_pages("pdf", &document, &pages).expect("register pages");
+
+        assert!(workspace.is_document_evidence_available("pdf", &document.id));
+        assert!(workspace.pending_pdf_documents("pdf", &storage).expect("pending").is_empty());
+        let evidence = workspace.retrieve_document_evidence("pdf", "capacitor").expect("retrieve");
+        assert_eq!(evidence.fragments.len(), 1);
+        assert!(evidence.fragments[0].locator.contains("#page=1&line="));
+
+        fs::write(storage.root().join(&document.relative_path), b"tampered").expect("tamper");
+        assert!(extract_pdf_pages(&storage, &document).is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn verified_datasheet_rows_become_evidence_and_survive_a_restart() {
+        use circuitfabric_contracts::{
+            DATASHEET_EXTRACTION_SCHEMA_VERSION, DatasheetOverview, DatasheetParameter,
+            DatasheetPin, DatasheetPinKind,
+        };
+        let root = test_root("evidence-datasheet");
+        let storage = ProjectStorage::create(&root, project("rows")).expect("project");
+        let mut workspace = ProjectWorkspace::default();
+        workspace.create_project(project("rows")).expect("project");
+        let source = root.join("lm317.pdf");
+        fs::write(&source, b"%PDF-1.4 fixture").expect("write source");
+        let document = workspace
+            .import_project_document("rows", &storage, &source, DocumentCategory::Datasheet)
+            .expect("import")
+            .document;
+        let extraction = DatasheetExtraction {
+            schema_version: DATASHEET_EXTRACTION_SCHEMA_VERSION,
+            document_id: document.id.clone(),
+            content_hash: document.content_hash.clone(),
+            extracted_at_unix_seconds: 1,
+            overview: DatasheetOverview::default(),
+            pins: vec![DatasheetPin {
+                number: "1".to_owned(),
+                name: "VIN".to_owned(),
+                kind: DatasheetPinKind::Power,
+                description: "Power supply input".to_owned(),
+                evidence: Some("1 VIN Power supply input".to_owned()),
+            }],
+            absolute_maximum_ratings: vec![DatasheetParameter {
+                parameter: "Unverified legacy row".to_owned(),
+                ..DatasheetParameter::default()
+            }],
+            electrical_characteristics: Vec::new(),
+            operating_conditions: Vec::new(),
+            notes: Vec::new(),
+        };
+
+        assert_eq!(
+            workspace.register_datasheet_evidence("rows", &document, &extraction).expect("rows"),
+            1
+        );
+        assert!(workspace.has_verified_datasheet_evidence("rows", &document.id));
+        assert!(workspace.is_document_evidence_available("rows", &document.id));
+        let evidence = workspace.retrieve_document_evidence("rows", "vin").expect("retrieve");
+        assert_eq!(evidence.fragments.len(), 1);
+        assert_eq!(evidence.fragments[0].text, "1 VIN Power supply input");
+        assert!(evidence.fragments[0].locator.ends_with("#datasheet=pins/1"));
+        assert!(
+            workspace.retrieve_document_evidence("rows", "legacy").unwrap().fragments.is_empty()
+        );
+
+        let mut stale = extraction.clone();
+        stale.content_hash = "sha256:other".to_owned();
+        assert_eq!(workspace.register_datasheet_evidence("rows", &document, &stale).unwrap(), 0);
+        assert!(!workspace.is_document_evidence_available("rows", &document.id));
+
+        storage.save_datasheet_extraction(&extraction).expect("persist extraction");
+        let mut restarted = ProjectWorkspace::default();
+        restarted.create_project(project("rows")).expect("project");
+        assert_eq!(restarted.hydrate_project_documents("rows", &storage).expect("hydrate"), 1);
+        assert!(restarted.has_verified_datasheet_evidence("rows", &document.id));
+        restarted.clear_datasheet_evidence("rows", &document.id);
+        assert!(!restarted.is_document_evidence_available("rows", &document.id));
+
+        fs::write(storage.root().join(&document.relative_path), b"tampered").expect("tamper");
+        let mut tampered = ProjectWorkspace::default();
+        tampered.create_project(project("rows")).expect("project");
+        assert_eq!(tampered.hydrate_project_documents("rows", &storage).expect("hydrate"), 0);
+        assert!(!tampered.has_verified_datasheet_evidence("rows", &document.id));
         let _ = fs::remove_dir_all(&root);
     }
 
