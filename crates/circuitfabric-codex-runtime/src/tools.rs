@@ -58,7 +58,74 @@ pub fn valid_env_name(name: &str) -> bool {
             .all(|(i, b)| b == b'_' || b.is_ascii_alphabetic() || (i > 0 && b.is_ascii_digit()))
 }
 
+/// Identifier of the bundled `TypeSafe` Jev judgment server (`evaluate`).
+pub const BUNDLED_JEV_SERVER_ID: &str = "typesafe-jev";
+
+/// Environment variable consulted first when locating the bundled binary.
+pub const BUNDLED_JEV_PATH_ENV: &str = "CIRCUITFABRIC_TYPESAFE_MCP_PATH";
+
+/// MCP servers shipped inside the application bundle.
+///
+/// The `TypeSafe` Jev `evaluate` server (vendored under `vendor/typesafe-mcp`)
+/// is included when its binary is found. Search order mirrors the `PDFium`
+/// loader: `CIRCUITFABRIC_TYPESAFE_MCP_PATH`, `typesafe-mcp/evaluate` next to
+/// the current executable, then `<ancestor>/native/windows-x64/typesafe-mcp/
+/// evaluate` for the first few ancestors of the executable, which covers
+/// `target/debug` and `target/debug/deps` during development. When no binary
+/// is found the list is empty and the runtime is unaffected.
+#[must_use]
+pub fn bundled_mcp_servers() -> Vec<McpServerDefinition> {
+    let Some(binary) = bundled_jev_binary() else { return Vec::new() };
+    vec![McpServerDefinition {
+        id: BUNDLED_JEV_SERVER_ID.to_owned(),
+        command: binary.to_string_lossy().into_owned(),
+        // `mcp` serves stdio; `--no-update-check` keeps startup offline.
+        args: vec!["mcp".to_owned(), "--no-update-check".to_owned()],
+        environment_variables: vec!["TYPESAFE_API_KEY".to_owned()],
+        enabled: true,
+    }]
+}
+
+fn bundled_jev_binary() -> Option<PathBuf> {
+    let name = format!("evaluate{}", env::consts::EXE_SUFFIX);
+    if let Some(explicit) = env::var_os(BUNDLED_JEV_PATH_ENV) {
+        let path = PathBuf::from(explicit);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    let directory = env::current_exe().ok()?.parent()?.to_owned();
+    for candidate in [directory.join("typesafe-mcp").join(&name), directory.join(&name)] {
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    for ancestor in directory.ancestors().take(5) {
+        let candidate =
+            ancestor.join("native").join("windows-x64").join("typesafe-mcp").join(&name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 impl ToolCatalog {
+    /// Register bundled MCP servers whose ids are not already defined, so an
+    /// entry the user edited or disabled is never overwritten. Deleting the
+    /// entry only lasts until the next load while the binary still ships.
+    pub fn ensure_bundled(&mut self) {
+        self.insert_bundled(&bundled_mcp_servers());
+    }
+
+    fn insert_bundled(&mut self, bundled: &[McpServerDefinition]) {
+        for server in bundled {
+            if !self.mcp_servers.iter().any(|existing| existing.id == server.id) {
+                self.mcp_servers.push(server.clone());
+            }
+        }
+    }
+
     /// Validate definitions without launching third-party processes.
     /// # Errors
     /// Rejects duplicate/invalid identifiers, empty commands and literal credentials.
@@ -278,7 +345,8 @@ impl ToolCatalog {
             writeln!(input, "{}", json!({"jsonrpc":"2.0","method":"notifications/initialized"}))?;
             writeln!(input, "{}", json!({"jsonrpc":"2.0","id":2,"method":method,"params":params}))?;
             input.flush()?;
-            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            let deadline = std::time::Instant::now()
+                + Duration::from_secs(if method == "tools/call" { 210 } else { 20 });
             let mut request_id = 2_u64;
             let mut tools = Vec::new();
             let mut cursors = BTreeSet::new();
@@ -416,10 +484,55 @@ mod tests {
         );
     }
     #[test]
+    #[ignore = "requires scripts/build-typesafe-mcp.ps1 output and TYPESAFE_API_KEY in the environment"]
+    fn bundled_jev_server_advertises_the_evaluate_tool() {
+        let mut catalog = ToolCatalog::default();
+        catalog.ensure_bundled();
+        let grants = ToolAuthorizationSettings {
+            authorized_mcp_server_ids: vec![BUNDLED_JEV_SERVER_ID.to_owned()],
+            ..ToolAuthorizationSettings::default()
+        };
+        let tools = catalog.list_tools(BUNDLED_JEV_SERVER_ID, &grants).expect("list bundled tools");
+        assert_eq!(tools["tools"][0]["name"], "evaluate");
+    }
+
+    #[test]
     fn rejects_key_values_as_environment_names() {
         assert!(valid_env_name("MCP_API_KEY"));
         assert!(!valid_env_name("sk-secret-key"));
         assert!(!valid_env_name("TOKEN=value"));
         assert!(!valid_env_name("3KEY"));
+    }
+
+    #[test]
+    fn bundled_servers_merge_once_and_never_overwrite_user_entries() {
+        let bundled = bundled_mcp_servers();
+        let definition = McpServerDefinition {
+            id: BUNDLED_JEV_SERVER_ID.to_owned(),
+            command: "evaluate".to_owned(),
+            args: vec!["mcp".to_owned()],
+            environment_variables: vec!["TYPESAFE_API_KEY".to_owned()],
+            enabled: true,
+        };
+
+        let mut catalog = ToolCatalog::default();
+        catalog.insert_bundled(std::slice::from_ref(&definition));
+        catalog.insert_bundled(std::slice::from_ref(&definition));
+        assert_eq!(catalog.mcp_servers.len(), 1);
+
+        let mut disabled = catalog.mcp_servers[0].clone();
+        disabled.enabled = false;
+        catalog.mcp_servers[0] = disabled;
+        catalog.insert_bundled(&[definition]);
+        assert!(!catalog.mcp_servers[0].enabled, "a disabled entry stays disabled");
+
+        if let Some(server) = bundled.first() {
+            assert_eq!(server.id, BUNDLED_JEV_SERVER_ID);
+            assert!(server.enabled);
+            assert_eq!(server.environment_variables, ["TYPESAFE_API_KEY"]);
+            ToolCatalog { mcp_servers: vec![server.clone()], ..ToolCatalog::default() }
+                .validate()
+                .expect("the bundled definition must satisfy catalog validation");
+        }
     }
 }

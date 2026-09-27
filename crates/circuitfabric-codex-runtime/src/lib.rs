@@ -474,6 +474,9 @@ impl RuntimeSettings {
 
     /// Loads saved settings, returning defaults when the file does not exist.
     ///
+    /// Bundled MCP servers (see [`tools::bundled_mcp_servers`]) are merged
+    /// into the catalog on every load without overwriting existing entries.
+    ///
     /// # Errors
     ///
     /// Returns an error when an existing file cannot be read or parsed.
@@ -482,11 +485,16 @@ impl RuntimeSettings {
             Ok(raw) => serde_json::from_str::<Self>(&raw)
                 .map(Self::migrate_legacy_provider)
                 .map_err(|source| RuntimeError::ParseSettings { path: path.to_owned(), source })
-                .and_then(|settings| {
+                .and_then(|mut settings| {
+                    settings.catalog.ensure_bundled();
                     settings.validate()?;
                     Ok(settings)
                 }),
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                let mut settings = Self::default();
+                settings.catalog.ensure_bundled();
+                Ok(settings)
+            }
             Err(source) => Err(RuntimeError::ReadSettings { path: path.to_owned(), source }),
         }
     }
@@ -518,6 +526,20 @@ impl RuntimeSettings {
         }
         result.map_err(|source| RuntimeError::WriteSettings { path: path.to_owned(), source })
     }
+}
+
+/// A turn fails when the server sends nothing at all for this long.
+pub const TURN_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
+/// Upper bound for one turn, however steadily it streams.
+pub const TURN_MAX_DURATION: Duration = Duration::from_secs(20 * 60);
+
+/// Which stream a turn delta belongs to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TurnDelta {
+    /// Reasoning summary (or raw reasoning) text; progress only, never part of the answer.
+    Reasoning,
+    /// The agent's reply.
+    Answer,
 }
 
 /// A synchronous client for the documented JSONL transport of `codex app-server`.
@@ -654,6 +676,28 @@ impl CodexAppServerClient {
     where
         F: FnMut(&str),
     {
+        self.run_turn_streaming(thread_id, input, |kind, delta| {
+            if kind == TurnDelta::Answer {
+                on_delta(delta);
+            }
+        })
+    }
+
+    /// Run a turn, forwarding both the reasoning-summary stream and the answer stream.
+    ///
+    /// The turn fails after [`TURN_IDLE_TIMEOUT`] without any server message, or after
+    /// [`TURN_MAX_DURATION`] in total; a long turn that keeps streaming is not cut off.
+    /// # Errors
+    /// Returns transport errors, cancellations, timeouts and failed turn statuses.
+    pub fn run_turn_streaming<F>(
+        &mut self,
+        thread_id: &str,
+        input: &[Value],
+        mut on_delta: F,
+    ) -> Result<(), RuntimeError>
+    where
+        F: FnMut(TurnDelta, &str),
+    {
         let started = self.request(
             "turn/start",
             &json!({
@@ -666,24 +710,49 @@ impl CodexAppServerClient {
             .and_then(Value::as_str)
             .ok_or_else(|| tools::invalid("运行时未返回任务标识"))?
             .to_owned();
-        let deadline = Instant::now() + Duration::from_secs(180);
+        let hard_deadline = Instant::now() + TURN_MAX_DURATION;
+        let mut idle_deadline = Instant::now() + TURN_IDLE_TIMEOUT;
+        let mut last_error_notification = None;
         loop {
-            let message = self.read_message("turn/completed", deadline)?;
-            if message.get("method").and_then(Value::as_str) == Some("item/agentMessage/delta")
+            let message = self.read_message("turn/completed", idle_deadline.min(hard_deadline))?;
+            idle_deadline = Instant::now() + TURN_IDLE_TIMEOUT;
+            let method = message.get("method").and_then(Value::as_str);
+            let kind = match method {
+                Some("item/agentMessage/delta") => Some(TurnDelta::Answer),
+                Some("item/reasoning/summaryTextDelta" | "item/reasoning/textDelta") => {
+                    Some(TurnDelta::Reasoning)
+                }
+                _ => None,
+            };
+            if let Some(kind) = kind
                 && let Some(delta) = message.pointer("/params/delta").and_then(Value::as_str)
             {
-                on_delta(delta);
+                on_delta(kind, delta);
             }
-            if message.get("method").and_then(Value::as_str) == Some("turn/completed")
+            if method == Some("error")
+                && message
+                    .pointer("/params/turnId")
+                    .and_then(Value::as_str)
+                    .is_none_or(|id| id == turn_id)
+                && let Some(detail) = message.pointer("/params/error").and_then(describe_turn_error)
+            {
+                last_error_notification = Some(detail);
+            }
+            if method == Some("turn/completed")
                 && message.pointer("/params/threadId").and_then(Value::as_str) == Some(thread_id)
                 && message.pointer("/params/turn/id").and_then(Value::as_str)
                     == Some(turn_id.as_str())
             {
-                return match message.pointer("/params/turn/status").and_then(Value::as_str) {
+                let turn = message.pointer("/params/turn").unwrap_or(&Value::Null);
+                return match turn.get("status").and_then(Value::as_str) {
                     Some("completed") => Ok(()),
-                    _ => Err(RuntimeError::Rpc {
+                    status => Err(RuntimeError::Rpc {
                         method: "turn/start".to_owned(),
-                        message: "任务失败或已取消；请检查模型及服务连接".to_owned(),
+                        message: failed_turn_message(
+                            status,
+                            turn.get("error"),
+                            last_error_notification,
+                        ),
                     }),
                 };
             }
@@ -711,10 +780,7 @@ impl CodexAppServerClient {
             if let Some(error) = message.get("error") {
                 return Err(RuntimeError::Rpc {
                     method: method.to_owned(),
-                    message: format!(
-                        "请求被拒绝（代码 {}）",
-                        error.get("code").unwrap_or(&Value::Null)
-                    ),
+                    message: describe_rpc_error(error),
                 });
             }
             return Ok(message.get("result").cloned().unwrap_or(Value::Null));
@@ -916,9 +982,126 @@ impl Drop for CodexAppServerClient {
     }
 }
 
+fn json_text(value: &Value) -> Option<String> {
+    match value {
+        Value::Null => None,
+        Value::String(text) => Some(text.trim().to_owned()).filter(|text| !text.is_empty()),
+        other => Some(other.to_string()),
+    }
+}
+
+/// Renders App Server `codexErrorInfo`, which is either a bare tag (`"unauthorized"`) or a
+/// single-key object carrying details (`{"httpConnectionFailed":{"httpStatusCode":502}}`).
+fn describe_error_info(info: &Value) -> Option<String> {
+    match info {
+        Value::String(tag) => Some(tag.clone()),
+        Value::Object(map) => {
+            let (tag, details) = map.iter().next()?;
+            Some(match details.get("httpStatusCode").and_then(Value::as_u64) {
+                Some(status) => format!("{tag}, HTTP {status}"),
+                None => tag.clone(),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Renders an App Server `TurnError` (`message`, `codexErrorInfo`, `additionalDetails`).
+fn describe_turn_error(error: &Value) -> Option<String> {
+    let message = error.get("message").and_then(json_text);
+    let info = error.get("codexErrorInfo").and_then(describe_error_info);
+    let details = error.get("additionalDetails").and_then(json_text);
+    let mut text = match (message, info) {
+        (Some(message), Some(info)) => format!("{message}（{info}）"),
+        (Some(text), None) | (None, Some(text)) => text,
+        (None, None) => return details,
+    };
+    if let Some(details) = details {
+        text.push_str("；详情：");
+        text.push_str(&details);
+    }
+    Some(text)
+}
+
+fn failed_turn_message(
+    status: Option<&str>,
+    turn_error: Option<&Value>,
+    last_error_notification: Option<String>,
+) -> String {
+    let status = match status {
+        Some("interrupted") => "任务已中断",
+        Some("failed") => "任务失败",
+        Some(other) => return format!("任务以未知状态 `{other}` 结束"),
+        None => "任务结束但未返回状态",
+    };
+    match turn_error.and_then(describe_turn_error).or(last_error_notification) {
+        Some(detail) => format!("{status}：{detail}"),
+        None => format!("{status}：App Server 未提供错误详情"),
+    }
+}
+
+/// Renders a JSON-RPC error object, keeping the server's message and data.
+fn describe_rpc_error(error: &Value) -> String {
+    let code = error.get("code").and_then(json_text).unwrap_or_else(|| "未知".to_owned());
+    let mut text = format!("请求被拒绝（代码 {code}）");
+    if let Some(message) = error.get("message").and_then(json_text) {
+        text.push('：');
+        text.push_str(&message);
+    }
+    if let Some(data) = error.get("data").and_then(json_text) {
+        text.push_str("；详情：");
+        text.push_str(&data);
+    }
+    text
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_turn_reports_server_error_message_and_info() {
+        let error = json!({
+            "message": "unexpected status 401 Unauthorized: invalid api key",
+            "codexErrorInfo": { "httpConnectionFailed": { "httpStatusCode": 401 } },
+            "additionalDetails": null,
+        });
+
+        assert_eq!(
+            failed_turn_message(Some("failed"), Some(&error), None),
+            "任务失败：unexpected status 401 Unauthorized: invalid api key（httpConnectionFailed, HTTP 401）"
+        );
+        assert_eq!(
+            failed_turn_message(
+                Some("failed"),
+                Some(&json!({ "message": "", "codexErrorInfo": "usageLimitExceeded" })),
+                None
+            ),
+            "任务失败：usageLimitExceeded"
+        );
+    }
+
+    #[test]
+    fn failed_turn_falls_back_to_error_notification_then_to_explicit_unknown() {
+        assert_eq!(
+            failed_turn_message(Some("failed"), None, Some("stream disconnected".to_owned())),
+            "任务失败：stream disconnected"
+        );
+        assert_eq!(
+            failed_turn_message(Some("interrupted"), Some(&Value::Null), None),
+            "任务已中断：App Server 未提供错误详情"
+        );
+    }
+
+    #[test]
+    fn rpc_rejection_keeps_message_and_data() {
+        let error = json!({ "code": -32600, "message": "model not found", "data": "gpt-x" });
+
+        assert_eq!(
+            describe_rpc_error(&error),
+            "请求被拒绝（代码 -32600）：model not found；详情：gpt-x"
+        );
+    }
 
     #[test]
     fn default_settings_are_loopback_only_and_do_not_hold_a_secret() {

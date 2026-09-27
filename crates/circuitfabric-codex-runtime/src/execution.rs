@@ -148,12 +148,45 @@ pub fn run_task_with_secrets(
     secrets: Option<&crate::secrets::SecretValues>,
     cancel: &Cancellation,
 ) -> Result<String, RuntimeError> {
+    run_task_streaming(
+        settings,
+        kind,
+        grants,
+        prompt,
+        image,
+        working_directory,
+        secrets,
+        cancel,
+        &mut |_, _| {},
+    )
+}
+
+/// Like [`run_task_with_secrets`], additionally forwarding the agent's reasoning summary
+/// and reply as they stream.
+///
+/// Codex forwards each redacted delta tagged with its stream; the CLI adapters produce no
+/// incremental output, so `on_delta` is not called for them. The returned string is the
+/// complete reply (answer stream only) either way.
+/// # Errors
+/// Same as [`run_task_with_secrets`].
+#[allow(clippy::too_many_arguments)]
+pub fn run_task_streaming(
+    settings: &RuntimeSettings,
+    kind: AgentKind,
+    grants: &ToolAuthorizationSettings,
+    prompt: &str,
+    image: Option<&std::path::Path>,
+    working_directory: Option<&std::path::Path>,
+    secrets: Option<&crate::secrets::SecretValues>,
+    cancel: &Cancellation,
+    on_delta: &mut dyn FnMut(crate::TurnDelta, &str),
+) -> Result<String, RuntimeError> {
     if let Some(directory) = working_directory
         && !directory.is_dir()
     {
         return Err(invalid("工作目录不存在或不是文件夹"));
     }
-    run_task_in(settings, kind, grants, prompt, image, working_directory, secrets, cancel)
+    run_task_in(settings, kind, grants, prompt, image, working_directory, secrets, cancel, on_delta)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -166,6 +199,7 @@ fn run_task_in(
     working_directory: Option<&std::path::Path>,
     secrets: Option<&crate::secrets::SecretValues>,
     cancel: &Cancellation,
+    on_delta: &mut dyn FnMut(crate::TurnDelta, &str),
 ) -> Result<String, RuntimeError> {
     settings.validate()?;
     if cancel.0.load(Ordering::SeqCst) {
@@ -232,6 +266,7 @@ fn run_task_in(
             &inputs,
             secrets,
             cancel,
+            &mut |kind, delta| on_delta(kind, &redact(delta, &key, &servers, secrets)),
         )
         .map(|output| redact(&output, &key, &servers, secrets));
     }
@@ -253,6 +288,7 @@ fn run_codex(
     input: &[serde_json::Value],
     secrets: Option<&crate::secrets::SecretValues>,
     cancel: &Cancellation,
+    on_delta: &mut dyn FnMut(crate::TurnDelta, &str),
 ) -> Result<String, RuntimeError> {
     let mut command = crate::app_server_command(&settings.codex, provider);
     restrict_environment(&mut command, &provider.api_key_environment_variable, servers, secrets);
@@ -311,7 +347,12 @@ fn run_codex(
     client.initialize()?;
     let thread = client.start_thread(Some(&provider.model))?;
     let mut output = String::new();
-    client.run_turn_with_input(&thread, input, |delta| output.push_str(delta))?;
+    client.run_turn_streaming(&thread, input, |kind, delta| {
+        if kind == crate::TurnDelta::Answer {
+            output.push_str(delta);
+        }
+        on_delta(kind, delta);
+    })?;
     Ok(output)
 }
 
