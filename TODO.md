@@ -21,8 +21,11 @@
 
 ## Next: Documents and JLCircuit import
 
-- [ ] Implement authorized Hardware Document source registration and content-hash index.
-- [ ] Extract source-aware document fragments and citations from PDF/text/BOM/netlist inputs.
+- [x] 已实现：授权硬件文档登记、托管副本与内容哈希索引（导入即哈希作为准入扫描，仅 `Scanned` 文档可打开或入索引）。
+- [x] 已实现：Markdown/文本/BOM/网表按行索引（`#line=n` 定位），PDF 后台提取全文按页索引（`#page=n&line=m` 定位），均进入来源感知检索。
+- [x] 已实现：文档预览与数据手册结构化提取——`circuitfabric-document-opener` 提供 PDF（pdfium 渲染 / `pdf-extract` 文本）、Markdown、Word、Excel 打开器；智能体提取引脚与参数表，引用经空白与形近字符归一化校验后由 Jev `evaluate` 复核；提取过程流式显示思考/输出，支持停止与断点续跑。
+- [x] 已实现：已校验数据行登记为证据片段（`#datasheet=` 定位，仅存原文行）；内容哈希不符或托管副本被篡改时证据自动失效，跨项目隔离。
+- [x] 已实现：随仓库分发 `native/` 原生库（pdfium、typesafe-jev `evaluate`），缺失时优雅降级；`vendor/typesafe-mcp` 以 submodule 固定源码版本。
 - [x] 已确认：EDA 发起的智能体会话可检索本项目已授权文档，且所有文档派生结论必须保留来源定位符并进入会话审计。
 - [ ] Bind authorized document sources to projects and expose source-aware retrieval to EDA-originated agent sessions.
 - [ ] Persist document citations used by an agent response in the session/task audit record.

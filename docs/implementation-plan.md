@@ -53,6 +53,8 @@ Acceptance:
 - document updates invalidate derived evidence packages predictably.
 - an EDA session can use only its project's authorized documents, and every document-derived response retains its source locator.
 
+Status: partially delivered. Source registration stores managed copies with content hashes and an integrity-scan gate (`Scanned` required before open/index). Text-like documents index per line (`#line=n`); PDFs extract full text in the background via `pdf-extract` and index per page (`#page=n&line=m`); verified datasheet rows register as separate evidence (`#datasheet=`) containing only the verbatim source line. Tampered or stale copies stop hydrating as evidence. Open: Word/Excel full-text indexing, a real malware scanner admission, and the version-update invalidation cascade.
+
 ## Phase 3 — JLCircuit observed-design importer
 
 Deliver:
@@ -102,6 +104,8 @@ Acceptance:
 - an agent can inspect documents and observed IR, propose an IRPatch, and request permitted tools;
 - agent text cannot bypass approval or materialization policy;
 - runtime restart can recover a task using only stored references and snapshots.
+
+Status: partially delivered. The Codex App Server adapter runs turns with streamed reasoning/answer deltas, an idle timeout plus an overall maximum, cancellation, token usage, and native MCP tool calls; the bundled `typesafe-jev` `evaluate` server ships under `native/` and registers into the tool catalog when present. Claude Code/DSH adapters remain stubs.
 
 ## Phase 6 — Additional EDA and engineering plugins
 

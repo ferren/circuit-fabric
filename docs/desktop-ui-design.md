@@ -168,12 +168,12 @@ Two panes: project list on the left (search + filter), detail on the right.
 
 Authorized document library.
 
-- List columns: title, kind (PDF/Word/Markdown/BOM/Netlist/Text), source locator, content hash (mono, truncated), version, trust, status (indexed / pending scan).
+- List columns: title, kind (PDF/Word/Markdown/BOM/Netlist/Text), source locator, content hash (mono, truncated), version, trust, status (indexed / pending scan), plus an evidence-readiness label: indexed / pending index / extracting full text / extraction failed / awaiting extractor.
 - Top bar: **register source** (choose file or enter locator) → trigger security scan.
-- Detail: metadata + extracted fragments + citation locators.
-- **Source-aware retrieval**: enter query → return fragments (with `document_id` + content hash + locator), demonstrating "every claim is citable".
+- Detail tabs: **preview** (PDF pages rasterized through the bundled pdfium, falling back to text extraction; Markdown/Word/Excel rendered as text) and **data** (datasheet structured extraction — pin/parameter tables verified by a verbatim-evidence check plus Jev `evaluate`, a live model-output panel showing reasoning/answer deltas with elapsed time, and stop/resume that reuses completed steps). Accepted rows register as citable evidence.
+- **Source-aware retrieval**: enter query → return fragments (with `document_id` + content hash + locator, `#line=` for text, `#page=&line=` for PDF, `#datasheet=` for verified rows), demonstrating "every claim is citable".
 
-`[TODO]` PDF/Word parsing and fragment extraction, security scanner, version-update evidence-package invalidation cascade.
+`[TODO]` Word/Excel full-text indexing, real malware scanner admission, version-update evidence-package invalidation cascade.
 
 ### 5.4 Semantics
 
@@ -207,6 +207,7 @@ Two-pane layout mirroring Projects (grouped list on the left, detail on the righ
 - **Runtime endpoints**: Codex App Server command / working directory with a supervised start & stop lifecycle (status chip: starting / running · PID / stopped / failed, echoed in the sidebar); the JLC bridge listen address belongs to EDA Services (§5.5); Claude Code and DSH shown as "coming soon" stubs.
 - **LLM providers**: multi-provider card list (default marked ★), add/edit/remove, enable/disable, vision config; a prominent note that "API keys are environment-variable names only — no key value is saved here", plus a live source hint under each key field (✔ unlocked vault / ✔ process environment / ✘ not found).
 - **Skills & MCP**: authorized skills/MCP list with kind badges, revoke actions, and scope — global authorizations persist immediately to `runtime.json`, project authorizations to the project's own `project-config.json`.
+- **Jev judgments**: dedicated settings page for the bundled `typesafe-jev` MCP server (`evaluate`) — definition/binary status (path shown, presence checked), enable/disable, global authorization grant/revoke, a masked `TYPESAFE_API_KEY` field saved into the secrets vault (with the same live source hint as provider key fields), a connection test that runs initialize + tools/list without a billable call, and usage notes (typed judgments; thresholds belong in workflow code). When the bundled binary is absent the page offers a re-detect action instead.
 
 `[TODO]` skills/MCP authorization enforcement at runtime launch, Claude Code / DSH adapters.
 

@@ -47,6 +47,8 @@ Import a directory containing SKILL.md or its full file path. The directory name
 
 MCP currently supports local stdio servers. Configure an executable, a JSON array of arguments and names of inherited environment variables. Save and authorize the definition before testing the connection. The test performs real initialize and tools/list requests; runtime tasks use native MCP clients to call tools.
 
+One server ships with the application: `typesafe-jev`, the TypeSafe Jev `evaluate` server built from `vendor/typesafe-mcp` (see `native/README.md`). Its catalog entry is added automatically when the bundled binary is present; it follows the same rules as any other server — explicit authorization and a `TYPESAFE_API_KEY` value from the vault or launch environment are still required before agents can call it.
+
 ```json
 {
   "catalog": {
