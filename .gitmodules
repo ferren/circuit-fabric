@@ -1,0 +1,3 @@
+[submodule "vendor/typesafe-mcp"]
+	path = vendor/typesafe-mcp
+	url = https://github.com/itsmostafa/typesafe-mcp.git
