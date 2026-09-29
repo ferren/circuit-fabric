@@ -67,6 +67,12 @@ impl std::fmt::Debug for SecretValues {
 }
 
 impl SecretValues {
+    /// A single-entry snapshot for tests elsewhere in the crate.
+    #[cfg(test)]
+    pub(crate) fn single(name: &str, value: &str) -> Self {
+        Self { entries: BTreeMap::from([(name.to_owned(), Zeroizing::new(value.to_owned()))]) }
+    }
+
     /// The value stored for one variable name, if any.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&str> {
@@ -499,9 +505,13 @@ mod tests {
         // authentication must reject it.
         let raw = fs::read_to_string(&path).expect("read");
         let mut parsed: serde_json::Value = serde_json::from_str(&raw).expect("parse");
-        let ciphertext = parsed["cipher"]["ciphertext"].as_str().expect("ciphertext").to_owned();
-        let flipped = format!("{}B", &ciphertext[..ciphertext.len() - 1]);
-        parsed["cipher"]["ciphertext"] = serde_json::Value::String(flipped);
+        // Flipping a decoded bit always changes the data; overwriting a base64 character
+        // with a fixed one was a no-op whenever it already held that character.
+        let mut ciphertext = BASE64
+            .decode(parsed["cipher"]["ciphertext"].as_str().expect("ciphertext"))
+            .expect("base64 ciphertext");
+        ciphertext[0] ^= 0x01;
+        parsed["cipher"]["ciphertext"] = serde_json::Value::String(BASE64.encode(ciphertext));
         fs::write(&path, serde_json::to_vec(&parsed).expect("encode")).expect("tamper");
         assert!(UnlockedVault::unlock(&path, "correct horse battery").is_err());
         let _ = fs::remove_file(path);

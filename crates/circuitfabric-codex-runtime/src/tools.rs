@@ -390,7 +390,24 @@ impl ToolCatalog {
                         return Ok(json!({"tools":tools}));
                     }
                     if message["result"]["isError"] == true {
-                        return Err(invalid("MCP 工具执行失败"));
+                        // The server's own message is the only clue to the cause (for
+                        // example an upstream 401/429); surface it redacted and bounded.
+                        let detail = message["result"]["content"]
+                            .as_array()
+                            .and_then(|blocks| {
+                                blocks.iter().find_map(|block| block["text"].as_str())
+                            })
+                            .unwrap_or_default();
+                        let detail: String =
+                            crate::execution::redact(detail, "", &[server], secrets)
+                                .chars()
+                                .take(600)
+                                .collect();
+                        return Err(invalid(if detail.is_empty() {
+                            "MCP 工具执行失败".to_owned()
+                        } else {
+                            format!("MCP 工具执行失败：{detail}")
+                        }));
                     }
                     return Ok(message["result"].clone());
                 }
@@ -415,10 +432,14 @@ fn redact_value(
     match value {
         Value::String(text) => *text = crate::execution::redact(text, "", &[server], secrets),
         Value::Array(items) => {
-            items.iter_mut().for_each(|item| redact_value(item, server, secrets))
+            for item in items {
+                redact_value(item, server, secrets);
+            }
         }
         Value::Object(fields) => {
-            fields.values_mut().for_each(|item| redact_value(item, server, secrets));
+            for item in fields.values_mut() {
+                redact_value(item, server, secrets);
+            }
         }
         _ => {}
     }
@@ -494,6 +515,35 @@ mod tests {
         };
         let tools = catalog.list_tools(BUNDLED_JEV_SERVER_ID, &grants).expect("list bundled tools");
         assert_eq!(tools["tools"][0]["name"], "evaluate");
+    }
+
+    #[test]
+    fn tool_errors_carry_the_server_message() {
+        let mut catalog = ToolCatalog::default();
+        catalog.ensure_bundled();
+        if !catalog.mcp_servers.iter().any(|server| server.id == BUNDLED_JEV_SERVER_ID) {
+            eprintln!("bundled evaluate binary not found; skipping");
+            return;
+        }
+        let grants = ToolAuthorizationSettings {
+            authorized_mcp_server_ids: vec![BUNDLED_JEV_SERVER_ID.to_owned()],
+            ..ToolAuthorizationSettings::default()
+        };
+        // An unknown question type is rejected locally, before any API call, so the
+        // placeholder key is never sent anywhere.
+        let secrets = crate::secrets::SecretValues::single("TYPESAFE_API_KEY", "placeholder-key");
+        let error = catalog
+            .call_tool_with_secrets(
+                BUNDLED_JEV_SERVER_ID,
+                &grants,
+                "evaluate",
+                &json!({"state":"s","questions":{"q":{"type":"bogus","instructions":"i"}}}),
+                Some(&secrets),
+            )
+            .expect_err("invalid question type is a tool error")
+            .to_string();
+        assert!(error.contains("MCP 工具执行失败："), "{error}");
+        assert!(error.len() > "MCP 工具执行失败：".len() + 40, "server detail missing: {error}");
     }
 
     #[test]
