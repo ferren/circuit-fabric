@@ -59,3 +59,9 @@ unused_must_use = "deny"
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 module_name_repetitions = "allow"
+
+# Dependencies (GPUI, pdfium bindings, PDF parsing) are optimized even in dev builds so
+# the desktop UI stays responsive under `cargo run`; workspace crates keep full debug info
+# and fast incremental builds.
+[profile.dev.package."*"]
+opt-level = 2
