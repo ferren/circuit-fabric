@@ -1,9 +1,14 @@
 //! Document access is project-scoped and returns citation-ready fragments.
 
-use std::collections::BTreeMap;
+mod search;
+
+use std::{collections::BTreeMap, sync::Arc};
 
 use circuitfabric_contracts::{
     DocumentFragment, DocumentKind, DocumentRecord, EvidencePackage, ProjectId,
+};
+pub use search::{
+    EvidenceCorpus, EvidenceHit, EvidenceScope, EvidenceSearch, FragmentAnchor, query_terms,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -17,7 +22,7 @@ pub enum DocumentError {
 #[derive(Clone, Debug)]
 struct IndexedDocument {
     record: DocumentRecord,
-    fragments: Vec<DocumentFragment>,
+    fragments: Arc<[DocumentFragment]>,
 }
 
 #[derive(Default)]
@@ -25,10 +30,29 @@ pub struct DocumentService {
     documents: BTreeMap<(ProjectId, String), IndexedDocument>,
     /// Individually verified source lines (e.g. checked datasheet rows), kept apart from
     /// the full-text index so they can be replaced or withdrawn on their own.
-    verified: BTreeMap<(ProjectId, String), Vec<DocumentFragment>>,
+    verified: BTreeMap<(ProjectId, String), Arc<[DocumentFragment]>>,
 }
 
 impl DocumentService {
+    /// Snapshots this project's citable fragments for [`EvidenceCorpus::search`]; the
+    /// fragments are shared, not copied, so this is cheap on the UI thread.
+    #[must_use]
+    pub fn corpus(&self, project_id: &str) -> EvidenceCorpus {
+        let shards = self
+            .documents
+            .iter()
+            .filter(|((owner, _), _)| owner == project_id)
+            .map(|(_, document)| document.fragments.clone())
+            .chain(
+                self.verified
+                    .iter()
+                    .filter(|((owner, _), _)| owner == project_id)
+                    .map(|(_, fragments)| fragments.clone()),
+            )
+            .collect();
+        EvidenceCorpus { shards }
+    }
+
     /// Returns whether this project has an indexed, citation-ready document with this id.
     #[must_use]
     pub fn is_indexed(&self, project_id: &str, document_id: &str) -> bool {
@@ -52,7 +76,7 @@ impl DocumentService {
         if fragments.is_empty() {
             self.verified.remove(&key);
         } else {
-            self.verified.insert(key, fragments);
+            self.verified.insert(key, fragments.into());
         }
     }
 
@@ -152,12 +176,12 @@ impl DocumentService {
             .documents
             .values()
             .filter(|document| document.record.project_id == project_id)
-            .flat_map(|document| &document.fragments)
+            .flat_map(|document| document.fragments.iter())
             .chain(
                 self.verified
                     .iter()
                     .filter(|((owner, _), _)| owner == project_id)
-                    .flat_map(|(_, fragments)| fragments),
+                    .flat_map(|(_, fragments)| fragments.iter()),
             )
             .filter(|fragment| fragment.text.to_lowercase().contains(&query_folded))
             .cloned()
@@ -274,6 +298,10 @@ mod tests {
         assert!(!service.is_indexed("project-a", "datasheet-a"));
         assert_eq!(service.retrieve("project-a", "vin").fragments.len(), 1);
         assert!(service.retrieve("project-b", "vin").fragments.is_empty());
+        let corpus = service.corpus("project-a");
+        assert_eq!(corpus.fragment_count(), 1);
+        assert_eq!(corpus.search("VIN", EvidenceScope::VerifiedData, |_| true, 10).total, 1);
+        assert_eq!(service.corpus("project-b").fragment_count(), 0);
 
         service.set_verified_fragments("project-a", "datasheet-a", vec![fragment("2 GND ground")]);
         assert!(service.retrieve("project-a", "vin").fragments.is_empty());

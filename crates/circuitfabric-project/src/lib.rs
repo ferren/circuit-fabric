@@ -28,6 +28,9 @@ pub use changesets::{
     ChangeSetAuditEntry, ChangeSetEvidenceRef, ChangeSetExecutionReport, ChangeSetStage,
     ChangeSetStageStatus, StoredChangeSet,
 };
+pub use circuitfabric_document::{
+    EvidenceCorpus, EvidenceHit, EvidenceScope, EvidenceSearch, FragmentAnchor,
+};
 pub use directories::{DocumentConsistencyReport, DocumentDirectoryNode, DocumentDirectoryTree};
 pub use documents::{
     DATASHEETS_DIRECTORY_ID, DOCUMENT_INDEX_SCHEMA_VERSION, DocumentCategory, DocumentDirectory,
@@ -173,6 +176,17 @@ impl ProjectWorkspace {
     ) -> Result<EvidencePackage, ProjectError> {
         self.require_project(project_id)?;
         Ok(self.documents.retrieve(project_id, query))
+    }
+
+    /// Snapshots the citable fragments of exactly one project for a ranked search that can
+    /// run off the UI thread ([`EvidenceCorpus::search`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::NotFound`] when the project is unknown.
+    pub fn evidence_corpus(&self, project_id: &str) -> Result<EvidenceCorpus, ProjectError> {
+        self.require_project(project_id)?;
+        Ok(self.documents.corpus(project_id))
     }
 
     /// Returns whether an authorized document passed integrity verification and is citable in
@@ -852,6 +866,11 @@ mod tests {
                 .len(),
             1
         );
+        let corpus = workspace.evidence_corpus("alpha").expect("alpha corpus");
+        assert_eq!(corpus.fragment_count(), 1);
+        let found = corpus.search("1uf capacitor", EvidenceScope::All, |_| true, 10);
+        assert_eq!(found.hits[0].anchor, FragmentAnchor::Line { line: 1 });
+        assert!(workspace.evidence_corpus("missing").is_err());
         assert_ne!(alpha_storage.root(), beta_storage.root());
         let _ = fs::remove_dir_all(&alpha_root);
         let _ = fs::remove_dir_all(&beta_root);
