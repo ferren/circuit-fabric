@@ -25,6 +25,7 @@
 - [x] 已实现：Markdown/文本/BOM/网表按行索引（`#line=n` 定位），PDF 后台提取全文按页索引（`#page=n&line=m` 定位），均进入来源感知检索。
 - [x] 已实现：文档预览与数据手册结构化提取——`circuitfabric-document-opener` 提供 PDF（pdfium 渲染 / `pdf-extract` 文本）、Markdown、Word、Excel 打开器；智能体提取引脚与参数表，引用经空白与形近字符归一化校验后由 Jev `evaluate` 复核；提取过程流式显示思考/输出，支持停止与断点续跑。
 - [x] 已实现：已校验数据行登记为证据片段（`#datasheet=` 定位，仅存原文行）；内容哈希不符或托管副本被篡改时证据自动失效，跨项目隔离。
+- [x] 已实现：桌面端项目内证据检索——后台线程检索（输入防抖、Enter 立即检索、只采用最新结果）、多词同时命中与引号短语、大小写/空白/形近字符归一化、相关度排序（已校验数据与短语命中优先）、范围筛选（全部/文档全文/已校验数据）、按文档分组与命中高亮；点击结果打开文档并滚动到对应页，或切到数据页高亮对应提取行。
 - [x] 已实现：随仓库分发 `native/` 原生库（pdfium、typesafe-jev `evaluate`），缺失时优雅降级；`vendor/typesafe-mcp` 以 submodule 固定源码版本。
 - [x] 已确认：EDA 发起的智能体会话可检索本项目已授权文档，且所有文档派生结论必须保留来源定位符并进入会话审计。
 - [ ] Bind authorized document sources to projects and expose source-aware retrieval to EDA-originated agent sessions.
