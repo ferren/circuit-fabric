@@ -39,11 +39,16 @@ mod markdown;
 mod pdf;
 mod word;
 
-pub use datasheet::{extract_datasheet, extract_datasheet_with_agent};
+pub use datasheet::{
+    extract_datasheet, extract_datasheet_by_category, extract_datasheet_with_agent,
+    extract_datasheet_with_agent_with_pages,
+};
 
 pub use excel::ExcelOpener;
 pub use markdown::MarkdownOpener;
 pub use pdf::PdfOpener;
+#[cfg(feature = "raster-pdf")]
+pub use pdf::{pdf_page_sizes, render_pdf_pages};
 pub use word::WordOpener;
 
 /// Truncates view text to the protocol's per-fragment cap.

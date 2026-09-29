@@ -65,6 +65,27 @@ fn open_text(request: &DocumentOpenerRequest) -> DocumentOpenerOutcome {
     }
 }
 
+/// Every page's size in points (`width`, `height`), read without loading or rendering the
+/// pages, so a host can lay out placeholders for pages it renders on demand. `None` when
+/// pdfium is unavailable.
+#[cfg(feature = "raster-pdf")]
+#[must_use]
+pub fn pdf_page_sizes(data: &[u8]) -> Option<Result<Vec<(f32, f32)>, String>> {
+    raster::with_pdfium(|pdfium| raster::page_sizes(pdfium, data))
+}
+
+/// Renders the given 1-based pages at the preview resolution. The pdfium lock is held for
+/// this batch only, so hosts render a few pages at a time as they scroll into view. `None`
+/// when pdfium is unavailable.
+#[cfg(feature = "raster-pdf")]
+#[must_use]
+pub fn render_pdf_pages(
+    data: &[u8],
+    numbers: &[u32],
+) -> Option<Result<Vec<circuitfabric_plugin_api::DocumentRasterPage>, String>> {
+    raster::with_pdfium(|pdfium| raster::render_numbers(pdfium, data, numbers))
+}
+
 /// Positioned text lines for the datasheet extractor; `None` when pdfium is unavailable.
 #[cfg(feature = "raster-pdf")]
 pub(super) fn positioned_lines(data: &[u8]) -> Option<Vec<crate::datasheet::Line>> {
@@ -94,8 +115,9 @@ mod raster {
     const TARGET_WIDTH: i32 = 900;
     /// Guard against pathological page aspect ratios producing enormous bitmaps.
     const MAX_HEIGHT: i32 = 3200;
-    /// Hard cap on rasterized pages per document; preview memory stays bounded.
-    const MAX_RASTER_PAGES: usize = 15;
+    /// Pages rasterized by `open`, so the first screen appears quickly; hosts render the
+    /// rest on demand with `render_pdf_pages`.
+    const INITIAL_RASTER_PAGES: usize = 2;
 
     /// Runs the raster pipeline when a pdfium library is available, `None` otherwise (the
     /// caller falls back to text extraction).
@@ -231,9 +253,9 @@ mod raster {
                 }
             };
         let page_count = usize::from(document.pages().len());
-        let truncated = page_count > MAX_RASTER_PAGES;
+        let truncated = page_count > INITIAL_RASTER_PAGES;
         let mut pages = Vec::new();
-        for (index, page) in document.pages().iter().enumerate().take(MAX_RASTER_PAGES) {
+        for (index, page) in document.pages().iter().enumerate().take(INITIAL_RASTER_PAGES) {
             match render_page(&page, index) {
                 Ok(page) => pages.push(page),
                 Err(reason) => {
@@ -253,6 +275,42 @@ mod raster {
                 DocumentViewBody::RasterPages { pages, page_count, truncated },
             ),
         }
+    }
+
+    pub(super) fn page_sizes(pdfium: &Pdfium, data: &[u8]) -> Result<Vec<(f32, f32)>, String> {
+        let document = pdfium
+            .load_pdf_from_byte_slice(data, None)
+            .map_err(|error| format!("the PDF could not be parsed: {error}"))?;
+        let sizes = document
+            .pages()
+            .page_sizes()
+            .map_err(|error| format!("page sizes could not be read: {error}"))?;
+        Ok(sizes
+            .iter()
+            .map(|rect| (rect.width().value.max(1.0), rect.height().value.max(1.0)))
+            .collect())
+    }
+
+    pub(super) fn render_numbers(
+        pdfium: &Pdfium,
+        data: &[u8],
+        numbers: &[u32],
+    ) -> Result<Vec<DocumentRasterPage>, String> {
+        let document = pdfium
+            .load_pdf_from_byte_slice(data, None)
+            .map_err(|error| format!("the PDF could not be parsed: {error}"))?;
+        let pages = document.pages();
+        numbers
+            .iter()
+            .map(|&number| {
+                let index = number
+                    .checked_sub(1)
+                    .and_then(|index| u16::try_from(index).ok())
+                    .ok_or_else(|| format!("page {number} does not exist"))?;
+                let page = pages.get(index).map_err(|_| format!("page {number} does not exist"))?;
+                render_page(&page, usize::from(index))
+            })
+            .collect()
     }
 
     // The casts below are provably safe: the target width is a small constant and the
@@ -369,6 +427,26 @@ mod tests {
             assert_eq!(state, DocumentLoadState::Loaded);
         }
         drop(release);
+    }
+
+    #[cfg(feature = "raster-pdf")]
+    #[test]
+    fn pages_render_on_demand_by_number() {
+        if !raster::pdfium_available() {
+            return;
+        }
+        let bytes = testing::minimal_pdf(&["LM317 voltage regulator"]);
+
+        let sizes = pdf_page_sizes(&bytes).expect("pdfium").expect("sizes");
+        assert_eq!(sizes.len(), 1);
+        assert!(sizes[0].1 > sizes[0].0, "portrait page: {sizes:?}");
+
+        let pages = render_pdf_pages(&bytes, &[1]).expect("pdfium").expect("page 1");
+        assert_eq!(pages[0].number, 1);
+        assert_eq!(pages[0].rgba.len(), pages[0].width as usize * pages[0].height as usize * 4);
+        let missing = render_pdf_pages(&bytes, &[2]).expect("pdfium");
+        assert!(missing.is_err_and(|reason| reason.contains("page 2")));
+        assert!(render_pdf_pages(&bytes, &[0]).expect("pdfium").is_err());
     }
 
     #[test]
