@@ -268,15 +268,16 @@ fn main() {
         DatasheetExtraction, DocumentKind, FactStatus, LogicalCircuitSnapshot, Project,
         SnapshotAuthority,
     };
-    use circuitfabric_document_opener::{DocumentOpenerRegistry, extract_datasheet_with_agent};
+    use circuitfabric_document_opener::{DocumentOpenerRegistry, extract_datasheet_by_category};
     use circuitfabric_plugin_api::{
         DocumentBlockKind, DocumentOpenDenial, DocumentSpanStyle, DocumentView, DocumentViewBody,
     };
     use circuitfabric_project::{
-        ChangeSetAuditEntry, ChangeSetStageStatus, DocumentCategory, ProjectDocument,
-        ProjectRegistry, ProjectStorage, ProjectWorkspace, SessionActor, SessionEvent,
-        SessionEventKind, SessionListing, SessionReplay, SessionSeed, SessionStatus, SessionUsage,
-        StoredChangeSet, is_evidence_indexable, rfc3339,
+        ChangeSetAuditEntry, ChangeSetStageStatus, DocumentCategory, EvidenceCorpus, EvidenceHit,
+        EvidenceScope, EvidenceSearch, FragmentAnchor, ProjectDocument, ProjectRegistry,
+        ProjectStorage, ProjectWorkspace, SessionActor, SessionEvent, SessionEventKind,
+        SessionListing, SessionReplay, SessionSeed, SessionStatus, SessionUsage, StoredChangeSet,
+        is_evidence_indexable, rfc3339,
     };
     use gpui::{
         AnyElement, AppContext, ClickEvent, Context, Div, DragMoveEvent, Entity, FontStyle,
@@ -310,6 +311,8 @@ fn main() {
     const SIDEBAR_ITEM_PRESSED: u32 = 0x0026_3756;
     const ACCENT: u32 = 0x0022_d3ee;
     const ACCENT_SOFT: u32 = 0x0067_e8f9;
+    // Background of the data row a search hit navigated to.
+    const FOCUSED_ROW_BG: u32 = 0x00fe_f9c3;
 
     const SURFACE_BG: u32 = 0x00f1_f5f9;
     const CARD_BG: u32 = 0x00ff_ffff;
@@ -676,21 +679,31 @@ fn main() {
     /// Marker for the drag value carried while the preview divider is being dragged.
     struct DraggedPreviewSplit;
 
-    /// One page bitmap converted to a GPUI render image, built once at open time.
+    /// One page bitmap converted to a GPUI render image off the UI thread.
     #[derive(Clone)]
     struct DocumentRasterPreviewPage {
-        number: u32,
         image: std::sync::Arc<gpui::RenderImage>,
         width: u32,
         height: u32,
     }
 
-    /// Pre-built page images for a rasterized document (pdfium-backed PDF preview).
+    /// Pages rendered around the viewport are kept; farther ones are evicted (and removed
+    /// from the GPU atlas), so memory stays bounded however long the document is.
+    const RASTER_PREFETCH_BEFORE: u32 = 1;
+    const RASTER_PREFETCH_AFTER: u32 = 2;
+    const RASTER_KEEP_DISTANCE: u32 = 6;
+
+    /// A pdfium-backed PDF preview whose pages are rendered on demand as they scroll into
+    /// view. Every page keeps its place (sized from `page_sizes`) whether rendered or not.
     #[derive(Clone)]
     struct DocumentRasterPreview {
-        pages: Vec<DocumentRasterPreviewPage>,
-        page_count: usize,
-        truncated: bool,
+        /// The verified bytes pages are rendered from.
+        data: std::sync::Arc<[u8]>,
+        /// Size in points of every page.
+        page_sizes: Vec<(f32, f32)>,
+        pages: BTreeMap<u32, DocumentRasterPreviewPage>,
+        in_flight: std::collections::BTreeSet<u32>,
+        failed: std::collections::BTreeSet<u32>,
     }
 
     /// What the preview pane shows for one selected document.
@@ -722,12 +735,11 @@ fn main() {
     }
 
     /// Completed steps of an interrupted datasheet extraction. "Continue" reuses them while
-    /// the document content is unchanged: a complete model reply skips the model call, and
-    /// finished Jev batches are not re-evaluated.
+    /// the document content is unchanged: completed category replies and Jev batches are reused.
     #[derive(Clone, Debug, Default)]
     struct DatasheetCheckpoint {
         content_hash: String,
-        model_response: Option<String>,
+        model_steps: Vec<(String, String)>,
         /// `(arguments, result)` per finished Jev batch, in call order.
         jev_results: Vec<(serde_json::Value, serde_json::Value)>,
     }
@@ -742,6 +754,30 @@ fn main() {
         /// The persisted structured datasheet extraction, when one exists for this exact
         /// content. Shared via `Arc` so per-frame rendering never clones the payload.
         extraction: Option<std::sync::Arc<DatasheetExtraction>>,
+    }
+
+    /// Search typing is debounced; Enter and filter changes search immediately.
+    const EVIDENCE_SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
+    /// Ranked hits kept per search, and how many are rendered per "show more" step.
+    const EVIDENCE_SEARCH_LIMIT: usize = 500;
+    const EVIDENCE_PAGE_SIZE: usize = 30;
+
+    /// The newest completed project-scoped evidence search.
+    struct EvidenceSearchResult {
+        project_id: ProjectId,
+        scope: EvidenceScope,
+        search: std::sync::Arc<EvidenceSearch>,
+        elapsed: Duration,
+    }
+
+    /// The search hit a preview was opened from: the pane lands on its page or data row
+    /// and shows the cited line above the content.
+    #[derive(Clone, Debug)]
+    struct PreviewFocus {
+        project_id: ProjectId,
+        document_id: String,
+        anchor: FragmentAnchor,
+        text: String,
     }
 
     // One GPUI view struct accumulates the whole control plane's UI state; the
@@ -801,6 +837,16 @@ fn main() {
         // Short-lived cache for the usage/audit projection; see `usage_audit_model`.
         usage_audit_cached: Option<(Instant, UsageAuditModel)>,
         evidence_query: Entity<InputState>,
+        evidence_scope: EvidenceScope,
+        // Only the newest search request may publish its result.
+        evidence_generation: u64,
+        evidence_searching: bool,
+        evidence_result: Option<EvidenceSearchResult>,
+        evidence_visible: usize,
+        preview_focus: Option<PreviewFocus>,
+        preview_scroll: gpui::ScrollHandle,
+        // Set when the preview must scroll to `preview_focus` once its content is laid out.
+        preview_scroll_pending: std::cell::Cell<bool>,
         semantic_query: Entity<InputState>,
         semantic_query_scope: SemanticQueryScope,
         selected_semantic_snapshot: Option<(ProjectId, String)>,
@@ -1096,7 +1142,20 @@ fn main() {
                 "CircuitFabric data directory",
                 cx,
             );
-            let evidence_query = Self::input(window, String::new(), "capacitor", cx);
+            let evidence_query = Self::input(
+                window,
+                String::new(),
+                "VIN 输入电压 / \"input voltage\"（多个词同时命中，引号保持短语）",
+                cx,
+            );
+            cx.subscribe(&evidence_query, |view, _, event, cx| match event {
+                InputEvent::Change => view.schedule_evidence_search(EVIDENCE_SEARCH_DEBOUNCE, cx),
+                InputEvent::PressEnter { .. } => {
+                    view.schedule_evidence_search(Duration::ZERO, cx);
+                }
+                _ => {}
+            })
+            .detach();
             let semantic_query = Self::input(
                 window,
                 String::new(),
@@ -1142,7 +1201,6 @@ fn main() {
                 Self::masked_input(window, "粘贴 TYPESAFE_API_KEY，保存后不再回显", cx);
             for input in [
                 &project_search,
-                &evidence_query,
                 &semantic_query,
                 &usage_filter,
                 &audit_filter,
@@ -1250,6 +1308,14 @@ fn main() {
                 audit_filter,
                 usage_audit_cached: None,
                 evidence_query,
+                evidence_scope: EvidenceScope::All,
+                evidence_generation: 0,
+                evidence_searching: false,
+                evidence_result: None,
+                evidence_visible: EVIDENCE_PAGE_SIZE,
+                preview_focus: None,
+                preview_scroll: gpui::ScrollHandle::new(),
+                preview_scroll_pending: std::cell::Cell::new(false),
                 semantic_query,
                 semantic_query_scope: SemanticQueryScope::Components,
                 selected_semantic_snapshot: None,
@@ -2252,6 +2318,7 @@ fn main() {
                         });
                         if indexed {
                             view.pdf_index_state.remove(&key);
+                            view.refresh_evidence_search(cx);
                         } else {
                             view.pdf_index_state.insert(key, PdfIndexState::Failed);
                         }
@@ -2261,6 +2328,138 @@ fn main() {
                 })
                 .detach();
             }
+            cx.notify();
+        }
+
+        /// Searches the selected project's evidence after `delay`, off the UI thread.
+        ///
+        /// The corpus is snapshotted when the delay ends, so a burst of keystrokes costs one
+        /// search over the newest index; a result is dropped when a newer request exists.
+        fn schedule_evidence_search(&mut self, delay: Duration, cx: &mut Context<Self>) {
+            self.evidence_generation += 1;
+            let generation = self.evidence_generation;
+            let query = self.evidence_query.read(cx).value().trim().to_owned();
+            let project_id = self.selected_project.clone();
+            let (Some(project_id), false) = (project_id, query.is_empty()) else {
+                self.evidence_searching = false;
+                self.evidence_result = None;
+                cx.notify();
+                return;
+            };
+            self.evidence_searching = true;
+            let scope = self.evidence_scope;
+            cx.spawn(async move |view, cx| {
+                if !delay.is_zero() {
+                    cx.background_executor().timer(delay).await;
+                }
+                let Ok(Some((corpus, admitted))) = view.update(cx, |view, _| {
+                    (view.evidence_generation == generation)
+                        .then(|| view.evidence_snapshot(&project_id))
+                        .flatten()
+                }) else {
+                    return;
+                };
+                let started = Instant::now();
+                let search = cx
+                    .background_executor()
+                    .spawn(async move {
+                        corpus.search(
+                            &query,
+                            scope,
+                            |fragment| admitted.contains(&fragment.document_id),
+                            EVIDENCE_SEARCH_LIMIT,
+                        )
+                    })
+                    .await;
+                view.update(cx, |view, cx| {
+                    if view.evidence_generation != generation {
+                        return;
+                    }
+                    view.evidence_searching = false;
+                    view.evidence_visible = EVIDENCE_PAGE_SIZE;
+                    view.evidence_result = Some(EvidenceSearchResult {
+                        project_id,
+                        scope,
+                        search: std::sync::Arc::new(search),
+                        elapsed: started.elapsed(),
+                    });
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+            cx.notify();
+        }
+
+        /// Re-runs an active search after the evidence index changed.
+        fn refresh_evidence_search(&mut self, cx: &mut Context<Self>) {
+            if !self.evidence_query.read(cx).value().trim().is_empty() {
+                self.schedule_evidence_search(Duration::ZERO, cx);
+            }
+        }
+
+        /// The project's fragment snapshot plus the documents allowed to appear in results:
+        /// integrity verified at listing time and currently citable.
+        fn evidence_snapshot(
+            &self,
+            project_id: &str,
+        ) -> Option<(EvidenceCorpus, std::collections::BTreeSet<String>)> {
+            let corpus = self.workspace.evidence_corpus(project_id).ok()?;
+            let admitted = self
+                .project_data
+                .get(project_id)
+                .map(|data| {
+                    data.documents
+                        .iter()
+                        .filter(|document| {
+                            data.document_integrity.get(&document.id).copied().unwrap_or(false)
+                                && self
+                                    .workspace
+                                    .is_document_evidence_available(project_id, &document.id)
+                        })
+                        .map(|document| document.id.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some((corpus, admitted))
+        }
+
+        /// Opens the document a search hit cites and lands on its page or data row.
+        fn open_evidence_hit(
+            &mut self,
+            project_id: &str,
+            hit: &EvidenceHit,
+            window: &mut Window,
+            cx: &mut Context<Self>,
+        ) {
+            let document = self.project_data.get(project_id).and_then(|data| {
+                data.documents.iter().find(|document| document.id == hit.fragment.document_id)
+            });
+            let Some(document) = document.cloned() else {
+                self.status = format!("文档 {} 已不在项目中", hit.fragment.document_id);
+                cx.notify();
+                return;
+            };
+            let already_open = self.document_preview.as_ref().is_some_and(|preview| {
+                preview.project_id == project_id
+                    && preview.document_id == document.id
+                    && !matches!(preview.state, DocumentPreviewState::Refused { .. })
+            });
+            if !already_open {
+                self.open_document_preview(project_id.to_owned(), &document, window, cx);
+            }
+            self.preview_show_data = hit.anchor.is_verified_data();
+            if let FragmentAnchor::DatasheetRow { row, .. } = hit.anchor {
+                self.datasheet_rows_visible = self.datasheet_rows_visible.max(row);
+            }
+            self.preview_focus = Some(PreviewFocus {
+                project_id: project_id.to_owned(),
+                document_id: document.id,
+                anchor: hit.anchor.clone(),
+                text: hit.fragment.text.clone(),
+            });
+            self.preview_scroll.set_offset(gpui::Point::default());
+            self.preview_scroll_pending.set(true);
             cx.notify();
         }
 
@@ -2428,6 +2627,7 @@ fn main() {
                                         );
                                     }
                                     view.schedule_pdf_indexing(&project_id, cx);
+                                    view.refresh_evidence_search(cx);
                                 }
                             }
                             Err(error) => view.status = format!("未导入文档：{error}"),
@@ -2490,7 +2690,10 @@ fn main() {
                     height: previous.height,
                 });
             }
+            self.release_preview_images(window);
             self.preview_show_data = false;
+            self.preview_focus = None;
+            self.preview_scroll.set_offset(gpui::Point::default());
             self.datasheet_feedback = None;
             self.datasheet_rows_visible = 40;
             self.document_preview = Some(DocumentPreviewSelection {
@@ -2513,10 +2716,10 @@ fn main() {
                     Ok(request) => match DocumentOpenerRegistry::with_builtin_openers()
                         .open(&request)
                     {
-                        circuitfabric_plugin_api::DocumentOpenerOutcome::Loaded { view } => {
-                            let view = std::sync::Arc::new(view);
-                            let raster = Self::raster_preview(&view);
-                            DocumentPreviewState::Loaded { view, raster }
+                        circuitfabric_plugin_api::DocumentOpenerOutcome::Loaded { mut view } => {
+                            let raster =
+                                Self::raster_preview(&mut view, request.managed_copy.data());
+                            DocumentPreviewState::Loaded { view: std::sync::Arc::new(view), raster }
                         }
                         circuitfabric_plugin_api::DocumentOpenerOutcome::Unsupported { reason }
                         | circuitfabric_plugin_api::DocumentOpenerOutcome::Failed { reason } => {
@@ -2679,29 +2882,58 @@ fn main() {
                                 content_hash: request.content_hash.clone(),
                                 ..DatasheetCheckpoint::default()
                             };
-                        } else if checkpoint.model_response.is_some() {
-                            log(&format!(
-                                "▶ 继续上次提取：复用模型响应及 {} 批 Jev 结果\n",
-                                checkpoint.jev_results.len()
-                            ));
+                        } else if !checkpoint.model_steps.is_empty() {
+                            log("▶ 找到上次提取检查点，正在核对选页与提示词…\n");
                         }
                     }
                     log("▶ 正在读取 PDF 文本…\n");
                     let mut jev_batch = 0_usize;
-                    let mut extraction = extract_datasheet_with_agent(
+                    let mut model_step = 0_usize;
+                    let mut extraction = extract_datasheet_by_category(
                         &request,
-                        |prompt| {
+                        |category, prompt, selected_pages| {
                             use circuitfabric_codex_runtime::{
                                 TurnDelta,
                                 execution::{AgentKind, run_task_streaming},
                             };
+                            let step = model_step;
+                            model_step += 1;
+                            let category = match category {
+                                "pins" => "引脚",
+                                "absoluteMaximumRatings" => "绝对最大额定值",
+                                "electricalCharacteristics" => "电气特性",
+                                "operatingConditions" => "工作条件",
+                                _ => "数据",
+                            };
+                            log(&format!(
+                                "▶ {category}（第 {} 次模型调用）已选页：{}\n",
+                                step + 1,
+                                selected_pages
+                                    .iter()
+                                    .map(usize::to_string)
+                                    .collect::<Vec<_>>()
+                                    .join(", "),
+                            ));
                             if stopped() {
                                 return Err("已停止".to_owned());
                             }
-                            let cached = checkpoint
-                                .lock()
-                                .ok()
-                                .and_then(|checkpoint| checkpoint.model_response.clone());
+                            let cached =
+                                checkpoint.lock().ok().and_then(|mut checkpoint| match checkpoint
+                                    .model_steps
+                                    .get(step)
+                                {
+                                    Some((cached_prompt, response)) if cached_prompt == prompt => {
+                                        Some(response.clone())
+                                    }
+                                    _ => {
+                                        if checkpoint.model_steps.len() > step {
+                                            log("▶ 选页或提示词已变化，重新调用模型与 Jev\n");
+                                            checkpoint.model_steps.truncate(step);
+                                            checkpoint.jev_results.clear();
+                                        }
+                                        None
+                                    }
+                                });
                             if let Some(response) = cached {
                                 log("▶ 复用上次完整的模型响应，跳过模型调用\n");
                                 return Ok(response);
@@ -2739,8 +2971,9 @@ fn main() {
                             });
                             if let (Ok(response), Ok(mut checkpoint)) =
                                 (&response, checkpoint.lock())
+                                && checkpoint.model_steps.len() == step
                             {
-                                checkpoint.model_response = Some(response.clone());
+                                checkpoint.model_steps.push((prompt.to_owned(), response.clone()));
                             }
                             response
                         },
@@ -2916,6 +3149,7 @@ fn main() {
                                 }
                             }
                         }
+                        view.refresh_evidence_search(cx);
                         cx.notify();
                     })
                     .ok();
@@ -2943,7 +3177,9 @@ fn main() {
         }
 
         fn close_document_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+            self.release_preview_images(window);
             self.document_preview = None;
+            self.preview_focus = None;
             if let Some(previous) = self.pre_preview_window_size.take()
                 && !window.is_fullscreen()
                 && !window.is_maximized()
@@ -7612,33 +7848,138 @@ fn main() {
                 );
             }
 
-            let query = self.evidence_query.read(cx).value().trim().to_owned();
-            let evidence = if query.is_empty() {
-                None
-            } else {
-                self.workspace.retrieve_document_evidence(&project.id, &query).ok().map(
-                    |mut package| {
-                        // The document service contains indexed text in memory.  Re-check the
-                        // cached integrity verdict before displaying it so a document
-                        // subsequently found invalid is never presented as usable evidence in
-                        // this UI.
-                        package.fragments.retain(|fragment| {
-                            documents.iter().any(|document| {
-                                document.id == fragment.document_id
-                                    && document_integrity
-                                        .get(&document.id)
-                                        .copied()
-                                        .unwrap_or(false)
-                                    && self
-                                        .workspace
-                                        .is_document_evidence_available(&project.id, &document.id)
-                            })
-                        });
-                        package
-                    },
-                )
+            let search_panel = self.render_evidence_search_panel(project, &documents, cx);
+
+            div()
+                .v_flex()
+                .gap_4()
+                .size_full()
+                .child(header)
+                .child(search_panel)
+                .child(list)
+                .into_any_element()
+        }
+
+        /// Human-readable position of a search hit.
+        fn evidence_anchor_label(anchor: &FragmentAnchor, language: UiLanguage) -> String {
+            match anchor {
+                FragmentAnchor::PageLine { page, line } => language.choose_owned(
+                    format!("第 {page} 页 · 第 {line} 行"),
+                    format!("Page {page} · line {line}"),
+                ),
+                FragmentAnchor::Line { line } => {
+                    language.choose_owned(format!("第 {line} 行"), format!("Line {line}"))
+                }
+                FragmentAnchor::DatasheetRow { section, row } => {
+                    let section = Self::datasheet_section_label(section, language);
+                    language.choose_owned(
+                        format!("已校验数据 · {section} 第 {row} 行"),
+                        format!("Verified data · {section} row {row}"),
+                    )
+                }
+                FragmentAnchor::Unknown => {
+                    language.choose("位置未知", "Unknown position").to_owned()
+                }
+            }
+        }
+
+        fn datasheet_section_label(section: &str, language: UiLanguage) -> &'static str {
+            match section {
+                "pins" => language.choose("引脚", "Pins"),
+                "absoluteMaximumRatings" => {
+                    language.choose("绝对最大额定值", "Absolute Maximum Ratings")
+                }
+                "electricalCharacteristics" => {
+                    language.choose("电特性", "Electrical Characteristics")
+                }
+                "operatingConditions" => language.choose("工作条件", "Operating Conditions"),
+                _ => language.choose("数据", "Data"),
+            }
+        }
+
+        /// Fragment text with the matched terms emphasized.
+        fn render_highlighted_text(
+            text: &str,
+            highlights: &[std::ops::Range<usize>],
+        ) -> StyledText {
+            let style = HighlightStyle {
+                background_color: Some(rgb(0x00fe_f08a).into()),
+                font_weight: Some(FontWeight::SEMIBOLD),
+                ..HighlightStyle::default()
             };
-            let mut search_panel = div()
+            StyledText::new(text.to_owned())
+                .with_highlights(highlights.iter().map(|range| (range.clone(), style)))
+        }
+
+        /// Project-scoped evidence search: query, scope filter, and ranked hits grouped by
+        /// document. Searching happens off the UI thread (`schedule_evidence_search`); this
+        /// only renders the newest result.
+        #[allow(clippy::too_many_lines)]
+        fn render_evidence_search_panel(
+            &mut self,
+            project: &Project,
+            documents: &[ProjectDocument],
+            cx: &mut Context<Self>,
+        ) -> Div {
+            let entity = cx.entity().clone();
+            let language = self.language;
+            let query = self.evidence_query.read(cx).value().trim().to_owned();
+            // A result left over from another project is searched again for this one.
+            if !query.is_empty()
+                && !self.evidence_searching
+                && self.selected_project.as_deref() == Some(project.id.as_str())
+                && self
+                    .evidence_result
+                    .as_ref()
+                    .is_none_or(|result| result.project_id != project.id)
+            {
+                self.schedule_evidence_search(Duration::ZERO, cx);
+            }
+            let result = self
+                .evidence_result
+                .as_ref()
+                .filter(|result| result.project_id == project.id && !query.is_empty());
+
+            let summary = if self.evidence_searching {
+                language.choose("检索中…", "Searching…").to_owned()
+            } else if let Some(result) = result {
+                let search = &result.search;
+                language.choose_owned(
+                    format!(
+                        "{} 条命中 · {} 份文档 · {} ms",
+                        search.total,
+                        search.documents,
+                        result.elapsed.as_millis()
+                    ),
+                    format!(
+                        "{} hits · {} documents · {} ms",
+                        search.total,
+                        search.documents,
+                        result.elapsed.as_millis()
+                    ),
+                )
+            } else {
+                String::new()
+            };
+
+            let scope_button = |id: &'static str, scope: EvidenceScope, label: &'static str| {
+                let chooser = entity.clone();
+                let active = self.evidence_scope == scope;
+                Button::new(id)
+                    .when(active, Button::primary)
+                    .when(!active, Button::ghost)
+                    .label(label)
+                    .on_click(move |_, _, cx| {
+                        chooser.update(cx, |view, cx| {
+                            if view.evidence_scope != scope {
+                                view.evidence_scope = scope;
+                                view.schedule_evidence_search(Duration::ZERO, cx);
+                            }
+                        });
+                    })
+            };
+
+            let mut panel = div()
                 .v_flex()
                 .gap_2()
                 .p_3()
@@ -7648,68 +7989,277 @@ fn main() {
                 .bg(rgb(SURFACE_BG))
                 .child(
                     div()
-                        .text_sm()
-                        .font_weight(FontWeight::MEDIUM)
-                        .child(language.choose("项目内证据检索", "Project-scoped evidence search")),
-                )
-                .child(div().id("evidence-query").w_full().child(Input::new(&self.evidence_query)));
-            match evidence {
-                Some(package) if !package.fragments.is_empty() => {
-                    search_panel = search_panel.child(
-                        div().text_xs().text_color(rgb(TEXT_MUTED)).child(language.choose_owned(
-                            format!("命中 {} 个可引用片段：", package.fragments.len()),
-                            format!("{} citation-ready fragments:", package.fragments.len()),
-                        )),
-                    );
-                    for fragment in package.fragments.iter().take(12) {
-                        search_panel = search_panel.child(
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
                             div()
-                                .v_flex()
-                                .gap_0p5()
-                                .p_2()
-                                .rounded_md()
-                                .bg(rgb(CARD_BG))
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(0x000e_7490))
-                                        .child(format!("locator: {}", fragment.locator)),
-                                )
-                                .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(format!(
-                                    "document_id: {} · content_hash: {}",
-                                    fragment.document_id, fragment.content_hash
-                                )))
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(rgb(TEXT_PRIMARY))
-                                        .child(fragment.text.clone()),
-                                ),
-                        );
-                    }
+                                .text_sm()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(language.choose("项目内证据检索", "Project-scoped evidence search")),
+                        )
+                        .child(div().ml_auto().text_xs().text_color(rgb(TEXT_MUTED)).child(summary)),
+                )
+                .child(div().id("evidence-query").w_full().child(Input::new(&self.evidence_query)))
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_1()
+                        .child(scope_button(
+                            "evidence-scope-all",
+                            EvidenceScope::All,
+                            language.choose("全部", "All"),
+                        ))
+                        .child(scope_button(
+                            "evidence-scope-text",
+                            EvidenceScope::FullText,
+                            language.choose("文档全文", "Full text"),
+                        ))
+                        .child(scope_button(
+                            "evidence-scope-verified",
+                            EvidenceScope::VerifiedData,
+                            language.choose("已校验数据", "Verified data"),
+                        ))
+                        .child(div().ml_auto().text_xs().text_color(rgb(TEXT_MUTED)).child(
+                            language.choose(
+                                "多个词需同时命中 · \"引号\" 保持短语 · Enter 立即检索 · 点击结果跳转",
+                                "All words must match · \"quotes\" keep phrases · Enter searches now · click a hit to jump",
+                            ),
+                        )),
+                );
+
+            let Some(result) = result else {
+                if query.is_empty() {
+                    panel = panel.child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(
+                        language.choose(
+                            "在本项目已索引的文档全文与已校验的数据手册行中检索；结果附来源定位符与内容哈希。",
+                            "Search this project's indexed full text and verified datasheet rows; hits carry their locator and content hash.",
+                        ),
+                    ));
                 }
-                Some(_) => {
-                    search_panel = search_panel.child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(TEXT_MUTED))
-                            .child(language.choose(
-                                "没有命中片段；换一个关键词，或导入更多文本类文档。",
-                                "No matching fragments; try another keyword or import more text documents.",
-                            )),
-                    );
-                }
-                None => {}
+                return panel;
+            };
+            let search = result.search.clone();
+            if search.hits.is_empty() {
+                return panel.child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(
+                    if result.scope == EvidenceScope::All {
+                        language.choose(
+                            "没有命中；试试更少或更短的关键词。尚未索引的文档（见下方标签）不会被检索到。",
+                            "No hits; try fewer or shorter words. Documents not indexed yet (see labels below) are not searched.",
+                        )
+                    } else {
+                        language.choose(
+                            "当前范围内没有命中；切换到“全部”试试。",
+                            "No hits in this scope; try \"All\".",
+                        )
+                    },
+                ));
             }
 
-            div()
-                .v_flex()
-                .gap_4()
-                .size_full()
-                .child(header)
-                .child(list)
-                .child(search_panel)
-                .into_any_element()
+            // Groups keep rank order: a document appears where its best hit ranks.
+            let visible = self.evidence_visible.min(search.hits.len());
+            let mut groups: Vec<(&str, Vec<&EvidenceHit>)> = Vec::new();
+            for hit in &search.hits[..visible] {
+                let document_id = hit.fragment.document_id.as_str();
+                match groups.iter_mut().find(|(id, _)| *id == document_id) {
+                    Some((_, hits)) => hits.push(hit),
+                    None => groups.push((document_id, vec![hit])),
+                }
+            }
+            let focused_locator = self
+                .preview_focus
+                .as_ref()
+                .filter(|focus| focus.project_id == project.id)
+                .map(|focus| (focus.document_id.clone(), focus.anchor.clone()));
+
+            for (group_index, (document_id, hits)) in groups.into_iter().enumerate() {
+                let document = documents.iter().find(|document| document.id == document_id);
+                let title = document.map_or_else(
+                    || document_id.to_owned(),
+                    |document| document.original_file_name.clone(),
+                );
+                let opener = entity.clone();
+                let open_project = project.id.clone();
+                let open_document = document.cloned();
+                let mut group = div()
+                    .v_flex()
+                    .gap_1()
+                    .p_2()
+                    .rounded_md()
+                    .bg(rgb(CARD_BG))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .whitespace_normal()
+                                    .child(title),
+                            )
+                            .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(
+                                language.choose_owned(
+                                    format!("{} 条", hits.len()),
+                                    format!("{} hits", hits.len()),
+                                ),
+                            ))
+                            .when_some(open_document, |row, document| {
+                                row.child(
+                                    Button::new(("evidence-open-document", group_index))
+                                        .ghost()
+                                        .label(language.choose("打开文档", "Open document"))
+                                        .on_click(move |_, window, cx| {
+                                            opener.update(cx, |view, cx| {
+                                                view.open_document_preview(
+                                                    open_project.clone(),
+                                                    &document,
+                                                    window,
+                                                    cx,
+                                                );
+                                            });
+                                        }),
+                                )
+                            }),
+                    );
+                for hit in hits {
+                    let verified = hit.anchor.is_verified_data();
+                    let focused = focused_locator.as_ref().is_some_and(|(document, anchor)| {
+                        *document == hit.fragment.document_id && *anchor == hit.anchor
+                    });
+                    let navigator = entity.clone();
+                    let navigate_project = project.id.clone();
+                    let navigate_hit = hit.clone();
+                    group = group.child(
+                        div()
+                            .id(gpui::SharedString::from(format!(
+                                "evidence-hit-{}",
+                                hit.fragment.locator
+                            )))
+                            .v_flex()
+                            .gap_0p5()
+                            .p_2()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(if focused { ACCENT } else { SURFACE_BG }))
+                            .bg(rgb(SURFACE_BG))
+                            .cursor_pointer()
+                            .hover(|this| this.border_color(rgb(ACCENT_SOFT)))
+                            .on_click(move |_, window, cx| {
+                                navigator.update(cx, |view, cx| {
+                                    view.open_evidence_hit(
+                                        &navigate_project,
+                                        &navigate_hit,
+                                        window,
+                                        cx,
+                                    );
+                                });
+                            })
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .px_1p5()
+                                            .py_0p5()
+                                            .rounded_sm()
+                                            .text_xs()
+                                            .bg(rgb(if verified {
+                                                0x00dc_fce7
+                                            } else {
+                                                0x00e0_f2fe
+                                            }))
+                                            .text_color(rgb(if verified {
+                                                0x0016_a34a
+                                            } else {
+                                                0x000e_7490
+                                            }))
+                                            .child(Self::evidence_anchor_label(
+                                                &hit.anchor,
+                                                language,
+                                            )),
+                                    )
+                                    .child(
+                                        div()
+                                            .ml_auto()
+                                            .text_xs()
+                                            .text_color(rgb(TEXT_MUTED))
+                                            .child(if verified {
+                                                language.choose("查看数据 →", "View data →")
+                                            } else {
+                                                language.choose("定位原文 →", "Show in document →")
+                                            }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .whitespace_normal()
+                                    .child(Self::render_highlighted_text(
+                                        &hit.fragment.text,
+                                        &hit.highlights,
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_MUTED))
+                                    .whitespace_normal()
+                                    .child(format!(
+                                        "{} · {}",
+                                        hit.fragment.locator,
+                                        &hit.fragment.content_hash
+                                            [..hit.fragment.content_hash.len().min(19)]
+                                    )),
+                            ),
+                    );
+                }
+                panel = panel.child(group);
+            }
+
+            if visible < search.hits.len() {
+                let loader = entity.clone();
+                panel = panel.child(
+                    Button::new("evidence-show-more")
+                        .label(language.choose_owned(
+                            format!("显示更多（已显示 {visible} / {}）", search.hits.len()),
+                            format!("Show more ({visible} of {})", search.hits.len()),
+                        ))
+                        .on_click(move |_, _, cx| {
+                            loader.update(cx, |view, cx| {
+                                view.evidence_visible += EVIDENCE_PAGE_SIZE;
+                                cx.notify();
+                            });
+                        }),
+                );
+            }
+            if search.total > search.hits.len() {
+                panel = panel.child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(
+                    language.choose_owned(
+                        format!(
+                            "共 {} 条命中，仅保留相关度最高的 {} 条；增加关键词可缩小范围。",
+                            search.total,
+                            search.hits.len()
+                        ),
+                        format!(
+                            "{} hits; only the {} most relevant are kept — add words to narrow down.",
+                            search.total,
+                            search.hits.len()
+                        ),
+                    ),
+                ));
+            }
+            panel
         }
 
         /// Top-level Documents navigation.  The evidence UI is project-scoped, but the
@@ -7842,43 +8392,150 @@ fn main() {
             Some(std::sync::Arc::new(gpui::RenderImage::new(vec![image::Frame::new(buffer)])))
         }
 
-        /// Builds the page-image set for a rasterized view body, once, at open time.
-        fn raster_preview(view: &DocumentView) -> Option<DocumentRasterPreview> {
-            let circuitfabric_plugin_api::DocumentViewBody::RasterPages {
-                pages,
-                page_count,
-                truncated,
-            } = &view.body
-            else {
+        /// Converts rendered pages to GPUI images; pages that fail to convert are skipped.
+        fn raster_preview_pages(
+            pages: Vec<circuitfabric_plugin_api::DocumentRasterPage>,
+        ) -> Vec<(u32, DocumentRasterPreviewPage)> {
+            pages
+                .into_iter()
+                .filter_map(|page| {
+                    Some((
+                        page.number,
+                        DocumentRasterPreviewPage {
+                            width: page.width,
+                            height: page.height,
+                            image: Self::render_image_from_rgba(
+                                page.width,
+                                page.height,
+                                page.rgba,
+                            )?,
+                        },
+                    ))
+                })
+                .collect()
+        }
+
+        /// Starts the on-demand preview of a rasterized view body: the opener's first pages
+        /// move out of the view (so their bitmaps are not held twice) and every page's size
+        /// is read for layout. Runs off the UI thread.
+        fn raster_preview(view: &mut DocumentView, data: &[u8]) -> Option<DocumentRasterPreview> {
+            let DocumentViewBody::RasterPages { pages, page_count, .. } = &mut view.body else {
                 return None;
             };
-            let converted = pages
-                .iter()
-                .filter_map(|page| {
-                    Some(DocumentRasterPreviewPage {
-                        number: page.number,
-                        image: Self::render_image_from_rgba(
-                            page.width,
-                            page.height,
-                            page.rgba.clone(),
-                        )?,
-                        width: page.width,
-                        height: page.height,
-                    })
+            let initial = std::mem::take(pages);
+            let fallback = initial.first().map_or((612.0, 792.0), |page| {
+                (page.width.max(1) as f32, page.height.max(1) as f32)
+            });
+            let page_sizes = circuitfabric_document_opener::pdf_page_sizes(data)
+                .and_then(Result::ok)
+                .filter(|sizes| sizes.len() == *page_count)
+                .unwrap_or_else(|| vec![fallback; *page_count]);
+            Some(DocumentRasterPreview {
+                data: std::sync::Arc::from(data),
+                page_sizes,
+                pages: Self::raster_preview_pages(initial).into_iter().collect(),
+                in_flight: std::collections::BTreeSet::new(),
+                failed: std::collections::BTreeSet::new(),
+            })
+        }
+
+        /// Removes the previewed document's page images from the GPU atlas; GPUI keeps an
+        /// image's texture until it is dropped explicitly.
+        fn release_preview_images(&mut self, window: &mut Window) {
+            if let Some(DocumentPreviewSelection {
+                state: DocumentPreviewState::Loaded { raster: Some(raster), .. },
+                ..
+            }) = self.document_preview.as_mut()
+            {
+                for (_, page) in std::mem::take(&mut raster.pages) {
+                    window.drop_image(page.image).ok();
+                }
+            }
+        }
+
+        /// Keeps the rendered pages around `visible` (inclusive page numbers): evicts far
+        /// pages and renders missing nearby ones in one background batch.
+        fn update_raster_window(
+            &mut self,
+            (first, last): (u32, u32),
+            window: &mut Window,
+            cx: &mut Context<Self>,
+        ) {
+            let Some(preview) = self.document_preview.as_mut() else {
+                return;
+            };
+            let DocumentPreviewState::Loaded { raster: Some(raster), .. } = &mut preview.state
+            else {
+                return;
+            };
+            let count = u32::try_from(raster.page_sizes.len()).unwrap_or(u32::MAX);
+            let keep = first.saturating_sub(RASTER_KEEP_DISTANCE)
+                ..=last.saturating_add(RASTER_KEEP_DISTANCE);
+            let evicted: Vec<u32> =
+                raster.pages.keys().filter(|number| !keep.contains(number)).copied().collect();
+            for number in evicted {
+                if let Some(page) = raster.pages.remove(&number) {
+                    window.drop_image(page.image).ok();
+                }
+            }
+            let wanted: Vec<u32> = (first.saturating_sub(RASTER_PREFETCH_BEFORE).max(1)
+                ..=last.saturating_add(RASTER_PREFETCH_AFTER).min(count))
+                .filter(|number| {
+                    !raster.pages.contains_key(number)
+                        && !raster.in_flight.contains(number)
+                        && !raster.failed.contains(number)
                 })
                 .collect();
-            Some(DocumentRasterPreview {
-                pages: converted,
-                page_count: *page_count,
-                truncated: *truncated,
+            if wanted.is_empty() {
+                return;
+            }
+            raster.in_flight.extend(&wanted);
+            let data = raster.data.clone();
+            let project_id = preview.project_id.clone();
+            let document_id = preview.document_id.clone();
+            let requested = wanted.clone();
+            let work = cx.background_spawn(async move {
+                match circuitfabric_document_opener::render_pdf_pages(&data, &requested) {
+                    Some(Ok(pages)) => Some(Self::raster_preview_pages(pages)),
+                    _ => None,
+                }
+            });
+            cx.spawn(async move |view, cx| {
+                let rendered = work.await;
+                view.update(cx, |view, cx| {
+                    let Some(DocumentPreviewSelection {
+                        project_id: shown_project,
+                        document_id: shown_document,
+                        state: DocumentPreviewState::Loaded { raster: Some(raster), .. },
+                        ..
+                    }) = view.document_preview.as_mut()
+                    else {
+                        return;
+                    };
+                    if *shown_project != project_id || *shown_document != document_id {
+                        return;
+                    }
+                    raster.in_flight.retain(|number| !wanted.contains(number));
+                    match rendered {
+                        Some(pages) => raster.pages.extend(pages),
+                        None => raster.failed.extend(wanted),
+                    }
+                    cx.notify();
+                })
+                .ok();
             })
+            .detach();
         }
 
         /// The docked right-hand preview pane.
         ///
         /// Rendered beside the scrollable page content (not inside it), so it keeps the full
         /// window height and scrolls independently of the page behind it.
-        fn render_document_preview_pane(&self, cx: &mut Context<Self>) -> AnyElement {
+        fn render_document_preview_pane(
+            &mut self,
+            window: &mut Window,
+            cx: &mut Context<Self>,
+        ) -> AnyElement {
             let entity = cx.entity().clone();
             let language = self.language;
             let pane_width = self.document_preview_width;
@@ -7972,6 +8629,7 @@ fn main() {
                                 .on_click(move |_, _, cx| {
                                     preview_tab.update(cx, |view, cx| {
                                         view.preview_show_data = false;
+                                        view.preview_scroll.set_offset(gpui::Point::default());
                                         cx.notify();
                                     });
                                 }),
@@ -7984,6 +8642,7 @@ fn main() {
                                 .on_click(move |_, _, cx| {
                                     data_tab.update(cx, |view, cx| {
                                         view.preview_show_data = true;
+                                        view.preview_scroll.set_offset(gpui::Point::default());
                                         cx.notify();
                                     });
                                 }),
@@ -7993,7 +8652,19 @@ fn main() {
                 None
             };
 
-            let mut body = div().v_flex().gap_2();
+            let focus = self.preview_focus.as_ref().filter(|focus| {
+                focus.project_id == preview.project_id && focus.document_id == preview.document_id
+            });
+            let target_page = match focus.map(|focus| &focus.anchor) {
+                Some(FragmentAnchor::PageLine { page, .. }) if !show_data => Some(*page),
+                _ => None,
+            };
+            // Items are direct children of the tracked scroll container, so a page can be
+            // scrolled to by index.
+            let mut items: Vec<(Option<u32>, AnyElement)> = Vec::new();
+            if let Some(focus) = focus {
+                items.push((None, self.render_preview_focus_banner(focus, preview, &entity)));
+            }
             if show_data {
                 let stream_log = self
                     .datasheet_stream
@@ -8002,65 +8673,72 @@ fn main() {
                         *project_id == preview.project_id && *document_id == preview.document_id
                     })
                     .and_then(|(_, _, stream)| stream.lock().ok().map(|buffer| buffer.clone()));
-                body = body.child(Self::render_datasheet_data(
-                    preview,
-                    language,
-                    &entity,
-                    self.datasheet_rows_visible,
-                    self.datasheet_extracting,
-                    self.datasheet_feedback.as_deref(),
-                    stream_log,
-                    self.datasheet_extract_started
-                        .filter(|_| self.datasheet_extracting)
-                        .map(|started| started.elapsed().as_secs()),
-                    self.datasheet_checkpoint.as_ref().is_some_and(
-                        |(project_id, document_id, _)| {
-                            *project_id == preview.project_id && *document_id == preview.document_id
-                        },
-                    ),
+                items.push((
+                    None,
+                    Self::render_datasheet_data(
+                        preview,
+                        language,
+                        &entity,
+                        self.datasheet_rows_visible,
+                        self.datasheet_extracting,
+                        self.datasheet_feedback.as_deref(),
+                        stream_log,
+                        self.datasheet_extract_started
+                            .filter(|_| self.datasheet_extracting)
+                            .map(|started| started.elapsed().as_secs()),
+                        self.datasheet_checkpoint.as_ref().is_some_and(
+                            |(project_id, document_id, _)| {
+                                *project_id == preview.project_id
+                                    && *document_id == preview.document_id
+                            },
+                        ),
+                        focus.map(|focus| &focus.anchor),
+                    )
+                    .into_any_element(),
                 ));
             } else {
                 match &preview.state {
                     DocumentPreviewState::Loading => {
-                        body = body.child(
+                        items.push((
+                            None,
                             div()
                                 .p_3()
-                                .child(language.choose("正在加载文档…", "Loading document…")),
-                        );
+                                .child(language.choose("正在加载文档…", "Loading document…"))
+                                .into_any_element(),
+                        ));
                     }
                     DocumentPreviewState::Loaded { view, raster } => {
-                        body = body
-                            .child(
-                                div()
-                                    .v_flex()
-                                    .gap_0p5()
-                                    .p_2()
-                                    .rounded_md()
-                                    .bg(rgb(SURFACE_BG))
-                                    .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(
-                                        format!(
-                                            "{} · {}",
-                                            &view.content_hash[..view.content_hash.len().min(19)],
-                                            view.opener_id
-                                        ),
-                                    ))
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(rgb(TEXT_MUTED))
-                                            .whitespace_normal()
-                                            .child(format!("source: {}", view.source_locator)),
-                                    ),
-                            )
-                            .child(match raster {
-                                Some(raster) => {
-                                    Self::render_document_raster_pages(raster, language, pane_width)
-                                }
-                                None => Self::render_document_view_body(&view.body, language),
-                            });
+                        items.push((
+                            None,
+                            div()
+                                .v_flex()
+                                .gap_0p5()
+                                .p_2()
+                                .rounded_md()
+                                .bg(rgb(SURFACE_BG))
+                                .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(format!(
+                                    "{} · {}",
+                                    &view.content_hash[..view.content_hash.len().min(19)],
+                                    view.opener_id
+                                )))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(TEXT_MUTED))
+                                        .whitespace_normal()
+                                        .child(format!("source: {}", view.source_locator)),
+                                )
+                                .into_any_element(),
+                        ));
+                        items.extend(match raster {
+                            Some(raster) => {
+                                Self::render_document_raster_pages(raster, language, pane_width)
+                            }
+                            None => Self::render_document_view_items(&view.body, language),
+                        });
                     }
                     DocumentPreviewState::Refused { denial } => {
-                        body = body.child(
+                        items.push((None,
                         div()
                             .v_flex()
                             .gap_1()
@@ -8079,11 +8757,11 @@ fn main() {
                             )
                             .child(
                                 div().text_xs().whitespace_normal().child(denial.to_string()),
-                            ),
-                    );
+                            )
+                            .into_any_element()));
                     }
                     DocumentPreviewState::Unavailable { reason } => {
-                        body = body.child(
+                        items.push((None,
                         div()
                             .v_flex()
                             .gap_1()
@@ -8100,13 +8778,51 @@ fn main() {
                                         "Preview unavailable: no opener supports this format, or the content is corrupt.",
                                     )),
                             )
-                            .child(div().text_xs().whitespace_normal().child(reason.clone())),
-                    );
+                            .child(div().text_xs().whitespace_normal().child(reason.clone()))
+                            .into_any_element()));
                     }
                 }
             }
 
-            div()
+            // Pages visible in the last layout (the scroll handle's child bounds), or the
+            // cited page while landing on it; the pages around them get rendered below.
+            let page_items: Vec<(usize, u32)> = items
+                .iter()
+                .enumerate()
+                .filter_map(|(index, (number, _))| number.map(|number| (index, number)))
+                .collect();
+            let raster_shown = !show_data
+                && matches!(preview.state, DocumentPreviewState::Loaded { raster: Some(_), .. });
+            let visible_pages = raster_shown.then(|| {
+                let landing = target_page.filter(|_| self.preview_scroll_pending.get());
+                let (top, bottom) =
+                    (self.preview_scroll.top_item(), self.preview_scroll.bottom_item());
+                let shown: Vec<u32> = page_items
+                    .iter()
+                    .filter(|(index, _)| (top..=bottom).contains(index))
+                    .map(|(_, number)| *number)
+                    .collect();
+                landing
+                    .map(|page| (page, page))
+                    .or_else(|| Some((*shown.first()?, *shown.last()?)))
+                    .unwrap_or((1, 1))
+            });
+
+            // Land on the cited page once its content is laid out; `scroll_to_top_of_item`
+            // waits for the child bounds of the next layout.
+            if self.preview_scroll_pending.get() {
+                let loading = matches!(preview.state, DocumentPreviewState::Loading) && !show_data;
+                if let Some(index) = target_page
+                    .and_then(|page| items.iter().position(|(number, _)| *number == Some(page)))
+                {
+                    self.preview_scroll.scroll_to_top_of_item(index);
+                    self.preview_scroll_pending.set(false);
+                } else if !loading {
+                    self.preview_scroll_pending.set(false);
+                }
+            }
+
+            let pane = div()
                 .flex_none()
                 .w(px(pane_width))
                 .h_full()
@@ -8118,15 +8834,161 @@ fn main() {
                 .when_some(tabs, ParentElement::child)
                 .child(
                     div()
-                        .id("document-preview-scroll")
+                        .relative()
                         .flex_1()
                         .min_h(px(0.))
-                        .overflow_y_scrollbar()
-                        .v_flex()
-                        .gap_2()
-                        .p_3()
-                        .child(body),
+                        .child(
+                            div()
+                                .id("document-preview-scroll")
+                                .size_full()
+                                .overflow_y_scroll()
+                                .track_scroll(&self.preview_scroll)
+                                .v_flex()
+                                .gap_2()
+                                .p_3()
+                                .children(items.into_iter().map(|(_, item)| item)),
+                        )
+                        .vertical_scrollbar(&self.preview_scroll),
                 )
+                .into_any_element();
+            if let Some(visible) = visible_pages {
+                self.update_raster_window(visible, window, cx);
+            }
+            pane
+        }
+
+        /// The cited line a search hit opened this preview for, with its extracted row when
+        /// it is verified data; the banner stays on top while the content scrolls to it.
+        fn render_preview_focus_banner(
+            &self,
+            focus: &PreviewFocus,
+            preview: &DocumentPreviewSelection,
+            entity: &Entity<Self>,
+        ) -> AnyElement {
+            let language = self.language;
+            let closer = entity.clone();
+            let row_detail = match (&focus.anchor, &preview.extraction) {
+                (FragmentAnchor::DatasheetRow { section, row }, Some(extraction)) => {
+                    let index = row.saturating_sub(1);
+                    let parameter = |rows: &[circuitfabric_contracts::DatasheetParameter]| {
+                        rows.get(index).map(|row| {
+                            let values = [("min", &row.min), ("typ", &row.typ), ("max", &row.max)]
+                                .into_iter()
+                                .filter_map(|(label, value)| {
+                                    value.as_ref().map(|value| format!("{label} {value}"))
+                                })
+                                .collect::<Vec<_>>()
+                                .join(" / ");
+                            [
+                                Some(row.parameter.clone()),
+                                row.symbol.clone(),
+                                (!values.is_empty()).then_some(values),
+                                row.unit.clone(),
+                                row.conditions.as_ref().map(|conditions| format!("({conditions})")),
+                            ]
+                            .into_iter()
+                            .flatten()
+                            .collect::<Vec<_>>()
+                            .join(" · ")
+                        })
+                    };
+                    match section.as_str() {
+                        "pins" => extraction.pins.get(index).map(|pin| {
+                            format!(
+                                "{} {} · {} · {}",
+                                pin.number,
+                                pin.name,
+                                pin.kind.as_str(),
+                                pin.description
+                            )
+                        }),
+                        "absoluteMaximumRatings" => parameter(&extraction.absolute_maximum_ratings),
+                        "electricalCharacteristics" => {
+                            parameter(&extraction.electrical_characteristics)
+                        }
+                        "operatingConditions" => parameter(&extraction.operating_conditions),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            let unrendered_page = match (&focus.anchor, &preview.state) {
+                (
+                    FragmentAnchor::PageLine { page, .. },
+                    DocumentPreviewState::Loaded { raster: Some(raster), .. },
+                ) if !self.preview_show_data && *page as usize > raster.page_sizes.len() => {
+                    Some(language.choose_owned(
+                        format!("文档只有 {} 页，第 {page} 页不存在。", raster.page_sizes.len()),
+                        format!(
+                            "The document has {} pages; page {page} does not exist.",
+                            raster.page_sizes.len()
+                        ),
+                    ))
+                }
+                _ => None,
+            };
+            div()
+                .v_flex()
+                .gap_1()
+                .p_2()
+                .rounded_md()
+                .border_1()
+                .border_color(rgb(ACCENT_SOFT))
+                .bg(rgb(FOCUSED_ROW_BG))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(rgb(0x000e_7490))
+                                .child(language.choose_owned(
+                                    format!(
+                                        "检索定位 · {}",
+                                        Self::evidence_anchor_label(&focus.anchor, language)
+                                    ),
+                                    format!(
+                                        "Search hit · {}",
+                                        Self::evidence_anchor_label(&focus.anchor, language)
+                                    ),
+                                )),
+                        )
+                        .child(
+                            Button::new("clear-preview-focus")
+                                .ghost()
+                                .ml_auto()
+                                .label(language.choose("清除", "Clear"))
+                                .on_click(move |_, _, cx| {
+                                    closer.update(cx, |view, cx| {
+                                        view.preview_focus = None;
+                                        cx.notify();
+                                    });
+                                }),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(TEXT_PRIMARY))
+                        .whitespace_normal()
+                        .child(focus.text.clone()),
+                )
+                .when_some(row_detail, |banner, detail| {
+                    banner.child(
+                        div().text_xs().text_color(rgb(TEXT_SECONDARY)).whitespace_normal().child(
+                            language.choose_owned(
+                                format!("提取的行：{detail}（表中已高亮）"),
+                                format!("Extracted row: {detail} (highlighted below)"),
+                            ),
+                        ),
+                    )
+                })
+                .when_some(unrendered_page, |banner, note| {
+                    banner.child(div().text_xs().text_color(rgb(0x00b4_5309)).child(note))
+                })
                 .into_any_element()
         }
 
@@ -8144,7 +9006,14 @@ fn main() {
             stream_log: Option<String>,
             elapsed_seconds: Option<u64>,
             can_resume: bool,
+            focus: Option<&FragmentAnchor>,
         ) -> Div {
+            let focused_row = |wanted: &str| match focus {
+                Some(FragmentAnchor::DatasheetRow { section, row }) if section == wanted => {
+                    Some(*row)
+                }
+                _ => None,
+            };
             let extractor = entity.clone();
             let stopper = entity.clone();
             let resumer = entity.clone();
@@ -8334,12 +9203,14 @@ fn main() {
                 &extraction.pins,
                 language,
                 visible_rows,
+                focused_row("pins"),
             ));
             content = content.child(Self::render_datasheet_parameter_table(
                 language.choose("绝对最大额定值", "Absolute Maximum Ratings"),
                 &extraction.absolute_maximum_ratings,
                 language,
                 visible_rows,
+                focused_row("absoluteMaximumRatings"),
                 0x00fe_f2f2,
                 0x00b9_1c1c,
             ));
@@ -8348,6 +9219,7 @@ fn main() {
                 &extraction.electrical_characteristics,
                 language,
                 visible_rows,
+                focused_row("electricalCharacteristics"),
                 0x00e0_f2fe,
                 0x000e_7490,
             ));
@@ -8356,6 +9228,7 @@ fn main() {
                 &extraction.operating_conditions,
                 language,
                 visible_rows,
+                focused_row("operatingConditions"),
                 0x00f3_e8ff,
                 0x0076_2ba3,
             ));
@@ -8404,6 +9277,7 @@ fn main() {
             pins: &[circuitfabric_contracts::DatasheetPin],
             language: UiLanguage,
             visible_rows: usize,
+            focused_row: Option<usize>,
         ) -> Div {
             let mut table = div().v_flex().gap_1().child(
                 div().text_sm().font_weight(FontWeight::SEMIBOLD).child(language.choose_owned(
@@ -8441,11 +9315,14 @@ fn main() {
                     .child(header_row(language.choose("说明", "Description"), 0.0))
                     .child(div().flex_1()),
             );
-            for pin in pins.iter().take(visible_rows) {
+            for (index, pin) in pins.iter().enumerate().take(visible_rows) {
                 table = table.child(
                     div()
                         .flex()
                         .gap_1()
+                        .when(focused_row == Some(index + 1), |row| {
+                            row.rounded_sm().bg(rgb(FOCUSED_ROW_BG))
+                        })
                         .child(
                             div()
                                 .flex_none()
@@ -8491,6 +9368,7 @@ fn main() {
             parameters: &[circuitfabric_contracts::DatasheetParameter],
             language: UiLanguage,
             visible_rows: usize,
+            focused_row: Option<usize>,
             accent: u32,
             accent_text: u32,
         ) -> Div {
@@ -8549,7 +9427,7 @@ fn main() {
                     .child(header_row(language.choose("最大", "Max"), 46.0))
                     .child(header_row(language.choose("单位", "Unit"), 34.0)),
             );
-            for parameter in parameters.iter().take(visible_rows) {
+            for (index, parameter) in parameters.iter().enumerate().take(visible_rows) {
                 let cell = |value: &Option<String>, emphasized: bool| {
                     div()
                         .flex_none()
@@ -8562,6 +9440,9 @@ fn main() {
                     div()
                         .flex()
                         .gap_1()
+                        .when(focused_row == Some(index + 1), |row| {
+                            row.rounded_sm().bg(rgb(FOCUSED_ROW_BG))
+                        })
                         .child(
                             div()
                                 .flex_1()
@@ -8609,38 +9490,133 @@ fn main() {
             table
         }
 
-        /// Displays rendered page bitmaps: a scrollable, reader-like PDF preview.
+        /// Displays the PDF as a scrollable, reader-like list with a slot for every page:
+        /// rendered pages show their bitmap, the rest a same-sized placeholder until they
+        /// are rendered on demand. Pages are separate items tagged with their number so the
+        /// preview's scroll container can land on one and report which are visible.
+        // Page sizes and bitmap dimensions are small positive values.
+        #[allow(clippy::cast_precision_loss)]
         fn render_document_raster_pages(
             raster: &DocumentRasterPreview,
             language: UiLanguage,
             pane_width: f32,
-        ) -> Div {
+        ) -> Vec<(Option<u32>, AnyElement)> {
             // Page bitmaps follow the divider: pane width minus the body padding, the page
             // card's own padding, and its border.
             let bitmap_width = (pane_width - 34.0).max(240.0);
-            let mut content = div().v_flex().gap_2().child(
-                div().text_xs().text_color(rgb(TEXT_MUTED)).child(language.choose_owned(
-                    format!("共 {} 页（整页渲染，滚动查看）", raster.page_count),
-                    format!("{} pages — full-page rendering, scroll to read", raster.page_count),
-                )),
-            );
-            if raster.truncated {
-                content = content.child(Self::render_preview_truncation_note(
-                    language
-                        .choose(
-                            "页数较多，仅渲染前 {first} 页。",
-                            "Long document; the first {first} pages are rendered.",
+            let page_count = raster.page_sizes.len();
+            let mut content = vec![(
+                None,
+                div()
+                    .text_xs()
+                    .text_color(rgb(TEXT_MUTED))
+                    .child(language.choose_owned(
+                        format!("共 {page_count} 页（滚动时按需渲染）"),
+                        format!("{page_count} pages — rendered on demand as you scroll"),
+                    ))
+                    .into_any_element(),
+            )];
+            for (index, (width_points, height_points)) in raster.page_sizes.iter().enumerate() {
+                let number = u32::try_from(index + 1).unwrap_or(u32::MAX);
+                let rendered = raster.pages.get(&number);
+                let display_height = match rendered {
+                    Some(page) if page.width > 0 => {
+                        bitmap_width * page.height as f32 / page.width as f32
+                    }
+                    _ => bitmap_width * height_points / width_points,
+                };
+                let frame = div()
+                    .p_1()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .bg(rgb(SURFACE_BG));
+                let frame = match rendered {
+                    Some(page) => frame
+                        .child(img(page.image.clone()).w(px(bitmap_width)).h(px(display_height))),
+                    None => frame.child(
+                        div()
+                            .w(px(bitmap_width))
+                            .h(px(display_height))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .bg(rgb(CARD_BG))
+                            .text_xs()
+                            .text_color(rgb(TEXT_MUTED))
+                            .child(if raster.failed.contains(&number) {
+                                language.choose("该页无法渲染", "This page could not be rendered")
+                            } else {
+                                language.choose("正在渲染…", "Rendering…")
+                            }),
+                    ),
+                };
+                content.push((
+                    Some(number),
+                    div()
+                        .v_flex()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(rgb(0x000e_7490))
+                                .child(language.choose_owned(
+                                    format!("第 {number} / {page_count} 页"),
+                                    format!("Page {number} / {page_count}"),
+                                )),
                         )
-                        .replace("{first}", &raster.pages.len().to_string()),
+                        .child(frame)
+                        .into_any_element(),
                 ));
             }
-            for page in &raster.pages {
-                let display_height = if page.width > 0 {
-                    bitmap_width * page.height as f32 / page.width as f32
-                } else {
-                    bitmap_width * 1.3
-                };
-                content = content.child(
+            content
+        }
+
+        /// A view body as preview items; pages of paged text are tagged with their number
+        /// so the preview's scroll container can land on one.
+        fn render_document_view_items(
+            view_body: &DocumentViewBody,
+            language: UiLanguage,
+        ) -> Vec<(Option<u32>, AnyElement)> {
+            let DocumentViewBody::PagedText { pages, truncated } = view_body else {
+                return vec![(
+                    None,
+                    Self::render_document_view_body(view_body, language).into_any_element(),
+                )];
+            };
+            let mut content: Vec<(Option<u32>, AnyElement)> = Vec::new();
+            if *truncated {
+                content.push((
+                    None,
+                    Self::render_preview_truncation_note(
+                        language
+                            .choose(
+                                "页数较多，仅显示前 {first} 页。",
+                                "Long document; showing the first {first} pages.",
+                            )
+                            .replace("{first}", &pages.len().to_string()),
+                    )
+                    .into_any_element(),
+                ));
+            }
+            if pages.len() > PREVIEW_MAX_RENDERED_PAGES {
+                content.push((
+                    None,
+                    Self::render_preview_truncation_note(
+                        language
+                            .choose(
+                                "为保持界面流畅，预览面板仅渲染前 {first} 页。",
+                                "For smooth scrolling the pane renders the first {first} pages.",
+                            )
+                            .replace("{first}", &PREVIEW_MAX_RENDERED_PAGES.to_string()),
+                    )
+                    .into_any_element(),
+                ));
+            }
+            for page in pages.iter().take(PREVIEW_MAX_RENDERED_PAGES) {
+                content.push((
+                    Some(page.number),
                     div()
                         .v_flex()
                         .gap_1()
@@ -8656,18 +9632,16 @@ fn main() {
                         )
                         .child(
                             div()
-                                .p_1()
-                                .rounded_sm()
-                                .border_1()
-                                .border_color(rgb(BORDER))
+                                .p_2()
+                                .rounded_md()
                                 .bg(rgb(SURFACE_BG))
-                                .child(
-                                    img(page.image.clone())
-                                        .w(px(bitmap_width))
-                                        .h(px(display_height)),
-                                ),
-                        ),
-                );
+                                .text_sm()
+                                .text_color(rgb(TEXT_PRIMARY))
+                                .whitespace_normal()
+                                .child(page.text.clone()),
+                        )
+                        .into_any_element(),
+                ));
             }
             content
         }
@@ -8676,59 +9650,10 @@ fn main() {
         fn render_document_view_body(view_body: &DocumentViewBody, language: UiLanguage) -> Div {
             let mut content = div().v_flex().gap_2();
             match view_body {
-                // Rasterized views are rendered by `render_document_raster_pages` before
-                // this function is reached; this arm keeps the match exhaustive for any
-                // body handed over directly.
-                DocumentViewBody::RasterPages { .. } => {}
-                DocumentViewBody::PagedText { pages, truncated } => {
-                    if *truncated {
-                        content = content.child(Self::render_preview_truncation_note(
-                            language
-                                .choose(
-                                    "页数较多，仅显示前 {first} 页。",
-                                    "Long document; showing the first {first} pages.",
-                                )
-                                .replace("{first}", &pages.len().to_string()),
-                        ));
-                    }
-                    if pages.len() > PREVIEW_MAX_RENDERED_PAGES {
-                        content = content.child(Self::render_preview_truncation_note(
-                            language
-                                .choose(
-                                    "为保持界面流畅，预览面板仅渲染前 {first} 页。",
-                                    "For smooth scrolling the pane renders the first {first} pages.",
-                                )
-                                .replace("{first}", &PREVIEW_MAX_RENDERED_PAGES.to_string()),
-                        ));
-                    }
-                    for page in pages.iter().take(PREVIEW_MAX_RENDERED_PAGES) {
-                        content = content.child(
-                            div()
-                                .v_flex()
-                                .gap_1()
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .text_color(rgb(0x000e_7490))
-                                        .child(language.choose_owned(
-                                            format!("第 {} 页", page.number),
-                                            format!("Page {}", page.number),
-                                        )),
-                                )
-                                .child(
-                                    div()
-                                        .p_2()
-                                        .rounded_md()
-                                        .bg(rgb(SURFACE_BG))
-                                        .text_sm()
-                                        .text_color(rgb(TEXT_PRIMARY))
-                                        .whitespace_normal()
-                                        .child(page.text.clone()),
-                                ),
-                        );
-                    }
-                }
+                // Rasterized views are rendered by `render_document_raster_pages`, and paged
+                // text becomes separate page items in `render_document_view_items`, before
+                // this function is reached; this arm keeps the match exhaustive.
+                DocumentViewBody::RasterPages { .. } | DocumentViewBody::PagedText { .. } => {}
                 DocumentViewBody::Blocks { blocks, truncated } => {
                     if *truncated {
                         content = content.child(Self::render_preview_truncation_note(
@@ -12759,7 +13684,7 @@ fn main() {
                     None
                 };
             let document_preview_pane = if self.document_preview.is_some() {
-                Some(self.render_document_preview_pane(cx))
+                Some(self.render_document_preview_pane(window, cx))
             } else {
                 None
             };
