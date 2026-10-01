@@ -9,10 +9,20 @@
 use circuitfabric_contracts::ProjectId;
 
 #[cfg_attr(not(feature = "native-ui"), allow(dead_code))]
+mod settings_persistence;
+
+#[cfg_attr(not(feature = "native-ui"), allow(dead_code))]
 mod usage_audit;
 
 #[cfg_attr(not(feature = "native-ui"), allow(dead_code))]
 mod plugin_governance;
+
+#[cfg_attr(not(feature = "native-ui"), allow(dead_code))]
+mod pdf_zoom;
+
+#[cfg(all(feature = "native-ui", windows))]
+#[allow(unsafe_code)]
+mod pdf_cursors;
 
 #[cfg(all(feature = "native-ui", windows))]
 #[allow(unsafe_code)]
@@ -238,12 +248,18 @@ pub fn app_window_title(selected_project_name: Option<&str>) -> String {
 
 #[cfg(not(feature = "native-ui"))]
 fn main() {
+    if circuitfabric_codex_runtime::judge::run_from_args() {
+        return;
+    }
     println!("CircuitFabric desktop scaffold. Rebuild with --features native-ui to start GPUI.");
 }
 
 #[cfg(feature = "native-ui")]
 #[allow(clippy::too_many_lines)]
 fn main() {
+    if circuitfabric_codex_runtime::judge::run_from_args() {
+        return;
+    }
     use std::{
         collections::BTreeMap,
         path::{Path, PathBuf},
@@ -288,7 +304,7 @@ fn main() {
     };
     use gpui_base::{InputBase, input::InputEditorStyle};
     use gpui_component::{
-        Disableable, Root, StyledExt,
+        Disableable, IconName, Root, StyledExt,
         button::{Button, ButtonVariants},
         input::{Input, InputEvent, InputState},
         scroll::ScrollableElement as _,
@@ -683,8 +699,7 @@ fn main() {
     #[derive(Clone)]
     struct DocumentRasterPreviewPage {
         image: std::sync::Arc<gpui::RenderImage>,
-        width: u32,
-        height: u32,
+        requested_width: u32,
     }
 
     /// Pages rendered around the viewport are kept; farther ones are evicted (and removed
@@ -702,8 +717,9 @@ fn main() {
         /// Size in points of every page.
         page_sizes: Vec<(f32, f32)>,
         pages: BTreeMap<u32, DocumentRasterPreviewPage>,
-        in_flight: std::collections::BTreeSet<u32>,
-        failed: std::collections::BTreeSet<u32>,
+        in_flight: BTreeMap<u32, u32>,
+        failed: std::collections::BTreeSet<(u32, u32)>,
+        retired_images: Vec<std::sync::Arc<gpui::RenderImage>>,
     }
 
     /// What the preview pane shows for one selected document.
@@ -742,6 +758,8 @@ fn main() {
         model_steps: Vec<(String, String)>,
         /// `(arguments, result)` per finished Jev batch, in call order.
         jev_results: Vec<(serde_json::Value, serde_json::Value)>,
+        /// Cached judgments belong to the backend/model configuration that produced them.
+        judge_definition: Option<circuitfabric_codex_runtime::tools::McpServerDefinition>,
     }
 
     /// The document currently shown in the right-hand preview pane.
@@ -776,8 +794,15 @@ fn main() {
     struct PreviewFocus {
         project_id: ProjectId,
         document_id: String,
+        content_hash: String,
         anchor: FragmentAnchor,
         text: String,
+        terms: Vec<String>,
+        regions: Vec<circuitfabric_document_opener::PdfHighlightRect>,
+        notice: Option<String>,
+        /// `true` while the source location is being resolved off the UI thread; the pane
+        /// shows a loading mask over the document area until it clears.
+        resolving: bool,
     }
 
     // One GPUI view struct accumulates the whole control plane's UI state; the
@@ -845,6 +870,13 @@ fn main() {
         evidence_visible: usize,
         preview_focus: Option<PreviewFocus>,
         preview_scroll: gpui::ScrollHandle,
+        preview_pdf_zoom: crate::pdf_zoom::ZoomMotion,
+        preview_zoom_tick: Option<std::time::Instant>,
+        preview_pdf_pan: Option<(gpui::Point<gpui::Pixels>, gpui::Point<gpui::Pixels>)>,
+        preview_zoom_anchor: Option<(usize, gpui::Point<f32>, gpui::Point<gpui::Pixels>)>,
+        preview_row_anchor: Option<gpui::ScrollAnchor>,
+        preview_focus_generation: u64,
+        main_content_scroll: gpui::ScrollHandle,
         // Set when the preview must scroll to `preview_focus` once its content is laid out.
         preview_scroll_pending: std::cell::Cell<bool>,
         semantic_query: Entity<InputState>,
@@ -867,8 +899,10 @@ fn main() {
         agents_selection: AgentsSelection,
         codex_process: Option<CodexAppServerHandle>,
         codex_status: RuntimeLifecycleStatus,
+        codex_active_provider: Option<String>,
         bridge_process: Option<BridgeProcessHandle>,
         bridge_status: RuntimeLifecycleStatus,
+        bridge_active_address: Option<String>,
         bridge_health: BridgeHealth,
         bridge_probed_at: Option<Instant>,
         bridge_probe_pending: bool,
@@ -884,11 +918,27 @@ fn main() {
         catalog_source: Entity<InputState>,
         catalog_args: Entity<InputState>,
         catalog_env: Entity<InputState>,
-        // Masked TYPESAFE_API_KEY entry on the bundled Jev settings page.
+        // Non-secret LLM adapter form and a write-only masked credential entry.
         jev_api_key: Entity<InputState>,
+        jev_base_url: Entity<InputState>,
+        jev_model: Entity<InputState>,
+        jev_key_env: Entity<InputState>,
+        jev_timeout: Entity<InputState>,
+        jev_retries: Entity<InputState>,
+        jev_llm_settings: circuitfabric_codex_runtime::judge::LlmJudgeSettings,
+        // Backend branch currently shown in the Jev page selector — a draft
+        // until "save and use" applies it to the catalog.
+        jev_llm_draft: bool,
+        // Jev configuration dialogs; edits inside stay draft until 保存.
+        jev_backend_modal_open: bool,
+        jev_key_modal_open: bool,
         adapters: circuitfabric_codex_runtime::execution::AdapterSettings,
-        adapter_command: Entity<InputState>,
-        adapter_provider: Entity<InputState>,
+        saved_settings: RuntimeSettings,
+        codex_provider: Entity<InputState>,
+        claude_command: Entity<InputState>,
+        claude_provider: Entity<InputState>,
+        dsh_command: Entity<InputState>,
+        dsh_provider: Entity<InputState>,
         task_prompt: Entity<InputState>,
         task_image: Entity<InputState>,
         task_result: String,
@@ -1044,7 +1094,16 @@ fn main() {
             placeholder: &'static str,
             cx: &mut Context<Self>,
         ) -> Entity<InputState> {
-            cx.new(|cx| InputState::new(window, cx).default_value(value).placeholder(placeholder))
+            let input = cx.new(|cx| {
+                InputState::new(window, cx).default_value(value).placeholder(placeholder)
+            });
+            cx.subscribe(&input, |_, _, event, cx| {
+                if let InputEvent::Change = event {
+                    cx.notify();
+                }
+            })
+            .detach();
+            input
         }
 
         /// Password-style input: no echo, and the value stays out of the clipboard.
@@ -1181,9 +1240,28 @@ fn main() {
                 Self::input(window, String::new(), "SKILL.md 路径 / MCP 可执行文件", cx);
             let catalog_args = Self::input(window, "[]".to_owned(), "参数 JSON 数组", cx);
             let catalog_env = Self::input(window, String::new(), "MCP_API_KEY", cx);
-            let adapter_command =
+            let claude_command =
                 Self::input(window, settings.adapters.claude_command.clone(), "可执行文件", cx);
-            let adapter_provider = Self::input(window, String::new(), "留空使用默认 Provider", cx);
+            let claude_provider = Self::input(
+                window,
+                settings.adapters.claude_provider_id.clone(),
+                "留空使用默认 Provider",
+                cx,
+            );
+            let dsh_command =
+                Self::input(window, settings.adapters.dsh_command.clone(), "可执行文件", cx);
+            let dsh_provider = Self::input(
+                window,
+                settings.adapters.dsh_provider_id.clone(),
+                "留空使用默认 Provider",
+                cx,
+            );
+            let codex_provider = Self::input(
+                window,
+                settings.adapters.codex_provider_id.clone(),
+                "留空使用默认 Provider",
+                cx,
+            );
             let task_prompt = Self::input(window, String::new(), "输入任务以验证真实模型调用", cx);
             let task_image =
                 Self::input(window, String::new(), "可选图片路径；使用 Vision 服务", cx);
@@ -1198,7 +1276,39 @@ fn main() {
             let secret_name = Self::input(window, String::new(), "OPENAI_API_KEY", cx);
             let secret_value = Self::masked_input(window, "粘贴密钥值，保存后不再回显", cx);
             let jev_api_key =
-                Self::masked_input(window, "粘贴 TYPESAFE_API_KEY，保存后不再回显", cx);
+                Self::masked_input(window, "粘贴当前判断后端的 API Key，保存后不再回显", cx);
+            let jev_llm_settings = settings
+                .catalog
+                .mcp_servers
+                .iter()
+                .find(|s| s.id == circuitfabric_codex_runtime::tools::BUNDLED_JEV_SERVER_ID)
+                .and_then(circuitfabric_codex_runtime::judge::LlmJudgeSettings::from_server)
+                .or_else(|| settings.catalog.llm_judge.clone())
+                .unwrap_or_default();
+            let jev_llm_draft = settings
+                .catalog
+                .mcp_servers
+                .iter()
+                .find(|s| s.id == circuitfabric_codex_runtime::tools::BUNDLED_JEV_SERVER_ID)
+                .and_then(circuitfabric_codex_runtime::judge::LlmJudgeSettings::from_server)
+                .is_some();
+            let jev_base_url = Self::input(
+                window,
+                jev_llm_settings.base_url.clone(),
+                "兼容 Chat Completions 的 Base URL",
+                cx,
+            );
+            let jev_model = Self::input(window, jev_llm_settings.model.clone(), "模型 ID", cx);
+            let jev_key_env = Self::input(
+                window,
+                jev_llm_settings.api_key_environment_variable.clone(),
+                "密钥环境变量名",
+                cx,
+            );
+            let jev_timeout =
+                Self::input(window, jev_llm_settings.timeout_seconds.to_string(), "5～180 秒", cx);
+            let jev_retries =
+                Self::input(window, jev_llm_settings.malformed_retries.to_string(), "0～3 次", cx);
             for input in [
                 &project_search,
                 &semantic_query,
@@ -1210,6 +1320,11 @@ fn main() {
                 &new_tool_id,
                 &secret_name,
                 &plugin_directory,
+                &jev_base_url,
+                &jev_model,
+                &jev_key_env,
+                &jev_timeout,
+                &jev_retries,
             ] {
                 cx.subscribe(input, |_, _, event, cx| {
                     if let InputEvent::Change = event {
@@ -1256,6 +1371,7 @@ fn main() {
             };
             Self {
                 sidebar_mark: Arc::new(Image::from_bytes(ImageFormat::Png, SIDEBAR_MARK.to_vec())),
+                saved_settings: settings.clone(),
                 command: Self::input(window, settings.codex.command, "codex", cx),
                 working_directory: Self::input(
                     window,
@@ -1315,6 +1431,13 @@ fn main() {
                 evidence_visible: EVIDENCE_PAGE_SIZE,
                 preview_focus: None,
                 preview_scroll: gpui::ScrollHandle::new(),
+                preview_pdf_zoom: crate::pdf_zoom::ZoomMotion::default(),
+                preview_zoom_tick: None,
+                preview_pdf_pan: None,
+                preview_zoom_anchor: None,
+                preview_row_anchor: None,
+                preview_focus_generation: 0,
+                main_content_scroll: gpui::ScrollHandle::new(),
                 preview_scroll_pending: std::cell::Cell::new(false),
                 semantic_query,
                 semantic_query_scope: SemanticQueryScope::Components,
@@ -1336,8 +1459,10 @@ fn main() {
                 agents_selection: AgentsSelection::Runtime(RuntimeAdapter::CodexAppServer),
                 codex_process: None,
                 codex_status: RuntimeLifecycleStatus::Stopped,
+                codex_active_provider: None,
                 bridge_process: None,
                 bridge_status: RuntimeLifecycleStatus::Stopped,
+                bridge_active_address: None,
                 bridge_health: BridgeHealth::Unknown,
                 bridge_probed_at: None,
                 bridge_probe_pending: false,
@@ -1352,9 +1477,21 @@ fn main() {
                 catalog_args,
                 catalog_env,
                 jev_api_key,
+                jev_base_url,
+                jev_model,
+                jev_key_env,
+                jev_timeout,
+                jev_retries,
+                jev_llm_settings,
+                jev_llm_draft,
+                jev_backend_modal_open: false,
+                jev_key_modal_open: false,
                 adapters: settings.adapters,
-                adapter_command,
-                adapter_provider,
+                claude_command,
+                claude_provider,
+                dsh_command,
+                dsh_provider,
+                codex_provider,
                 task_prompt,
                 task_image,
                 task_result: String::new(),
@@ -1550,7 +1687,7 @@ fn main() {
             let selected = self.selected_provider.min(self.providers.len() - 1);
             self.providers[selected].enabled = !self.providers[selected].enabled;
             self.status = format!(
-                "Provider `{}` 已{}。",
+                "Provider `{}` 的{}修改尚未保存；请点击「保存 Provider 列表」。",
                 self.providers[selected].id.read(cx).value(),
                 if self.providers[selected].enabled { "启用" } else { "停用" }
             );
@@ -1561,68 +1698,135 @@ fn main() {
             let selected = self.selected_provider.min(self.providers.len() - 1);
             self.providers[selected].supports_vision = !self.providers[selected].supports_vision;
             self.status = format!(
-                "Provider `{}` 的 Vision 已{}。",
+                "Provider `{}` 的 Vision {}修改尚未保存；请点击「保存 Provider 列表」。",
                 self.providers[selected].id.read(cx).value(),
                 if self.providers[selected].supports_vision { "启用" } else { "停用" }
             );
             cx.notify();
         }
 
-        /// Collects every runtime form on the Agents & tools page into persistable settings.
-        fn runtime_settings_from_form(&self, cx: &Context<Self>) -> RuntimeSettings {
-            let providers = self.provider_values(cx);
-            let default_provider_id =
-                if providers.iter().any(|provider| provider.id == self.default_provider_id) {
-                    self.default_provider_id.clone()
-                } else {
-                    providers.first().map_or_else(String::new, |provider| provider.id.clone())
-                };
-            let mut settings = RuntimeSettings::default();
-            settings.codex.command = self.command.read(cx).value().to_string();
-            settings.codex.working_directory =
-                self.working_directory.read(cx).value().to_string().into();
-            if let Some(provider) =
-                providers.iter().find(|provider| provider.id == default_provider_id)
-            {
-                settings.codex.model = Some(provider.model.clone());
-                settings
-                    .codex
-                    .api_key_environment_variable
-                    .clone_from(&provider.api_key_environment_variable);
-            }
-            settings.default_provider_id.clone_from(&default_provider_id);
-            settings.providers = providers;
-            settings.bridge.listen_address = self.bridge_address.read(cx).value().to_string();
-            settings.tools = self.tool_authorizations.clone();
-            settings.catalog = self.catalog.clone();
-            settings.adapters = self.adapters.clone();
-            settings.global_preferences = self.global_preferences_from_form(cx);
-            settings
+        fn save_update(
+            &mut self,
+            update: crate::settings_persistence::SettingsUpdate,
+        ) -> Result<(), circuitfabric_codex_runtime::RuntimeError> {
+            let saved = crate::settings_persistence::save_update(&self.settings_path, update)?;
+            self.adapters = saved.adapters.clone();
+            self.saved_settings = saved;
+            Ok(())
         }
 
-        fn save_settings(&mut self, cx: &mut Context<Self>) {
-            let settings = self.runtime_settings_from_form(cx);
-            if settings.providers.is_empty() {
-                "未保存：至少需要一个 Provider。".clone_into(&mut self.status);
-                cx.notify();
-                return;
-            }
-            self.default_provider_id.clone_from(&settings.default_provider_id);
-            self.status = match settings.save(&self.settings_path) {
-                Ok(()) => format!(
-                    "已保存到 {}。默认 Provider：{}。API Key 仅保存环境变量名。",
-                    self.settings_path.display(),
-                    settings.default_provider_id
-                ),
-                Err(error) => format!("未保存：{error}"),
+        fn save_providers(&mut self, cx: &mut Context<Self>) {
+            let update = crate::settings_persistence::SettingsUpdate::Providers {
+                providers: self.provider_values(cx),
+                default_provider_id: self.default_provider_id.clone(),
+            };
+            self.status = match self.save_update(update) {
+                Ok(()) => "已保存 Provider 列表及默认项；下次任务生效，运行中的服务须重启。".into(),
+                Err(error) => format!("Provider 未保存：{error}"),
             };
             cx.notify();
         }
 
+        fn save_runtime(&mut self, adapter: RuntimeAdapter, cx: &mut Context<Self>) {
+            use crate::settings_persistence::SettingsUpdate;
+            let (command, provider) = self.runtime_fields(adapter);
+            let command = command.read(cx).value().trim().to_owned();
+            let provider_id = provider.read(cx).value().trim().to_owned();
+            let update = match adapter {
+                RuntimeAdapter::CodexAppServer => SettingsUpdate::Codex {
+                    command,
+                    working_directory: self.working_directory.read(cx).value().trim().into(),
+                    provider_id,
+                },
+                RuntimeAdapter::ClaudeCode => SettingsUpdate::Claude { command, provider_id },
+                RuntimeAdapter::Dsh => SettingsUpdate::Dsh { command, provider_id },
+            };
+            self.status = match self.save_update(update) {
+                Ok(()) => {
+                    format!("已保存 {} 配置；下次任务生效，运行中的服务须重启。", adapter.label())
+                }
+                Err(error) => format!(
+                    "{} 配置未保存：{error}。新增 Provider 请先在 Provider 详情中保存。",
+                    adapter.label()
+                ),
+            };
+            cx.notify();
+        }
+
+        fn runtime_fields(
+            &self,
+            adapter: RuntimeAdapter,
+        ) -> (&Entity<InputState>, &Entity<InputState>) {
+            match adapter {
+                RuntimeAdapter::CodexAppServer => (&self.command, &self.codex_provider),
+                RuntimeAdapter::ClaudeCode => (&self.claude_command, &self.claude_provider),
+                RuntimeAdapter::Dsh => (&self.dsh_command, &self.dsh_provider),
+            }
+        }
+
+        fn runtime_dirty(&self, adapter: RuntimeAdapter, cx: &Context<Self>) -> bool {
+            let (command, provider) = self.runtime_fields(adapter);
+            let saved = &self.saved_settings;
+            let (saved_command, saved_provider) = match adapter {
+                RuntimeAdapter::CodexAppServer => {
+                    (&saved.codex.command, &saved.adapters.codex_provider_id)
+                }
+                RuntimeAdapter::ClaudeCode => {
+                    (&saved.adapters.claude_command, &saved.adapters.claude_provider_id)
+                }
+                RuntimeAdapter::Dsh => {
+                    (&saved.adapters.dsh_command, &saved.adapters.dsh_provider_id)
+                }
+            };
+            command.read(cx).value().trim() != saved_command
+                || provider.read(cx).value().trim() != saved_provider
+                || (adapter == RuntimeAdapter::CodexAppServer
+                    && PathBuf::from(self.working_directory.read(cx).value().trim())
+                        != saved.codex.working_directory)
+        }
+
+        fn save_state_note(dirty: bool, language: UiLanguage) -> Div {
+            div().text_xs().text_color(rgb(if dirty { 0x00b4_5309 } else { TEXT_MUTED }))
+                .child(if dirty {
+                    language.choose("有未保存修改；切换页面会保留草稿，启动和任务使用已保存配置。", "Unsaved changes; drafts survive navigation. Starts and tasks use saved configuration.")
+                } else {
+                    language.choose("当前配置无修改；启动和任务使用已保存配置。", "No pending changes; starts and tasks use saved configuration.")
+                })
+        }
+
+        fn save_bridge_settings(&mut self, cx: &mut Context<Self>) {
+            let update = crate::settings_persistence::SettingsUpdate::Bridge {
+                listen_address: self.bridge_address.read(cx).value().trim().to_owned(),
+            };
+            self.status = match self.save_update(update) {
+                Ok(()) => "已保存 Bridge 监听地址；下次启动生效。".into(),
+                Err(error) => format!("Bridge 监听地址未保存：{error}"),
+            };
+            cx.notify();
+        }
+
+        fn bridge_endpoint(&self) -> String {
+            self.bridge_active_address
+                .as_ref()
+                .unwrap_or(&self.saved_settings.bridge.listen_address)
+                .clone()
+        }
+
+        /// Execution reads saved configuration and never commits unrelated form drafts.
+        fn settings_for_execution(&mut self, cx: &mut Context<Self>) -> Option<RuntimeSettings> {
+            match RuntimeSettings::load_or_default(&self.settings_path) {
+                Ok(settings) => Some(settings),
+                Err(error) => {
+                    self.status = format!("无法读取已保存配置：{error}");
+                    cx.notify();
+                    None
+                }
+            }
+        }
+
         /// Starts the supervised Codex App Server child process.
         ///
-        /// The launch persists the current form first, so what runs is exactly what was saved,
-        /// and briefly watches the process so an immediate exit is reported as a failure.
+        /// Uses the saved snapshot and checks for an immediate process exit.
         fn start_codex_runtime(&mut self, window: &mut Window, cx: &mut Context<Self>) {
             if self.codex_process.is_some()
                 || matches!(self.codex_status, RuntimeLifecycleStatus::Starting)
@@ -1631,7 +1835,9 @@ fn main() {
                 cx.notify();
                 return;
             }
-            let settings = self.runtime_settings_from_form(cx);
+            let Some(settings) = self.settings_for_execution(cx) else {
+                return;
+            };
             let Some(provider) = circuitfabric_codex_runtime::execution::selected_provider(
                 &settings,
                 circuitfabric_codex_runtime::execution::AgentKind::Codex,
@@ -1641,13 +1847,9 @@ fn main() {
                 cx.notify();
                 return;
             };
-            if let Err(error) = settings.save(&self.settings_path) {
-                self.status = format!("未启动：设置未保存（{error}）");
-                cx.notify();
-                return;
-            }
-            self.default_provider_id.clone_from(&settings.default_provider_id);
             self.codex_status = RuntimeLifecycleStatus::Starting;
+            self.codex_active_provider =
+                Some(format!("{} / {} / {}", provider.id, provider.model, provider.base_url));
             self.status = format!("Codex App Server: {} / {}", provider.id, provider.model);
             let secrets = (self.secret_storage_provider == SecretStorageProvider::EncryptedVault)
                 .then(|| self.vault.as_ref().map(|vault| vault.values().clone()))
@@ -1671,6 +1873,7 @@ fn main() {
                                 view.codex_status = RuntimeLifecycleStatus::Running { pid };
                             }
                             Err(reason) => {
+                                view.codex_active_provider = None;
                                 view.codex_status =
                                     RuntimeLifecycleStatus::Failed { reason: reason.clone() };
                                 view.status = reason;
@@ -1704,6 +1907,7 @@ fn main() {
             match process.stop() {
                 Ok(()) => {
                     self.codex_status = RuntimeLifecycleStatus::Stopped;
+                    self.codex_active_provider = None;
                     self.status = format!(
                         "已停止 Codex App Server（PID {pid}）。已保存的运行时设置保持不变。"
                     );
@@ -1723,6 +1927,7 @@ fn main() {
             let exit = self.codex_process.as_mut().and_then(CodexAppServerHandle::try_exit);
             if let Some(exit) = exit {
                 self.codex_process = None;
+                self.codex_active_provider = None;
                 if exit.success() {
                     self.codex_status = RuntimeLifecycleStatus::Stopped;
                 } else {
@@ -1735,8 +1940,7 @@ fn main() {
 
         /// Starts the `JLCircuit` EDA bridge as a supervised child process.
         ///
-        /// The launch persists the current form first, so the bridge reads exactly
-        /// what was saved, then waits for the configured port to accept before
+        /// The bridge reads the saved snapshot, then waits for the configured port before
         /// reporting running — an early exit is reported as a failure together
         /// with the bridge's own stderr.
         fn start_bridge_service(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1747,17 +1951,14 @@ fn main() {
                 cx.notify();
                 return;
             }
-            let settings = self.runtime_settings_from_form(cx);
-            if let Err(error) = settings.save(&self.settings_path) {
-                self.status = format!("未启动：设置未保存（{error}）");
-                cx.notify();
+            let Some(settings) = self.settings_for_execution(cx) else {
                 return;
-            }
-            self.default_provider_id.clone_from(&settings.default_provider_id);
+            };
             let config_path = self.settings_path.clone();
             let address = settings.bridge.listen_address.clone();
             let launch_address = address.clone();
             self.bridge_status = RuntimeLifecycleStatus::Starting;
+            self.bridge_active_address = Some(address.clone());
             self.bridge_health = BridgeHealth::Unknown;
             self.bridge_probed_at = None;
             self.status = format!("bridge 正在启动：ws://{address}/bridge");
@@ -1804,6 +2005,7 @@ fn main() {
                                     format!("bridge 已启动（PID {pid}）：ws://{address}/bridge");
                             }
                             Err(reason) => {
+                                view.bridge_active_address = None;
                                 view.bridge_status =
                                     RuntimeLifecycleStatus::Failed { reason: reason.clone() };
                                 view.status = format!("bridge 启动失败：{reason}");
@@ -1836,6 +2038,7 @@ fn main() {
             match process.stop() {
                 Ok(()) => {
                     self.bridge_status = RuntimeLifecycleStatus::Stopped;
+                    self.bridge_active_address = None;
                     self.bridge_health = BridgeHealth::Unknown;
                     self.bridge_probed_at = None;
                     self.bridge_test = None;
@@ -1860,6 +2063,7 @@ fn main() {
                     .map(BridgeProcessHandle::exit_diagnostics)
                     .unwrap_or_default();
                 self.bridge_process = None;
+                self.bridge_active_address = None;
                 if exit.success() {
                     self.bridge_status = RuntimeLifecycleStatus::Stopped;
                 } else {
@@ -1887,7 +2091,7 @@ fn main() {
             }
             self.bridge_probe_pending = true;
             self.bridge_probed_at = Some(Instant::now());
-            let address = self.bridge_address.read(cx).value().to_string();
+            let address = self.bridge_endpoint();
             let probe_task = cx.background_spawn(async move {
                 probe::tcp_reachable(&address, Duration::from_secs(2))
             });
@@ -1918,7 +2122,7 @@ fn main() {
                 return;
             }
             self.bridge_test_pending = true;
-            let address = self.bridge_address.read(cx).value().to_string();
+            let address = self.bridge_endpoint();
             let test_task = cx.background_spawn(async move {
                 probe::status(&address, Duration::from_secs(5)).map_err(|reason| {
                     // A refused connection really is offline; anything else
@@ -2027,10 +2231,12 @@ fn main() {
                     } else {
                         format!("（另跳过已授权的 {skipped} 项）")
                     };
-                    let settings = self.runtime_settings_from_form(cx);
-                    match settings.save(&self.settings_path) {
+                    match self.save_update(
+                        crate::settings_persistence::SettingsUpdate::Authorizations(
+                            self.tool_authorizations.clone(),
+                        ),
+                    ) {
                         Ok(()) => {
-                            self.default_provider_id.clone_from(&settings.default_provider_id);
                             self.new_tool_id
                                 .update(cx, |state, cx| state.set_value("", window, cx));
                             self.status = format!(
@@ -2042,8 +2248,7 @@ fn main() {
                         }
                         Err(error) => {
                             self.tool_authorizations = previous;
-                            self.status =
-                                format!("未授权（全局授权会立即保存运行时设置）：{error}");
+                            self.status = format!("全局授权未保存：{error}");
                         }
                     }
                 }
@@ -2135,10 +2340,12 @@ fn main() {
                     let previous = self.tool_authorizations.clone();
                     let list = Self::global_tool_list_mut(&mut self.tool_authorizations, kind);
                     list.retain(|existing| existing.as_str() != id);
-                    let settings = self.runtime_settings_from_form(cx);
-                    match settings.save(&self.settings_path) {
+                    match self.save_update(
+                        crate::settings_persistence::SettingsUpdate::Authorizations(
+                            self.tool_authorizations.clone(),
+                        ),
+                    ) {
                         Ok(()) => {
-                            self.default_provider_id.clone_from(&settings.default_provider_id);
                             self.status = format!(
                                 "已撤销{kind_label} `{id}` 的全局授权，已写入 {}。",
                                 self.settings_path.display()
@@ -2146,7 +2353,7 @@ fn main() {
                         }
                         Err(error) => {
                             self.tool_authorizations = previous;
-                            self.status = format!("未撤销（撤销会立即保存运行时设置）：{error}");
+                            self.status = format!("撤销授权未保存：{error}");
                         }
                     }
                 }
@@ -2432,6 +2639,7 @@ fn main() {
             window: &mut Window,
             cx: &mut Context<Self>,
         ) {
+            self.stop_pdf_interaction();
             let document = self.project_data.get(project_id).and_then(|data| {
                 data.documents.iter().find(|document| document.id == hit.fragment.document_id)
             });
@@ -2452,14 +2660,180 @@ fn main() {
             if let FragmentAnchor::DatasheetRow { row, .. } = hit.anchor {
                 self.datasheet_rows_visible = self.datasheet_rows_visible.max(row);
             }
+            self.reset_pdf_view();
             self.preview_focus = Some(PreviewFocus {
                 project_id: project_id.to_owned(),
                 document_id: document.id,
+                // The document's own content hash, not the fragment's: full-text fragments
+                // carry the hash of the extracted text corpus, which never equals the
+                // file's hash and would make the resolver reject every search navigation
+                // as "content changed". Verified-data rows keep their staleness signal
+                // through the evidence lookup itself.
+                content_hash: document.content_hash.clone(),
                 anchor: hit.anchor.clone(),
                 text: hit.fragment.text.clone(),
+                terms: hit
+                    .highlights
+                    .iter()
+                    .filter_map(|range| hit.fragment.text.get(range.clone()).map(str::to_owned))
+                    .collect(),
+                regions: Vec::new(),
+                notice: None,
+                resolving: false,
             });
+            self.preview_focus_generation += 1;
+            self.preview_row_anchor = self
+                .preview_show_data
+                .then(|| gpui::ScrollAnchor::for_handle(self.preview_scroll.clone()));
             self.preview_scroll.set_offset(gpui::Point::default());
             self.preview_scroll_pending.set(true);
+            if matches!(hit.anchor, FragmentAnchor::PageLine { .. }) {
+                self.resolve_preview_pdf_focus(None, cx);
+            }
+            cx.notify();
+        }
+
+        /// Resolve a row quote or highlight a known PDF page using a newly verified copy.
+        /// Only the latest focus request may publish its result.
+        fn resolve_preview_pdf_focus(&mut self, section: Option<String>, cx: &mut Context<Self>) {
+            let Some(focus) = self.preview_focus.as_mut() else { return };
+            let Some(storage) = self.project_storages.get(&focus.project_id).cloned() else {
+                return;
+            };
+            focus.notice =
+                Some(self.language.choose("正在定位原文…", "Locating source…").to_owned());
+            focus.resolving = true;
+            let focus = focus.clone();
+            let generation = self.preview_focus_generation;
+            let work = cx.background_spawn(async move {
+                let request = storage
+                    .prepare_document_open(&focus.project_id, &focus.document_id)
+                    .map_err(|error| error.to_string())?;
+                if request.content_hash != focus.content_hash {
+                    return Err("文档内容已变化，请刷新检索或重新提取后定位。".to_owned());
+                }
+                let (page, regions) = match focus.anchor {
+                    FragmentAnchor::PageLine { page, .. } => {
+                        // The hit's page number and its terms both come from the extractor
+                        // that indexed the document, which can disagree with pdfium's
+                        // pagination and text spacing. Search from that page outward with
+                        // the terms plus the full matched line — the strongest locator —
+                        // so the keywords still get highlighted on the page that really
+                        // holds them.
+                        let mut terms = focus.terms.clone();
+                        let line = focus.text.trim().to_owned();
+                        if !line.is_empty() && !terms.iter().any(|term| *term == line) {
+                            terms.push(line);
+                        }
+                        circuitfabric_document_opener::pdf_locate_highlight(
+                            request.managed_copy.data(),
+                            page,
+                            &terms,
+                        )
+                        .map(|result| result.map_err(|error| error.clone()))
+                        .transpose()?
+                        .unwrap_or((page, Vec::new()))
+                    }
+                    _ => {
+                        let page =
+                            circuitfabric_document_opener::datasheet::locate_datasheet_evidence(
+                                &request,
+                                section.as_deref().unwrap_or_default(),
+                                &focus.text,
+                            )?
+                            .ok_or_else(|| {
+                                "未能在当前 PDF 中定位这条证据，请对照原文核对。".to_owned()
+                            })?;
+                        let regions = circuitfabric_document_opener::pdf_highlight_regions(
+                            request.managed_copy.data(),
+                            page,
+                            &focus.terms,
+                        )
+                        .transpose()?
+                        .unwrap_or_default();
+                        (page, regions)
+                    }
+                };
+                Ok::<_, String>((page, regions))
+            });
+            cx.spawn(async move |view, cx| {
+                let result = work.await;
+                view.update(cx, |view, cx| {
+                    if view.preview_focus_generation != generation { return }
+                    let Some(focus) = view.preview_focus.as_mut() else { return };
+                    match result {
+                        Ok((page, regions)) => {
+                            focus.resolving = false;
+                            match focus.anchor {
+                                FragmentAnchor::PageLine { page: anchored, line } if page != anchored => {
+                                    // The keywords live on a different page than the hit's
+                                    // anchor claimed; navigate to where they were found.
+                                    focus.anchor = FragmentAnchor::PageLine { page, line };
+                                    view.preview_scroll_pending.set(true);
+                                }
+                                FragmentAnchor::PageLine { .. } => {}
+                                _ => {
+                                    focus.anchor = FragmentAnchor::PageLine { page, line: 1 };
+                                    view.preview_scroll_pending.set(true);
+                                }
+                            }
+                            focus.notice = regions.is_empty().then(|| view.language.choose(
+                                "已定位页面；该页文本层未匹配到高亮位置。", "Page located; no matching highlight coordinates in its text layer.",
+                            ).to_owned());
+                            focus.regions = regions;
+                        }
+                        Err(error) => {
+                            focus.resolving = false;
+                            focus.notice = Some(error);
+                        }
+                    }
+                    cx.notify();
+                }).ok();
+            }).detach();
+        }
+
+        fn open_datasheet_source(&mut self, section: &str, row: usize, cx: &mut Context<Self>) {
+            self.stop_pdf_interaction();
+            let Some(preview) = &self.document_preview else { return };
+            let Some(extraction) = &preview.extraction else { return };
+            let evidence = match section {
+                "pins" => extraction.pins.get(row).and_then(|row| row.evidence.clone()),
+                "absoluteMaximumRatings" => extraction
+                    .absolute_maximum_ratings
+                    .get(row)
+                    .and_then(|row| row.evidence.clone()),
+                "electricalCharacteristics" => extraction
+                    .electrical_characteristics
+                    .get(row)
+                    .and_then(|row| row.evidence.clone()),
+                "operatingConditions" => {
+                    extraction.operating_conditions.get(row).and_then(|row| row.evidence.clone())
+                }
+                _ => None,
+            };
+            let Some(evidence) = evidence else { return };
+            let (project_id, document_id, content_hash) = (
+                preview.project_id.clone(),
+                preview.document_id.clone(),
+                extraction.content_hash.clone(),
+            );
+            self.reset_pdf_view();
+            self.preview_focus = Some(PreviewFocus {
+                project_id,
+                document_id,
+                content_hash,
+                anchor: FragmentAnchor::Unknown,
+                text: evidence.clone(),
+                terms: vec![evidence],
+                regions: Vec::new(),
+                notice: None,
+                resolving: false,
+            });
+            self.preview_focus_generation += 1;
+            self.preview_row_anchor = None;
+            self.preview_show_data = false;
+            self.preview_scroll.set_offset(gpui::Point::default());
+            self.resolve_preview_pdf_focus(Some(section.to_owned()), cx);
             cx.notify();
         }
 
@@ -2693,6 +3067,10 @@ fn main() {
             self.release_preview_images(window);
             self.preview_show_data = false;
             self.preview_focus = None;
+            self.reset_pdf_view();
+            self.preview_focus_generation += 1;
+            self.preview_row_anchor = None;
+            self.preview_scroll_pending.set(false);
             self.preview_scroll.set_offset(gpui::Point::default());
             self.datasheet_feedback = None;
             self.datasheet_rows_visible = 40;
@@ -2789,7 +3167,9 @@ fn main() {
             let Some(storage) = self.project_storages.get(&project_id).cloned() else {
                 return;
             };
-            let settings = self.runtime_settings_from_form(cx);
+            let Some(settings) = self.settings_for_execution(cx) else {
+                return;
+            };
             let catalog = self.catalog.clone();
             let grants = self.effective_grants_for(&project_id);
             if !grants.authorized_mcp_server_ids.iter().any(|id| id == BUNDLED_JEV_SERVER_ID) {
@@ -2884,6 +3264,13 @@ fn main() {
                             };
                         } else if !checkpoint.model_steps.is_empty() {
                             log("▶ 找到上次提取检查点，正在核对选页与提示词…\n");
+                        }
+                        let definition = catalog.mcp_servers.iter()
+                            .find(|server| server.id == BUNDLED_JEV_SERVER_ID).cloned();
+                        if checkpoint.judge_definition != definition {
+                            checkpoint.jev_results.clear();
+                            checkpoint.judge_definition = definition;
+                            log("▶ 判断后端配置已变化，将重新复核候选数据…\n");
                         }
                     }
                     log("▶ 正在读取 PDF 文本…\n");
@@ -3027,6 +3414,15 @@ fn main() {
                         },
                     )?;
                     extraction.notes.push(format!("Jev evaluate MCP calls: {jev_evaluate_calls}"));
+                    if let Some(judge) = catalog.mcp_servers.iter()
+                        .find(|server| server.id == BUNDLED_JEV_SERVER_ID)
+                        .and_then(circuitfabric_codex_runtime::judge::LlmJudgeSettings::from_server)
+                    {
+                        extraction.notes.push(format!(
+                            "LLM judgment backend: {} ({:?}); probabilities are uncalibrated estimates.",
+                            judge.model, judge.answer_mode,
+                        ));
+                    }
                     let current = storage
                         .prepare_document_open(&project_id, &document_id)
                         .map_err(|error| error.to_string())?;
@@ -3179,7 +3575,12 @@ fn main() {
         fn close_document_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
             self.release_preview_images(window);
             self.document_preview = None;
+            self.stop_pdf_interaction();
             self.preview_focus = None;
+            self.preview_focus_generation += 1;
+            self.preview_row_anchor = None;
+            #[cfg(windows)]
+            crate::pdf_cursors::clear();
             if let Some(previous) = self.pre_preview_window_size.take()
                 && !window.is_fullscreen()
                 && !window.is_maximized()
@@ -3881,28 +4282,9 @@ fn main() {
                         .bg(rgb(if selected { 0x00f0_f9ff } else { CARD_BG }))
                         .cursor_pointer()
                         .hover(|this| this.border_color(rgb(ACCENT_SOFT)))
-                        .on_click(move |_, window, cx| {
+                        .on_click(move |_, _, cx| {
                             selector.update(cx, |view, cx| {
                                 view.agents_selection = AgentsSelection::Runtime(adapter);
-                                let (command, provider) = match adapter {
-                                    RuntimeAdapter::ClaudeCode => (
-                                        &view.adapters.claude_command,
-                                        &view.adapters.claude_provider_id,
-                                    ),
-                                    RuntimeAdapter::Dsh => {
-                                        (&view.adapters.dsh_command, &view.adapters.dsh_provider_id)
-                                    }
-                                    RuntimeAdapter::CodexAppServer => (
-                                        &view.adapters.claude_command,
-                                        &view.adapters.codex_provider_id,
-                                    ),
-                                };
-                                let command = command.clone();
-                                let provider = provider.clone();
-                                view.adapter_command
-                                    .update(cx, |input, cx| input.set_value(command, window, cx));
-                                view.adapter_provider
-                                    .update(cx, |input, cx| input.set_value(provider, window, cx));
                                 cx.notify();
                             });
                         })
@@ -4108,16 +4490,21 @@ fn main() {
                         .authorized_mcp_server_ids
                         .iter()
                         .any(|id| id == BUNDLED_JEV_SERVER_ID);
+                    let llm =
+                        circuitfabric_codex_runtime::judge::LlmJudgeSettings::from_server(server)
+                            .is_some();
                     language.choose_owned(
                         format!(
-                            "{} · {}",
+                            "{} · {} · {}",
                             if server.enabled { "已启用" } else { "已停用" },
-                            if granted { "已授权" } else { "未授权" }
+                            if granted { "已授权" } else { "未授权" },
+                            if llm { "LLM" } else { "TypeSafe" }
                         ),
                         format!(
-                            "{} · {}",
+                            "{} · {} · {}",
                             if server.enabled { "enabled" } else { "disabled" },
-                            if granted { "authorized" } else { "not authorized" }
+                            if granted { "authorized" } else { "not authorized" },
+                            if llm { "LLM" } else { "TypeSafe" }
                         ),
                     )
                 }
@@ -4165,11 +4552,10 @@ fn main() {
                         ),
                 )
                 .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(language.choose(
-                    "内置 TypeSafe System One 判断服务器（evaluate）",
-                    "Bundled TypeSafe System One judgment server (evaluate)",
+                    "TypeSafe 或第三方 LLM 的类型化判断（evaluate）",
+                    "Typed judgments via TypeSafe or a third-party LLM (evaluate)",
                 )));
 
-            let save_runtime = entity.clone();
             let add_provider = entity.clone();
             div()
                 .size_full()
@@ -4199,19 +4585,11 @@ fn main() {
                                 .child(
                                     div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(
                                         language.choose(
-                                            "运行时端点、LLM Provider 与技能/MCP 授权统一在这里管理；API Key 始终只以环境变量名引用。",
-                                            "Runtime endpoints, LLM providers, and skills/MCP authorizations in one place; API keys stay environment-variable names.",
+                                            "在各详情页保存对应配置；技能/MCP 启停与授权即时保存。API Key 以变量名引用。",
+                                            "Save each configuration in its detail pane; skill/MCP toggles and grants save immediately. API keys use variable names.",
                                         ),
                                     ),
                                 ),
-                        )
-                        .child(
-                            Button::new("save-runtime")
-                                .primary()
-                                .label(language.choose("保存设置", "Save settings"))
-                                .on_click(move |_, _, cx| {
-                                    save_runtime.update(cx, ControlPlaneView::save_settings);
-                                }),
                         ),
                 )
                 .child(
@@ -4271,7 +4649,7 @@ fn main() {
             let jlc_selected = self.eda_services_selection == EdaServiceSelection::JlcircuitBridge;
             let lifecycle_label = self.bridge_status.clone().label(language);
             let health = self.bridge_health.clone();
-            let address = self.bridge_address.read(cx).value().to_string();
+            let address = self.bridge_endpoint();
             let jlc_card = div()
                 .id("eda-service-jlcircuit")
                 .v_flex()
@@ -4424,7 +4802,7 @@ fn main() {
             let is_running = self.bridge_process.is_some();
             let is_starting = matches!(self.bridge_status, RuntimeLifecycleStatus::Starting);
             let is_test_pending = self.bridge_test_pending;
-            let address = self.bridge_address.read(cx).value().to_string();
+            let address = self.bridge_endpoint();
             let health = self.bridge_health.clone();
             let externally_owned =
                 matches!(health, BridgeHealth::Listening { .. }) && !is_running && !is_starting;
@@ -4566,10 +4944,14 @@ fn main() {
                     language.choose("bridge 监听地址", "Bridge listen address"),
                     "bridge-address",
                     Some(language.choose(
-                        "仅允许回环地址（如 127.0.0.1:49630）；保存后写入运行时设置，bridge 下次启动时生效。",
-                        "Loopback only (e.g. 127.0.0.1:49630); saved into the runtime settings and read the next time the bridge starts.",
+                        "仅保存此服务的监听地址（如 127.0.0.1:49630）；下次启动生效，运行中需重启。",
+                        "Saves only this service's listen address (e.g. 127.0.0.1:49630); applies at the next start. Restart a running service.",
                     )),
                     &self.bridge_address,
+                ))
+                .child(Self::save_state_note(
+                    self.bridge_address.read(cx).value().trim() != self.saved_settings.bridge.listen_address,
+                    language,
                 ))
                 .child(
                     div()
@@ -4578,9 +4960,9 @@ fn main() {
                         .child(
                             Button::new("save-eda-bridge")
                                 .primary()
-                                .label(language.choose("保存设置", "Save settings"))
+                                .label(language.choose("保存 Bridge 地址", "Save Bridge address"))
                                 .on_click(move |_, _, cx| {
-                                    bridge_saver.update(cx, ControlPlaneView::save_settings);
+                                    bridge_saver.update(cx, ControlPlaneView::save_bridge_settings);
                                 }),
                         )
                         .child(
@@ -4729,27 +5111,14 @@ fn main() {
             let starter = entity.clone();
             let binding_saver = entity.clone();
             let stopper = entity;
-            // The endpoint launches with the default provider — the same one
-            // `runtime_settings_from_form` normalizes to — so surface that link here.
-            let launch_provider = self
-                .providers
-                .iter()
-                .find(|provider| {
-                    provider.id.read(cx).value()
-                        == *if self.adapters.codex_provider_id.is_empty() {
-                            &self.default_provider_id
-                        } else {
-                            &self.adapters.codex_provider_id
-                        }
-                })
-                .or_else(|| self.providers.first());
+            let launch_provider = circuitfabric_codex_runtime::execution::selected_provider(
+                &self.saved_settings,
+                circuitfabric_codex_runtime::execution::AgentKind::Codex,
+            );
             let launch_provider_summary = match launch_provider {
-                Some(provider) => format!(
-                    "`{}`（{} · {}）",
-                    provider.id.read(cx).value(),
-                    provider.name.read(cx).value(),
-                    provider.model.read(cx).value()
-                ),
+                Some(provider) => {
+                    format!("`{}`（{} · {}）", provider.id, provider.name, provider.model)
+                }
                 None => language
                     .choose(
                         "尚未配置（请先添加 Provider）",
@@ -4855,11 +5224,16 @@ fn main() {
                                 launch_provider_summary,
                             )),
                         )
+                        .when_some(self.codex_active_provider.clone(), |this, provider| {
+                            this.child(div().text_xs().text_color(rgb(TEXT_SECONDARY)).child(format!(
+                                "{}{}", language.choose("当前进程使用：", "Current process uses: "), provider
+                            )))
+                        })
                         .child(
                             div().text_xs().text_color(rgb(TEXT_MUTED)).child(
                                 language.choose(
-                                    "启动会先保存当前设置，然后以子进程运行 Codex App Server；运行状态不持久化，退出 CircuitFabric 时进程会随之终止。停止只终止进程，不修改已保存的设置。切换 Provider：在 LLM Provider 详情中「设为默认」，再次启动即生效。",
-                                    "Start saves the current settings first, then runs the Codex App Server as a child process; the running state is not persisted and ends with CircuitFabric. Stop terminates the process without changing saved settings. To switch providers, set a default in the LLM provider detail and start again.",
+                                    "启动读取已保存配置；退出应用时清理子进程。此处保存 Codex 命令、工作目录及 Provider 关联；运行中的连接检查进程需重启，新任务使用新配置。Provider 的模型与地址请在其详情中保存。",
+                                    "Start reads saved configuration; child processes end with the app. Save here updates the Codex command, working directory and provider binding. Restart a running connection-check process; new tasks use the new configuration. Save provider models and URLs in provider details.",
                                 ),
                             ),
                         ),
@@ -4890,20 +5264,15 @@ fn main() {
                         ),
                 )
                 .child(Self::info_note(
-                    "API Key 仅以环境变量名引用（在 LLM Provider 中配置）；CircuitFabric 不保存、不回显任何密钥值。",
-                    "API keys are referenced by environment-variable name only (configured per LLM provider); CircuitFabric never stores or echoes a key value.",
+                    "此处只保存 Provider 关联；API Key 变量名在 Provider 中配置，密钥值由密钥保险库单独加密保存或由进程环境提供。",
+                    "This pane saves provider bindings only; API key variable names are configured per provider. Values are stored separately in the encrypted vault or supplied by the process environment.",
                     language,
                 ))
-                .child(Self::labeled_field("Provider ID（留空使用默认项）", "codex-provider", None, &self.adapter_provider))
-                .child(Button::new("save-codex-binding").label("保存关联").on_click(move |_, _, cx| {
+                .child(Self::labeled_field("Provider ID（留空使用默认项）", "codex-provider", None, &self.codex_provider))
+                .child(Self::save_state_note(self.runtime_dirty(RuntimeAdapter::CodexAppServer, cx), language))
+                .child(Button::new("save-codex-settings").primary().label(language.choose("保存 Codex 配置", "Save Codex configuration")).on_click(move |_, _, cx| {
                     binding_saver.update(cx, |view, cx| {
-                        let before = view.adapters.codex_provider_id.clone();
-                        view.adapters.codex_provider_id = view.adapter_provider.read(cx).value().to_string();
-                        match view.runtime_settings_from_form(cx).save(&view.settings_path) {
-                            Ok(()) => "已保存关联；新任务立即使用，连接检查进程须重启后生效".clone_into(&mut view.status),
-                            Err(error) => { view.adapters.codex_provider_id = before; view.status = format!("未保存：{error}"); }
-                        }
-                        cx.notify();
+                        view.save_runtime(RuntimeAdapter::CodexAppServer, cx);
                     });
                 }))
                 .child(self.render_task_controls(RuntimeAdapter::CodexAppServer, cx))
@@ -5266,12 +5635,9 @@ fn main() {
             if self.task_cancel.is_some() {
                 return;
             }
-            let settings = self.runtime_settings_from_form(cx);
-            if let Err(error) = settings.save(&self.settings_path) {
-                self.status = format!("未执行：{error}");
-                cx.notify();
+            let Some(settings) = self.settings_for_execution(cx) else {
                 return;
-            }
+            };
             let grants = self.effective_grants();
             let user_prompt = self.task_prompt.read(cx).value().to_string();
             let image_text = self.task_image.read(cx).value().to_string();
@@ -5543,18 +5909,17 @@ fn main() {
             cx: &mut Context<Self>,
         ) -> impl IntoElement {
             let saver = cx.entity().clone();
+            let language = self.language;
+            let (command, provider) = self.runtime_fields(adapter);
             div().flex_1().min_w(px(0.)).v_flex().gap_3().p_5().bg(rgb(CARD_BG)).rounded_xl()
                 .child(div().text_xl().child(adapter.label()))
                 .child("每次执行创建独立任务进程；完成、失败或取消后清理。Claude Code 使用 Anthropic Messages 协议。")
-                .child(Self::labeled_field("运行时命令", "adapter-command", None, &self.adapter_command))
-                .child(Self::labeled_field("Provider ID（留空使用默认项）", "adapter-provider", None, &self.adapter_provider))
-                .child(Button::new("save-adapter").label("保存关联").on_click(move |_, _, cx| { saver.update(cx, |view, cx| {
-                    let before = view.adapters.clone();
-                    let command = view.adapter_command.read(cx).value().to_string();
-                    let provider = view.adapter_provider.read(cx).value().to_string();
-                    match adapter { RuntimeAdapter::ClaudeCode => { view.adapters.claude_command = command; view.adapters.claude_provider_id = provider; }, RuntimeAdapter::Dsh => { view.adapters.dsh_command = command; view.adapters.dsh_provider_id = provider; }, RuntimeAdapter::CodexAppServer => {} }
-                    match view.runtime_settings_from_form(cx).save(&view.settings_path) { Ok(()) => view.status = "已保存运行时关联；下次任务生效".into(), Err(error) => { view.adapters = before; view.status = format!("未保存：{error}"); } }
-                    cx.notify();
+                .child(Self::labeled_field("运行时命令", "adapter-command", None, command))
+                .child(Self::labeled_field("Provider ID（留空使用默认项）", "adapter-provider", None, provider))
+                .child(Self::info_note("仅保存此运行时的命令和 Provider 关联；下次任务生效。新增 Provider 请先在其详情中保存。", "Saves only this runtime's command and provider binding; applies to the next task. Save new providers in provider details first.", language))
+                .child(Self::save_state_note(self.runtime_dirty(adapter, cx), language))
+                .child(Button::new("save-adapter").primary().label(language.choose_owned(format!("保存 {} 配置", adapter.label()), format!("Save {} configuration", adapter.label()))).on_click(move |_, _, cx| { saver.update(cx, |view, cx| {
+                    view.save_runtime(adapter, cx);
                 }); }))
                 .child(self.render_task_controls(adapter, cx))
         }
@@ -5571,6 +5936,9 @@ fn main() {
             let toggle_provider = entity.clone();
             let remove_provider = entity.clone();
             let toggle_vision = entity.clone();
+            let provider_saver = entity.clone();
+            let dirty = self.provider_values(cx) != self.saved_settings.providers
+                || self.default_provider_id != self.saved_settings.default_provider_id;
             let api_key_hint = self.secret_source_hint(
                 &provider.api_key_environment_variable.read(cx).value(),
                 &entity,
@@ -5657,10 +6025,19 @@ fn main() {
                         ),
                 )
                 .child(Self::info_note(
-                    "API Key 只记录环境变量名：CircuitFabric 不保存、不回显密钥值；子进程启动时直接从环境读取。",
-                    "API keys are stored as environment-variable names only: CircuitFabric never saves or echoes a key value; the child process reads it from the environment at launch.",
+                    "Provider 配置只保存 API Key 变量名；密钥值在密钥保险库中单独加密保存，也可由进程环境提供。",
+                    "Provider configuration saves API key variable names only; values are stored separately in the encrypted vault or supplied by the process environment.",
                     language,
                 ))
+                .child(Self::save_state_note(dirty, language))
+                .child(Self::info_note(
+                    "保存范围：整个 Provider 列表的新增、编辑、删除、启停、Vision 配置和默认项。下次任务生效；运行中的服务需重启。",
+                    "Saves additions, edits, removals, enabled/Vision states and the default for the entire provider list. Applies to the next task; restart running services.",
+                    language,
+                ))
+                .child(Button::new("save-providers").primary()
+                    .label(language.choose("保存 Provider 列表", "Save provider list"))
+                    .on_click(move |_, _, cx| { provider_saver.update(cx, ControlPlaneView::save_providers); }))
                 .child(
                     div()
                         .v_flex()
@@ -5809,8 +6186,8 @@ fn main() {
                 .child(
                     div().text_xs().text_color(rgb(TEXT_MUTED)).child(
                         language.choose(
-                            "「设为默认」后，Codex App Server 端点将使用此 Provider 启动（启动时读取，运行中的进程不受影响）。",
-                            "After \"Set as default\", the Codex App Server endpoint launches with this provider (read at start; a running process is unaffected).",
+                            "上述默认项、启停、删除及 Vision 切换均为草稿，点击「保存 Provider 列表」后生效。默认项用于未指定 Provider 的运行时。",
+                            "Default, enabled, removal and Vision changes are drafts until Save provider list. The default applies to runtimes without an explicit provider binding.",
                         ),
                     ),
                 )
@@ -6048,6 +6425,11 @@ fn main() {
                 .v_flex()
                 .gap_2()
                 .child("技能与 MCP 定义（保存定义后，在下方选择作用域授权）")
+                .child(Self::info_note(
+                    "导入、保存定义、启停、删除和授权操作均即时保存，仅更新定义或选定作用域的授权。",
+                    "Imports, definition saves, toggles, removal and grants save immediately, updating only definitions or grants in the selected scope.",
+                    self.language,
+                ))
                 .child(Self::labeled_field("MCP 标识", "catalog-id", None, &self.catalog_id))
                 .child(Self::labeled_field(
                     "技能文件/目录路径，或 MCP 启动程序",
@@ -6080,7 +6462,9 @@ fn main() {
                                         view.catalog_source.read(cx).value().to_string(),
                                     );
                                     match view.catalog.import_skill(&path) {
-                                        Ok(_) => view.persist_catalog(previous, cx),
+                                        Ok(_) => {
+                                            view.persist_catalog(previous, cx);
+                                        }
                                         Err(error) => {
                                             view.status = format!("导入失败：{error}");
                                             cx.notify();
@@ -6129,20 +6513,25 @@ fn main() {
             &mut self,
             previous: circuitfabric_codex_runtime::tools::ToolCatalog,
             cx: &mut Context<Self>,
-        ) {
-            match self.runtime_settings_from_form(cx).save(&self.settings_path) {
+        ) -> bool {
+            let saved = match self.save_update(
+                crate::settings_persistence::SettingsUpdate::Catalog(self.catalog.clone()),
+            ) {
                 Ok(()) => {
                     if let Some(cancel) = &self.task_cancel {
                         cancel.cancel();
                     }
                     self.status = "已保存定义；当前任务已请求取消，下次任务使用新配置".into();
+                    true
                 }
                 Err(error) => {
                     self.catalog = previous;
                     self.status = format!("未保存：{error}");
+                    false
                 }
-            }
+            };
             cx.notify();
+            saved
         }
 
         /// Enable/disable switch for the bundled Jev server definition.
@@ -6174,7 +6563,9 @@ fn main() {
                     list.retain(|id| id != BUNDLED_JEV_SERVER_ID);
                 }
             }
-            match self.runtime_settings_from_form(cx).save(&self.settings_path) {
+            match self.save_update(crate::settings_persistence::SettingsUpdate::Authorizations(
+                self.tool_authorizations.clone(),
+            )) {
                 Ok(()) => {
                     if let Some(cancel) = &self.task_cancel {
                         cancel.cancel();
@@ -6232,30 +6623,47 @@ fn main() {
 
         /// Store `TYPESAFE_API_KEY` into the unlocked vault; the value never
         /// lands in configuration files.
-        fn save_jev_api_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        /// Store the active backend's key variable into the unlocked vault;
+        /// returns whether the value was saved (so dialogs can close).
+        fn save_jev_api_key(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+            let name = self
+                .catalog
+                .mcp_servers
+                .iter()
+                .find(|server| {
+                    server.id == circuitfabric_codex_runtime::tools::BUNDLED_JEV_SERVER_ID
+                })
+                .and_then(circuitfabric_codex_runtime::judge::LlmJudgeSettings::from_server)
+                .map_or_else(
+                    || "TYPESAFE_API_KEY".to_owned(),
+                    |settings| settings.api_key_environment_variable,
+                );
             let value = self.jev_api_key.read(cx).value().trim().to_owned();
             if value.is_empty() {
-                "未保存：请粘贴 TYPESAFE_API_KEY 的值。".clone_into(&mut self.status);
+                self.status = format!("未保存：请粘贴 {name} 的值。");
                 cx.notify();
-                return;
+                return false;
             }
             let Some(vault) = self.vault.as_mut() else {
                 "未保存：请先在「密钥保险库」页解锁保险库，或改用同名环境变量。"
                     .clone_into(&mut self.status);
                 cx.notify();
-                return;
+                return false;
             };
-            match vault.set("TYPESAFE_API_KEY", &value) {
+            let saved = match vault.set(&name, &value) {
                 Ok(()) => {
                     self.vault_index = vault.values().names().cloned().collect();
                     self.jev_api_key.update(cx, |state, cx| state.set_value("", window, cx));
-                    "已保存 TYPESAFE_API_KEY（值已加密写入保险库）。".clone_into(&mut self.status);
+                    self.status = format!("已保存 {name}（值已加密写入保险库）。");
+                    true
                 }
                 Err(error) => {
                     self.status = format!("未保存：{error}");
+                    false
                 }
-            }
+            };
             cx.notify();
+            saved
         }
 
         /// Re-run bundled binary detection after the catalog entry was removed
@@ -6275,9 +6683,350 @@ fn main() {
             }
         }
 
-        /// The bundled `TypeSafe` Jev judgment server page: the definition ships
-        /// with the app; this page manages the enable switch, the global
-        /// authorization and the `TYPESAFE_API_KEY` vault entry.
+        fn jev_settings_from_form(
+            &self,
+            cx: &Context<Self>,
+        ) -> Result<circuitfabric_codex_runtime::judge::LlmJudgeSettings, String> {
+            let mut settings = self.jev_llm_settings.clone();
+            settings.base_url = self.jev_base_url.read(cx).value().trim().to_owned();
+            settings.model = self.jev_model.read(cx).value().trim().to_owned();
+            settings.api_key_environment_variable =
+                self.jev_key_env.read(cx).value().trim().to_owned();
+            settings.timeout_seconds = self
+                .jev_timeout
+                .read(cx)
+                .value()
+                .parse()
+                .map_err(|_| "超时必须为 5～180 秒".to_owned())?;
+            settings.malformed_retries = self
+                .jev_retries
+                .read(cx)
+                .value()
+                .parse()
+                .map_err(|_| "结构修正重试必须为 0～3 次".to_owned())?;
+            settings.validate().map_err(|error| error.to_string())?;
+            Ok(settings)
+        }
+
+        /// Persist the chosen backend branch; returns whether it was saved
+        /// (so the configuration dialog can close on success only).
+        fn apply_jev_backend(&mut self, llm: bool, cx: &mut Context<Self>) -> bool {
+            use circuitfabric_codex_runtime::tools::{BUNDLED_JEV_SERVER_ID, bundled_mcp_servers};
+            let result = if llm {
+                self.jev_settings_from_form(cx).and_then(|settings| {
+                    std::env::current_exe().map_err(|error| error.to_string()).and_then(|path| {
+                        settings.server(&path, true).map_err(|error| error.to_string())
+                    })
+                })
+            } else {
+                bundled_mcp_servers().into_iter().find(|s| s.id == BUNDLED_JEV_SERVER_ID)
+                    .ok_or_else(|| "未找到 TypeSafe evaluate 二进制，请先构建或设置 CIRCUITFABRIC_TYPESAFE_MCP_PATH".to_owned())
+            };
+            match result {
+                Ok(mut server) => {
+                    let previous = self.catalog.clone();
+                    if let Some(settings) =
+                        circuitfabric_codex_runtime::judge::LlmJudgeSettings::from_server(&server)
+                    {
+                        self.catalog.llm_judge = Some(settings);
+                    }
+                    if let Some(existing) =
+                        self.catalog.mcp_servers.iter().find(|s| s.id == BUNDLED_JEV_SERVER_ID)
+                    {
+                        server.enabled = existing.enabled;
+                    }
+                    self.catalog.mcp_servers.retain(|s| s.id != BUNDLED_JEV_SERVER_ID);
+                    self.catalog.mcp_servers.push(server);
+                    if self.persist_catalog(previous, cx) {
+                        self.jev_llm_draft = llm;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                Err(error) => {
+                    self.status = format!("判断后端未保存：{error}");
+                    cx.notify();
+                    false
+                }
+            }
+        }
+
+        /// Compact status chip for the overview row: green while `good` is
+        /// `Some(true)`, red while `Some(false)`, neutral gray when `None`.
+        fn jev_chip(id: &'static str, label: String, good: Option<bool>) -> impl IntoElement {
+            let (background, foreground) = match good {
+                Some(true) => (0x00dc_fce7, 0x0016_a34a),
+                Some(false) => (0x00fe_e2e2, 0x00b9_1c1c),
+                None => (SURFACE_BG, TEXT_MUTED),
+            };
+            div()
+                .id(id)
+                .px_2()
+                .py_0p5()
+                .rounded_sm()
+                .text_xs()
+                .bg(rgb(background))
+                .text_color(rgb(foreground))
+                .child(label)
+        }
+
+        /// Numbered section heading used across the Jev settings page.
+        fn jev_section_header(zh: &'static str, en: &'static str, language: UiLanguage) -> Div {
+            div().text_sm().font_weight(FontWeight::MEDIUM).child(language.choose(zh, en))
+        }
+
+        /// Fixed-width caption for one segmented mode row.
+        fn jev_mode_label(label: &'static str) -> Div {
+            div().w(px(84.)).flex_none().text_sm().text_color(rgb(TEXT_SECONDARY)).child(label)
+        }
+
+        /// One option of an in-place segmented control; `active` marks the
+        /// selected branch and `apply` runs when the option is clicked.
+        fn jev_option(
+            id: &'static str,
+            label: &'static str,
+            active: bool,
+            entity: &Entity<Self>,
+            apply: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+        ) -> impl IntoElement {
+            let entity = entity.clone();
+            div()
+                .id(id)
+                .px_3()
+                .py_1p5()
+                .rounded_md()
+                .border_1()
+                .border_color(rgb(if active { ACCENT } else { BORDER }))
+                .bg(rgb(if active { 0x00f0_f9ff } else { CARD_BG }))
+                .text_sm()
+                .text_color(rgb(if active { TEXT_PRIMARY } else { TEXT_MUTED }))
+                .cursor_pointer()
+                .hover(|this| this.border_color(rgb(ACCENT_SOFT)))
+                .child(label)
+                .on_click(move |_, _, cx| {
+                    entity.update(cx, |view, cx| {
+                        apply(view, cx);
+                        cx.notify();
+                    });
+                })
+        }
+
+        /// Free MCP-level check: initialize + tools/list, no billable call.
+        fn jev_discover_button(language: UiLanguage, entity: &Entity<Self>) -> impl IntoElement {
+            let tester = entity.clone();
+            Button::new("jev-test")
+                .label(
+                    language
+                        .choose("连接并发现工具（不计费）", "Connect and discover tools (free)"),
+                )
+                .on_click(move |_, window, cx| {
+                    tester.update(cx, |view, cx| {
+                        let catalog = view.catalog.clone();
+                        let grants = view.effective_grants();
+                        let secrets = view.vault.as_ref().map(|vault| vault.values().clone());
+                        let id = BUNDLED_JEV_SERVER_ID.to_owned();
+                        view.status = "正在连接 MCP…".into();
+                        let work = cx.background_spawn(async move {
+                            catalog
+                                .list_tools_with_secrets(&id, &grants, secrets.as_ref())
+                                .map(|value| value.to_string())
+                                .map_err(|error| error.to_string())
+                        });
+                        cx.spawn_in(window, async move |view, cx| {
+                            let result = work.await;
+                            cx.update(|_, cx| {
+                                view.update(cx, |view, cx| {
+                                    view.status = match result {
+                                        Ok(tools) => format!("MCP 已连接，工具：{tools}"),
+                                        Err(error) => format!("MCP 连接失败：{error}"),
+                                    };
+                                    cx.notify();
+                                })
+                                .ok();
+                            })
+                            .ok();
+                        })
+                        .detach();
+                        cx.notify();
+                    });
+                })
+        }
+
+        /// Billable end-to-end judgment check through the saved backend.
+        fn jev_real_test_button(language: UiLanguage, entity: &Entity<Self>) -> impl IntoElement {
+            let tester = entity.clone();
+            Button::new("jev-real-test")
+                .label(language.choose("测试真实判断（消耗额度）", "Run a real judgment (billed)"))
+                .on_click(move |_, window, cx| {
+                    tester.update(cx, |view, cx| {
+                        let catalog = view.catalog.clone();
+                        let grants = view.effective_grants();
+                        let secrets = view.vault.as_ref().map(|vault| vault.values().clone());
+                        view.status = "正在测试已保存的判断后端（会调用模型）…".into();
+                        let work = cx.background_spawn(async move {
+                            catalog
+                                .call_tool_with_secrets(
+                                    circuitfabric_codex_runtime::tools::BUNDLED_JEV_SERVER_ID,
+                                    &grants,
+                                    "evaluate",
+                                    &serde_json::json!({"state":"The LED is on.","questions":{"led_on":{"type":"noul","instructions":"Does the evidence state that the LED is on?"}}}),
+                                    secrets.as_ref(),
+                                )
+                                .map_err(|error| error.to_string())
+                                .and_then(|value| {
+                                    if value["isError"] == true {
+                                        Err(value["content"][0]["text"]
+                                            .as_str()
+                                            .unwrap_or("判断失败")
+                                            .to_owned())
+                                    } else {
+                                        Ok(value.to_string())
+                                    }
+                                })
+                        });
+                        cx.spawn_in(window, async move |view, cx| {
+                            let result = work.await;
+                            cx.update(|_, cx| {
+                                view.update(cx, |view, cx| {
+                                    view.status = match result {
+                                        Ok(value) => format!("判断测试成功：{value}"),
+                                        Err(error) => format!("判断测试失败：{error}"),
+                                    };
+                                    cx.notify();
+                                })
+                                .ok();
+                            })
+                            .ok();
+                        })
+                        .detach();
+                        cx.notify();
+                    });
+                })
+        }
+
+        /// Third-party-LLM form body used inside the backend dialog: provider
+        /// presets, endpoint and answer semantics. No apply button — the
+        /// dialog footer owns 保存/取消.
+        fn render_jev_llm_configuration(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+            use circuitfabric_codex_runtime::judge::{AnswerMode, OutputFormat};
+            let entity = cx.entity().clone();
+            let language = self.language;
+            let presets = div().flex().flex_wrap().gap_2().children(
+                [
+                    (
+                        "deepseek",
+                        language.choose("DeepSeek", "DeepSeek").to_owned(),
+                        "https://api.deepseek.com/v1",
+                        "deepseek-flash",
+                        "DEEPSEEK_API_KEY",
+                    ),
+                    (
+                        "zai-coding",
+                        language.choose("z.ai 编程包", "z.ai Coding Plan").to_owned(),
+                        "https://api.z.ai/api/coding/paas/v4",
+                        "glm-5.3-flash",
+                        "ZAI_API_KEY",
+                    ),
+                    (
+                        "zai-standard",
+                        language.choose("z.ai 按量付费", "z.ai Pay-as-you-go").to_owned(),
+                        "https://api.z.ai/api/paas/v4",
+                        "glm-4.7",
+                        "ZAI_API_KEY",
+                    ),
+                ]
+                .into_iter()
+                .map(|(id, label, url, model, key)| {
+                    let selector = entity.clone();
+                    Button::new(id).label(label).on_click(move |_, window, cx| {
+                        selector.update(cx, |view, cx| {
+                            view.jev_base_url.update(cx, |s, cx| s.set_value(url, window, cx));
+                            view.jev_model.update(cx, |s, cx| s.set_value(model, window, cx));
+                            view.jev_key_env.update(cx, |s, cx| s.set_value(key, window, cx));
+                            view.jev_llm_settings.output_format = OutputFormat::JsonObject;
+                            view.status = "已填入预设，可按账户修改模型；点击「保存」生效。".into();
+                            cx.notify();
+                        });
+                    })
+                }),
+            );
+            div().v_flex().gap_3()
+                .child(div().flex().flex_wrap().items_center().gap_2()
+                    .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(language.choose(
+                        "服务商预设：",
+                        "Provider presets:",
+                    )))
+                    .child(presets))
+                .child(Self::labeled_field(
+                    "Base URL",
+                    "jev-llm-url",
+                    Some(language.choose(
+                        "兼容 OpenAI Chat Completions，自动追加 /chat/completions",
+                        "OpenAI Chat Completions compatible; /chat/completions is appended",
+                    )),
+                    &self.jev_base_url,
+                ))
+                .child(Self::labeled_field(language.choose("判断模型", "Judge model"), "jev-llm-model", None, &self.jev_model))
+                .child(Self::labeled_field(
+                    language.choose("密钥变量名", "API key variable"),
+                    "jev-llm-env",
+                    Some(language.choose(
+                        "其值在主列表「API 密钥」行更换",
+                        "change its value via the “API key” row of the main list",
+                    )),
+                    &self.jev_key_env,
+                ))
+                .child(div().flex().gap_3()
+                    .child(Self::labeled_field(language.choose("单次请求超时（秒）", "Request timeout (s)"), "jev-llm-timeout", None, &self.jev_timeout))
+                    .child(Self::labeled_field(language.choose("结构修正重试", "Malformed retries"), "jev-llm-retries", None, &self.jev_retries)))
+                .child(div().flex().flex_wrap().items_center().gap_2()
+                    .child(Self::jev_mode_label(language.choose("回答模式", "Answer mode")))
+                    .child(Self::jev_option("jev-mode-probabilities",
+                        language.choose("概率分布", "Probabilities"),
+                        self.jev_llm_settings.answer_mode == AnswerMode::Probabilities,
+                        &entity,
+                        move |view, _cx| { view.jev_llm_settings.answer_mode = AnswerMode::Probabilities; }))
+                    .child(Self::jev_option("jev-mode-discrete",
+                        language.choose("离散值", "Discrete"),
+                        self.jev_llm_settings.answer_mode == AnswerMode::Discrete,
+                        &entity,
+                        move |view, _cx| { view.jev_llm_settings.answer_mode = AnswerMode::Discrete; })))
+                .child(div().flex().flex_wrap().items_center().gap_2()
+                    .child(Self::jev_mode_label(language.choose("输出格式", "Output format")))
+                    .child(Self::jev_option("jev-format-object", "JSON Object",
+                        self.jev_llm_settings.output_format == OutputFormat::JsonObject,
+                        &entity,
+                        move |view, _cx| { view.jev_llm_settings.output_format = OutputFormat::JsonObject; }))
+                    .child(Self::jev_option("jev-format-schema", "JSON Schema",
+                        self.jev_llm_settings.output_format == OutputFormat::JsonSchema,
+                        &entity,
+                        move |view, _cx| { view.jev_llm_settings.output_format = OutputFormat::JsonSchema; }))
+                    .child(Self::jev_option("jev-format-prompted", "Prompted JSON",
+                        self.jev_llm_settings.output_format == OutputFormat::Prompted,
+                        &entity,
+                        move |view, _cx| { view.jev_llm_settings.output_format = OutputFormat::Prompted; })))
+                .child(div().flex().flex_wrap().items_center().gap_2()
+                    .child(Self::jev_mode_label(language.choose("概率归一化", "Normalize")))
+                    .child(Self::jev_option("jev-normalize-on",
+                        language.choose("开", "On"),
+                        self.jev_llm_settings.normalize_probabilities,
+                        &entity,
+                        move |view, _cx| { view.jev_llm_settings.normalize_probabilities = true; }))
+                    .child(Self::jev_option("jev-normalize-off",
+                        language.choose("关", "Off"),
+                        !self.jev_llm_settings.normalize_probabilities,
+                        &entity,
+                        move |view, _cx| { view.jev_llm_settings.normalize_probabilities = false; })))
+                .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(language.choose(
+                    "概率是 LLM 估计、未经校准；离散模式的 0/1 只表示选择。JSON Schema 需服务商支持，不支持时可选 Prompted JSON（仍会严格校验）。",
+                    "Probabilities are uncalibrated LLM estimates; discrete 0/1 only encodes a selection. JSON Schema needs provider support; otherwise choose Prompted JSON (still strictly validated).")))
+        }
+
+        /// The bundled Jev judgment tool page: a read-mostly settings list
+        /// where every row shows the saved value, a dialog for the two
+        /// multi-field edits (backend, key), and immediate toggles for the
+        /// gates. Saved state is always visible — no inline save buttons.
         fn render_bundled_jev_detail(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
             let entity = cx.entity().clone();
             let language = self.language;
@@ -6287,11 +7036,13 @@ fn main() {
                 .iter()
                 .find(|server| server.id == BUNDLED_JEV_SERVER_ID)
                 .cloned();
+            let enabled = server.as_ref().is_some_and(|server| server.enabled);
             let authorized = self
                 .tool_authorizations
                 .authorized_mcp_server_ids
                 .iter()
                 .any(|id| id == BUNDLED_JEV_SERVER_ID);
+            let has_project = self.selected_project.is_some();
             let project_authorized = self
                 .selected_project
                 .as_ref()
@@ -6302,252 +7053,344 @@ fn main() {
                         .iter()
                         .any(|id| id == BUNDLED_JEV_SERVER_ID)
                 });
-            let has_project = self.selected_project.is_some();
-
-            let body = if let Some(server) = server {
-                let binary_found = std::path::Path::new(&server.command).is_file();
-                let definition_line = if server.args.is_empty() {
+            let llm_settings = server
+                .as_ref()
+                .and_then(circuitfabric_codex_runtime::judge::LlmJudgeSettings::from_server);
+            let saved_llm = llm_settings.is_some();
+            let key_name = llm_settings
+                .as_ref()
+                .map_or("TYPESAFE_API_KEY", |s| s.api_key_environment_variable.as_str())
+                .to_owned();
+            let key_source =
+                secret_source(&key_name, self.vault.as_ref().map(UnlockedVault::values));
+            let key_present = key_source.is_some();
+            let definition_line = server.as_ref().map_or_else(String::new, |server| {
+                if server.args.is_empty() {
                     server.command.clone()
                 } else {
                     format!("{} {}", server.command, server.args.join(" "))
-                };
-                let toggler = entity.clone();
-                let grant_toggle = entity.clone();
-                let project_grant_toggle = entity.clone();
-                let tester = entity.clone();
-                let saver = entity.clone();
-                div()
-                        .v_flex()
-                        .gap_4()
-                        .child(
-                            div()
-                                .v_flex()
-                                .gap_2()
-                                .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(
-                                    language.choose("定义与二进制", "Definition & binary"),
-                                ))
-                                .child(
-                                    div().text_xs().text_color(rgb(TEXT_MUTED)).child(format!(
-                                        "{BUNDLED_JEV_SERVER_ID} · {definition_line}"
-                                    )),
-                                )
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(if binary_found {
-                                            0x0016_a34a
-                                        } else {
-                                            0x00dc_2626
-                                        }))
-                                        .child(if binary_found {
-                                            language.choose(
-                                                "✔ 二进制已就绪（由 scripts/build-typesafe-mcp.ps1 构建）",
-                                                "✔ Binary ready (built by scripts/build-typesafe-mcp.ps1)",
-                                            )
-                                        } else {
-                                            language.choose(
-                                                "✘ 未找到二进制：请运行 scripts/build-typesafe-mcp.ps1",
-                                                "✘ Binary not found: run scripts/build-typesafe-mcp.ps1",
-                                            )
-                                        }),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_3()
-                                .child(div().text_sm().child(language.choose(
-                                    if server.enabled { "状态：已启用" } else { "状态：已停用" },
-                                    if server.enabled { "Status: enabled" } else { "Status: disabled" },
-                                )))
-                                .child(
-                                    Button::new("jev-toggle-enabled")
-                                        .label(language.choose(
-                                            if server.enabled { "停用" } else { "启用" },
-                                            if server.enabled { "Disable" } else { "Enable" },
-                                        ))
-                                        .on_click(move |_, _, cx| {
-                                            toggler.update(cx, |view, cx| {
-                                                view.toggle_jev_enabled(cx);
-                                            });
-                                        }),
-                                )
-                                .child(div().text_sm().child(language.choose(
-                                    if authorized { "全局授权：已授权" } else { "全局授权：未授权" },
+                }
+            });
+
+            // At-a-glance state so the list below can be read as a checklist.
+            let backend_chip = llm_settings.as_ref().map_or_else(
+                || language.choose("后端：TypeSafe Jev", "Backend: TypeSafe Jev").to_owned(),
+                |s| {
+                    format!(
+                        "{}：{} · {}",
+                        language.choose("后端：第三方 LLM", "Backend: third-party LLM"),
+                        s.model,
+                        s.base_url
+                    )
+                },
+            );
+            let overview = div()
+                .v_flex()
+                .gap_2()
+                .child(Self::jev_section_header("状态总览", "Overview", language))
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .child(Self::jev_chip("jev-chip-backend", backend_chip, None))
+                        .child(Self::jev_chip(
+                            "jev-chip-enabled",
+                            language.choose("已启用", "enabled").to_owned(),
+                            enabled.then_some(true),
+                        ))
+                        .child(Self::jev_chip(
+                            "jev-chip-grant",
+                            language
+                                .choose(
                                     if authorized {
-                                        "Global grant: authorized"
+                                        "全局授权：已授权"
                                     } else {
-                                        "Global grant: not authorized"
+                                        "全局授权：未授权"
                                     },
-                                )))
-                                .child(
-                                    Button::new("jev-toggle-authorization")
-                                        .label(language.choose(
-                                            if authorized { "撤销全局授权" } else { "授权（全局作用域）" },
-                                            if authorized {
-                                                "Revoke global grant"
-                                            } else {
-                                                "Authorize (global scope)"
-                                            },
-                                        ))
-                                        .on_click(move |_, _, cx| {
-                                            grant_toggle.update(cx, |view, cx| {
-                                                view.set_jev_authorization(!authorized, cx);
-                                            });
-                                        }),
-                                ),
-                        )
-                        .child(
-                            div().flex().items_center().gap_3()
-                                .child(div().text_sm().child(language.choose(
-                                    if !has_project { "项目授权：请先选择项目" } else if project_authorized { "当前项目：已授权" } else { "当前项目：未授权" },
-                                    if !has_project { "Project grant: select a project" } else if project_authorized { "Current project: authorized" } else { "Current project: not authorized" },
-                                )))
-                                .child(Button::new("jev-toggle-project-authorization")
-                                    .disabled(!has_project)
-                                    .label(language.choose(
-                                        if project_authorized { "撤销项目授权" } else { "授权当前项目" },
-                                        if project_authorized { "Revoke project grant" } else { "Authorize current project" },
-                                    ))
-                                    .on_click(move |_, _, cx| {
-                                        project_grant_toggle.update(cx, |view, cx| {
-                                            view.set_jev_project_authorization(!project_authorized, cx);
-                                        });
-                                    })),
-                        )
-                        .child(
-                            div()
-                                .v_flex()
-                                .gap_2()
-                                .child(Self::labeled_field(
-                                    "TYPESAFE_API_KEY",
-                                    "jev-api-key",
-                                    None,
-                                    &self.jev_api_key,
-                                ))
-                                .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(
-                                    language.choose(
-                                        "值只写入密钥保险库或进程环境变量，绝不保存在配置文件中；保存前请先在「密钥保险库」页解锁。",
-                                        "The value goes only to the secrets vault or a process environment variable, never into configuration files; unlock the vault page before saving.",
-                                    ),
-                                ))
-                                .children(self.secret_source_hint("TYPESAFE_API_KEY", &entity))
-                                .child(
-                                    Button::new("jev-save-key")
-                                        .primary()
-                                        .label(language.choose("保存到密钥保险库", "Save to vault"))
-                                        .on_click(move |_, window, cx| {
-                                            saver.update(cx, |view, cx| {
-                                                view.save_jev_api_key(window, cx);
-                                            });
-                                        }),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_3()
-                                .child(
-                                    Button::new("jev-test")
-                                        .label(language.choose(
-                                            "连接并发现工具",
-                                            "Connect and discover tools",
-                                        ))
-                                        .on_click(move |_, window, cx| {
-                                            tester.update(cx, |view, cx| {
-                                                let catalog = view.catalog.clone();
-                                                let grants = view.effective_grants();
-                                                let secrets = view
-                                                    .vault
-                                                    .as_ref()
-                                                    .map(|vault| vault.values().clone());
-                                                let id = BUNDLED_JEV_SERVER_ID.to_owned();
-                                                view.status = "正在连接 MCP…".into();
-                                                let work = cx.background_spawn(async move {
-                                                    catalog
-                                                        .list_tools_with_secrets(
-                                                            &id,
-                                                            &grants,
-                                                            secrets.as_ref(),
-                                                        )
-                                                        .map(|value| value.to_string())
-                                                        .map_err(|error| error.to_string())
-                                                });
-                                                cx.spawn_in(window, async move |view, cx| {
-                                                    let result = work.await;
-                                                    cx.update(|_, cx| {
-                                                        view.update(cx, |view, cx| {
-                                                            view.status = match result {
-                                                                Ok(tools) => format!(
-                                                                    "MCP 已连接，工具：{tools}"
-                                                                ),
-                                                                Err(error) => {
-                                                                    format!("MCP 连接失败：{error}")
-                                                                }
-                                                            };
-                                                            cx.notify();
-                                                        })
-                                                        .ok();
-                                                    })
-                                                    .ok();
-                                                })
-                                                .detach();
-                                                cx.notify();
-                                            });
-                                        }),
+                                    if authorized {
+                                        "global grant: on"
+                                    } else {
+                                        "global grant: off"
+                                    },
                                 )
-                                .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(
-                                    language.choose(
-                                        "仅执行 initialize 与 tools/list，不发起计费判断调用。",
-                                        "Runs initialize and tools/list only; no billable judgment call is made.",
-                                    ),
-                                )),
+                                .to_owned(),
+                            Some(authorized),
+                        ))
+                        .child(Self::jev_chip(
+                            "jev-chip-project-grant",
+                            if has_project {
+                                language
+                                    .choose(
+                                        if project_authorized {
+                                            "当前项目：已授权"
+                                        } else {
+                                            "当前项目：未授权"
+                                        },
+                                        if project_authorized {
+                                            "project grant: on"
+                                        } else {
+                                            "project grant: off"
+                                        },
+                                    )
+                                    .to_owned()
+                            } else {
+                                language
+                                    .choose("项目授权：未选择项目", "project grant: no project")
+                                    .to_owned()
+                            },
+                            if has_project { Some(project_authorized) } else { None },
+                        ))
+                        .child(Self::jev_chip(
+                            "jev-chip-key",
+                            format!("{} {key_name}", if key_present { "✔" } else { "✘" }),
+                            Some(key_present),
+                        )),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(TEXT_MUTED))
+                        .child(format!("{BUNDLED_JEV_SERVER_ID} · {definition_line}")),
+                );
+
+            // The settings list: value = what is saved right now.
+            let backend_value = llm_settings.as_ref().map_or_else(
+                || {
+                    language
+                        .choose("TypeSafe Jev（随附二进制）", "TypeSafe Jev (bundled binary)")
+                        .to_owned()
+                },
+                |s| {
+                    format!(
+                        "{} · {} · {}",
+                        language.choose("第三方 LLM", "third-party LLM"),
+                        s.model,
+                        s.base_url
+                    )
+                },
+            );
+            let backend_edit = entity.clone();
+            let key_edit = entity.clone();
+            let toggler = entity.clone();
+            let grant_toggle = entity.clone();
+            let project_grant_toggle = entity.clone();
+            let backend_row = Self::jev_setting_row(
+                "jev-row-backend",
+                language.choose("判断后端", "Backend"),
+                backend_value,
+                None,
+                Button::new("jev-edit-backend").label(language.choose("编辑", "Edit")).on_click(
+                    move |_, window, cx| {
+                        backend_edit.update(cx, |view, cx| {
+                            view.jev_llm_draft = saved_llm;
+                            view.reset_jev_form_to_saved(window, cx);
+                            view.jev_backend_modal_open = true;
+                            cx.notify();
+                        });
+                    },
+                ),
+            );
+            let key_row = Self::jev_setting_row(
+                "jev-row-key",
+                language.choose("API 密钥", "API key"),
+                format!(
+                    "{} {key_name} · {}",
+                    if key_present { "✔" } else { "✘" },
+                    match key_source {
+                        Some(SecretSource::Vault) => language.choose("保险库", "vault"),
+                        Some(SecretSource::Environment) => {
+                            language.choose("环境变量", "environment")
+                        }
+                        None => language.choose("未找到", "not found"),
+                    },
+                ),
+                Some(key_present),
+                Button::new("jev-edit-key").label(language.choose("更换", "Replace")).on_click(
+                    move |_, window, cx| {
+                        key_edit.update(cx, |view, cx| {
+                            view.jev_api_key.update(cx, |state, cx| {
+                                state.set_value("", window, cx);
+                            });
+                            view.jev_key_modal_open = true;
+                            cx.notify();
+                        });
+                    },
+                ),
+            );
+            let enable_row = Self::jev_setting_row(
+                "jev-row-enabled",
+                language.choose("启用状态", "Enabled"),
+                language
+                    .choose(
+                        if enabled { "已启用" } else { "已停用" },
+                        if enabled { "enabled" } else { "disabled" },
+                    )
+                    .to_owned(),
+                enabled.then_some(true),
+                Button::new("jev-toggle-enabled")
+                    .label(language.choose(
+                        if enabled { "停用" } else { "启用" },
+                        if enabled { "Disable" } else { "Enable" },
+                    ))
+                    .on_click(move |_, _, cx| {
+                        toggler.update(cx, |view, cx| {
+                            view.toggle_jev_enabled(cx);
+                        });
+                    }),
+            );
+            let grant_row = Self::jev_setting_row(
+                "jev-row-grant",
+                language.choose("全局授权", "Global grant"),
+                language
+                    .choose(
+                        if authorized { "已授权" } else { "未授权" },
+                        if authorized { "authorized" } else { "not authorized" },
+                    )
+                    .to_owned(),
+                Some(authorized),
+                Button::new("jev-toggle-authorization")
+                    .label(language.choose(
+                        if authorized { "撤销" } else { "授权" },
+                        if authorized { "Revoke" } else { "Authorize" },
+                    ))
+                    .on_click(move |_, _, cx| {
+                        grant_toggle.update(cx, |view, cx| {
+                            view.set_jev_authorization(!authorized, cx);
+                        });
+                    }),
+            );
+            let project_row = Self::jev_setting_row(
+                "jev-row-project-grant",
+                language.choose("项目授权", "Project grant"),
+                if has_project {
+                    language
+                        .choose(
+                            if project_authorized {
+                                "当前项目：已授权"
+                            } else {
+                                "当前项目：未授权"
+                            },
+                            if project_authorized {
+                                "current project: authorized"
+                            } else {
+                                "current project: not authorized"
+                            },
                         )
-                        .child(
-                            div()
-                                .v_flex()
-                                .gap_1()
-                                .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(
-                                    language.choose("使用要点", "Usage notes"),
-                                ))
-                                .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(
-                                    language.choose(
-                                        "evaluate 返回类型化判断：noul（0~1 是/否概率）、choice（多选一+概率分布）、score（量表评分）；接近 0.5 表示不确定而非中等。",
-                                        "evaluate returns typed judgments: noul (0~1 yes/no probability), choice (one option + distribution), score (rubric scale); near 0.5 means uncertain, not medium.",
-                                    ),
-                                ))
-                                .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(
-                                    language.choose(
-                                        "阈值判断（例如 noul > 0.8 才放行）应写在工作流代码里，而不是依赖模型自觉。",
-                                        "Threshold decisions (e.g. proceed only when noul > 0.8) belong in workflow code, not in the model's discretion.",
-                                    ),
-                                )),
-                        )
-                        .into_any_element()
+                        .to_owned()
+                } else {
+                    language.choose("请先在「项目」页选择项目", "select a project first").to_owned()
+                },
+                if has_project { Some(project_authorized) } else { None },
+                Button::new("jev-toggle-project-authorization")
+                    .disabled(!has_project)
+                    .label(language.choose(
+                        if project_authorized { "撤销" } else { "授权当前项目" },
+                        if project_authorized { "Revoke" } else { "Authorize project" },
+                    ))
+                    .on_click(move |_, _, cx| {
+                        project_grant_toggle.update(cx, |view, cx| {
+                            view.set_jev_project_authorization(!project_authorized, cx);
+                        });
+                    }),
+            );
+            let settings_list = div()
+                .v_flex()
+                .gap_2()
+                .child(Self::jev_section_header("配置", "Settings", language))
+                .child(backend_row)
+                .child(key_row)
+                .child(enable_row)
+                .child(grant_row)
+                .child(project_row)
+                .child(
+                    div().text_xs().text_color(rgb(TEXT_MUTED)).child(language.choose(
+                        "「判断后端」「API 密钥」在弹窗中修改，点「保存」后立即生效并写回 runtime.json；启用与授权点击后即刻生效（会取消进行中的任务）。列表显示的永远是已保存的值。",
+                        "“Backend” and “API key” are edited in dialogs and applied on 保存 (persisted to runtime.json immediately); enable/grant toggles apply instantly (canceling the running task). The list always shows the saved values.",
+                    )),
+                );
+
+            // Verification: free discovery first, then one billed judgment.
+            let verify_section = div()
+                .v_flex()
+                .gap_2()
+                .child(Self::jev_section_header("连接与测试", "Connect & test", language))
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_2()
+                        .child(Self::jev_discover_button(language, &entity))
+                        .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(
+                            language.choose(
+                                "仅握手与列出工具，不计费。",
+                                "Handshake and tools/list only; no billable call.",
+                            ),
+                        )),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_2()
+                        .child(Self::jev_real_test_button(language, &entity))
+                        .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(
+                            language.choose(
+                                "通过已保存的后端真实调用一次判断，结果见底部状态栏。",
+                                "One real judgment through the saved backend; the result lands in the status bar.",
+                            ),
+                        )),
+                );
+
+            let notes_section = div()
+                .v_flex()
+                .gap_1()
+                .child(Self::jev_section_header("使用要点", "Usage notes", language))
+                .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(language.choose(
+                    "evaluate 返回类型化判断：noul（0~1 是/否概率）、choice（多选一+概率分布）、score（量表评分）；接近 0.5 表示不确定而非中等。",
+                    "evaluate returns typed judgments: noul (0~1 yes/no probability), choice (one option + distribution), score (rubric scale); near 0.5 means uncertain, not medium.",
+                )))
+                .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(language.choose(
+                    "阈值判断（例如 noul > 0.8 才放行）应写在工作流代码里，而不是依赖模型自觉。",
+                    "Threshold decisions (e.g. proceed only when noul > 0.8) belong in workflow code, not in the model's discretion.",
+                )));
+
+            let content = if server.is_some() {
+                div()
+                    .v_flex()
+                    .gap_4()
+                    .child(overview)
+                    .child(settings_list)
+                    .child(verify_section)
+                    .child(notes_section)
+                    .into_any_element()
             } else {
                 let register = entity.clone();
                 div()
-                        .v_flex()
-                        .gap_3()
-                        .child(div().text_sm().text_color(rgb(TEXT_MUTED)).child(language.choose(
-                            "尚未注册：未检测到随附的 evaluate 二进制。构建后会自动注册，也可以手动重新检测。",
-                            "Not registered yet: the bundled evaluate binary was not detected. It registers automatically once built; you can also re-detect manually.",
-                        )))
-                        .child(
-                            Button::new("jev-reregister")
-                                .label(language.choose("重新检测并注册", "Re-detect and register"))
-                                .on_click(move |_, _, cx| {
-                                    register.update(cx, |view, cx| {
-                                        view.reregister_jev(cx);
-                                    });
-                                }),
-                        )
-                        .into_any_element()
+                    .v_flex()
+                    .gap_3()
+                    .child(div().text_sm().text_color(rgb(TEXT_MUTED)).child(language.choose(
+                        "尚未注册：未检测到随附的 evaluate 二进制。构建后会自动注册，也可以手动重新检测。",
+                        "Not registered yet: the bundled evaluate binary was not detected. It registers automatically once built; you can also re-detect manually.",
+                    )))
+                    .child(
+                        Button::new("jev-reregister")
+                            .label(language.choose("重新检测并注册", "Re-detect and register"))
+                            .on_click(move |_, _, cx| {
+                                register.update(cx, |view, cx| {
+                                    view.reregister_jev(cx);
+                                });
+                            }),
+                    )
+                    .into_any_element()
             };
 
             div()
+                .id("jev-settings-detail")
+                .overflow_y_scroll()
+                .min_h(px(0.))
                 .flex_1()
                 .min_w(px(0.))
                 .v_flex()
@@ -6566,12 +7409,340 @@ fn main() {
                         ))
                         .child(div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(
                             language.choose(
-                                "内置的 TypeSafe Jev（System One）服务器，通过 MCP 暴露 evaluate 工具：输入状态与问题，返回带校准概率的类型化判断，供智能体按阈值在代码里分支。",
-                                "The bundled TypeSafe Jev (System One) server exposes evaluate over MCP: state and questions in, typed judgments with calibrated probabilities out, so agents branch in code on thresholds.",
+                                "各配置项以列表呈现，列表值始终等于已保存状态；「判断后端」与「API 密钥」通过弹窗修改。evaluate 始终以相同接口返回类型化判断，供智能体和数据手册复核调用。",
+                                "Settings appear as a list whose values always mirror what is saved; “backend” and “API key” are edited through dialogs. evaluate keeps one interface returning typed judgments for agents and datasheet review.",
                             ),
                         )),
                 )
-                .child(body)
+                .child(content)
+        }
+
+        /// One row of the Jev settings list: label, the saved value (always
+        /// visible so save state is unambiguous), and the row action.
+        fn jev_setting_row(
+            id: &'static str,
+            label: &str,
+            value: String,
+            value_positive: Option<bool>,
+            action: impl IntoElement,
+        ) -> impl IntoElement {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .gap_3()
+                .p_3()
+                .rounded_lg()
+                .border_1()
+                .border_color(rgb(BORDER))
+                .bg(rgb(CARD_BG))
+                .child(
+                    div()
+                        .w(px(96.))
+                        .flex_none()
+                        .truncate()
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(label.to_owned()),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .text_sm()
+                        .whitespace_normal()
+                        .text_color(rgb(match value_positive {
+                            Some(true) => 0x0016_a34a,
+                            Some(false) => 0x00dc_2626,
+                            None => TEXT_SECONDARY,
+                        }))
+                        .child(value),
+                )
+                .child(action)
+        }
+
+        /// Reset the LLM form inputs to the saved configuration so a canceled
+        /// dialog session never leaks its edits into the next one.
+        fn reset_jev_form_to_saved(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+            let saved = self
+                .catalog
+                .mcp_servers
+                .iter()
+                .find(|server| server.id == BUNDLED_JEV_SERVER_ID)
+                .and_then(circuitfabric_codex_runtime::judge::LlmJudgeSettings::from_server)
+                .or_else(|| self.catalog.llm_judge.clone())
+                .unwrap_or_default();
+            self.jev_llm_settings = saved.clone();
+            self.jev_base_url
+                .update(cx, |state, cx| state.set_value(saved.base_url.as_str(), window, cx));
+            self.jev_model
+                .update(cx, |state, cx| state.set_value(saved.model.as_str(), window, cx));
+            self.jev_key_env.update(cx, |state, cx| {
+                state.set_value(saved.api_key_environment_variable.as_str(), window, cx);
+            });
+            self.jev_timeout.update(cx, |state, cx| {
+                state.set_value(saved.timeout_seconds.to_string().as_str(), window, cx);
+            });
+            self.jev_retries.update(cx, |state, cx| {
+                state.set_value(saved.malformed_retries.to_string().as_str(), window, cx);
+            });
+        }
+
+        /// Backend configuration dialog: pick a branch, edit the LLM form,
+        /// 保存 applies it to the catalog; 取消 keeps the saved backend.
+        fn render_jev_backend_modal(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+            let entity = cx.entity().clone();
+            let language = self.language;
+            let draft_llm = self.jev_llm_draft;
+            let typesafe_ready = circuitfabric_codex_runtime::tools::bundled_mcp_servers()
+                .into_iter()
+                .find(|s| s.id == BUNDLED_JEV_SERVER_ID)
+                .is_some_and(|s| std::path::Path::new(&s.command).is_file());
+            let llm_form = self.render_jev_llm_configuration(cx).into_any_element();
+            let cancel = entity.clone();
+            let save = entity.clone();
+            // Failure messages of the two save handlers, shown inside the dialog.
+            let error_line = (self.status.starts_with("未保存")
+                || self.status.starts_with("判断后端未保存"))
+            .then(|| self.status.clone());
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .p_6()
+                .child(
+                    div()
+                        .id("jev-backend-backdrop")
+                        .absolute()
+                        .inset_0()
+                        .bg(rgba(0x00_0f17_2ab3))
+                        .occlude(),
+                )
+                .child(
+                    div()
+                        .id("jev-backend-modal")
+                        .relative()
+                        .occlude()
+                        .w(px(560.))
+                        .v_flex()
+                        .gap_4()
+                        .p_5()
+                        .rounded_xl()
+                        .border_1()
+                        .border_color(rgb(ACCENT_SOFT))
+                        .bg(rgb(SURFACE_BG))
+                        .shadow_lg()
+                        .child(
+                            div().v_flex().gap_1()
+                                .child(div().text_lg().font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .child(language.choose("配置判断后端", "Configure the judgment backend")))
+                                .child(div().text_sm().whitespace_normal().text_color(rgb(TEXT_SECONDARY))
+                                    .child(language.choose(
+                                        "选择 TypeSafe Jev 或第三方 LLM；修改仅在点击「保存」后生效，取消则保持现状。",
+                                        "Choose TypeSafe Jev or a third-party LLM; changes apply only on 保存 — cancel keeps the current setup.",
+                                    ))),
+                        )
+                        .child(
+                            div()
+                                .id("jev-backend-form-area")
+                                .v_flex()
+                                .gap_3()
+                                .max_h(px(440.))
+                                .overflow_y_scroll()
+                                .child(
+                                    div().flex().flex_wrap().gap_2()
+                                        .child(Self::jev_option(
+                                            "jev-select-typesafe",
+                                            language.choose("TypeSafe Jev（随附二进制）", "TypeSafe Jev (bundled)"),
+                                            !draft_llm,
+                                            &entity,
+                                            move |view, _cx| {
+                                                view.jev_llm_draft = false;
+                                            },
+                                        ))
+                                        .child(Self::jev_option(
+                                            "jev-select-llm",
+                                            language.choose("第三方 LLM 模拟", "Third-party LLM"),
+                                            draft_llm,
+                                            &entity,
+                                            move |view, _cx| {
+                                                view.jev_llm_draft = true;
+                                            },
+                                        )),
+                                )
+                                .child(if draft_llm {
+                                    llm_form
+                                } else {
+                                    div().v_flex().gap_2()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(if typesafe_ready { 0x0016_a34a } else { 0x00dc_2626 }))
+                                                .child(if typesafe_ready {
+                                                    language.choose(
+                                                        "✔ 已找到随附的 evaluate 二进制",
+                                                        "✔ Bundled evaluate binary found",
+                                                    )
+                                                } else {
+                                                    language.choose(
+                                                        "✘ 未找到二进制：请运行 scripts/build-typesafe-mcp.ps1，或设置 CIRCUITFABRIC_TYPESAFE_MCP_PATH",
+                                                        "✘ Binary not found: run scripts/build-typesafe-mcp.ps1 or set CIRCUITFABRIC_TYPESAFE_MCP_PATH",
+                                                    )
+                                                }),
+                                        )
+                                        .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(
+                                            language.choose(
+                                                "官方校准判断；保存后请在列表「API 密钥」行收录 TYPESAFE_API_KEY。",
+                                                "Calibrated official judgments; after saving, record TYPESAFE_API_KEY via the “API key” row of the list.",
+                                            ),
+                                        ))
+                                        .into_any_element()
+                                }),
+                        )
+                        .when_some(error_line, |this, message| {
+                            this.child(
+                                div()
+                                    .text_xs()
+                                    .whitespace_normal()
+                                    .text_color(rgb(0x00dc_2626))
+                                    .child(message),
+                            )
+                        })
+                        .child(
+                            div().flex().items_center().justify_end().gap_2()
+                                .child(
+                                    Button::new("jev-backend-cancel")
+                                        .ghost()
+                                        .label(language.choose("取消", "Cancel"))
+                                        .on_click(move |_, _, cx| {
+                                            cancel.update(cx, |view, cx| {
+                                                view.jev_backend_modal_open = false;
+                                                cx.notify();
+                                            });
+                                        }),
+                                )
+                                .child(
+                                    Button::new("jev-backend-save")
+                                        .primary()
+                                        .label(language.choose("保存", "Save"))
+                                        .on_click(move |_, _, cx| {
+                                            save.update(cx, |view, cx| {
+                                                let llm = view.jev_llm_draft;
+                                                if view.apply_jev_backend(llm, cx) {
+                                                    view.jev_backend_modal_open = false;
+                                                }
+                                            });
+                                        }),
+                                ),
+                        ),
+                )
+        }
+
+        /// Key-replacement dialog for the saved backend's key variable.
+        fn render_jev_key_modal(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+            let entity = cx.entity().clone();
+            let language = self.language;
+            let llm_settings = self
+                .catalog
+                .mcp_servers
+                .iter()
+                .find(|server| server.id == BUNDLED_JEV_SERVER_ID)
+                .and_then(circuitfabric_codex_runtime::judge::LlmJudgeSettings::from_server);
+            let key_name = llm_settings
+                .as_ref()
+                .map_or("TYPESAFE_API_KEY", |s| s.api_key_environment_variable.as_str())
+                .to_owned();
+            let cancel = entity.clone();
+            let save = entity.clone();
+            // Failure messages of the two save handlers, shown inside the dialog.
+            let error_line = (self.status.starts_with("未保存")
+                || self.status.starts_with("判断后端未保存"))
+            .then(|| self.status.clone());
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .p_6()
+                .child(
+                    div()
+                        .id("jev-key-backdrop")
+                        .absolute()
+                        .inset_0()
+                        .bg(rgba(0x00_0f17_2ab3))
+                        .occlude(),
+                )
+                .child(
+                    div()
+                        .id("jev-key-modal")
+                        .relative()
+                        .occlude()
+                        .w(px(480.))
+                        .v_flex()
+                        .gap_4()
+                        .p_5()
+                        .rounded_xl()
+                        .border_1()
+                        .border_color(rgb(ACCENT_SOFT))
+                        .bg(rgb(SURFACE_BG))
+                        .shadow_lg()
+                        .child(
+                            div().v_flex().gap_1()
+                                .child(div().text_lg().font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .child(language.choose("更换 API 密钥", "Replace the API key")))
+                                .child(div().text_sm().whitespace_normal().text_color(rgb(TEXT_SECONDARY))
+                                    .child(format!(
+                                        "{}：{key_name}。{}",
+                                        language.choose("密钥变量", "Key variable"),
+                                        language.choose(
+                                            "值只写入密钥保险库（或同名环境变量），绝不进配置文件；需先解锁保险库。",
+                                            "Values go only to the vault (or a same-named environment variable), never config files; unlock the vault first.",
+                                        ),
+                                    ))),
+                        )
+                        .children(self.secret_source_hint(&key_name, &entity))
+                        .child(Self::labeled_field("API Key", "jev-api-key", None, &self.jev_api_key))
+                        .when_some(error_line, |this, message| {
+                            this.child(
+                                div()
+                                    .text_xs()
+                                    .whitespace_normal()
+                                    .text_color(rgb(0x00dc_2626))
+                                    .child(message),
+                            )
+                        })
+                        .child(
+                            div().flex().items_center().justify_end().gap_2()
+                                .child(
+                                    Button::new("jev-key-cancel")
+                                        .ghost()
+                                        .label(language.choose("取消", "Cancel"))
+                                        .on_click(move |_, _, cx| {
+                                            cancel.update(cx, |view, cx| {
+                                                view.jev_key_modal_open = false;
+                                                cx.notify();
+                                            });
+                                        }),
+                                )
+                                .child(
+                                    Button::new("jev-key-save")
+                                        .primary()
+                                        .label(language.choose("保存到密钥保险库", "Save to vault"))
+                                        .on_click(move |_, window, cx| {
+                                            save.update(cx, |view, cx| {
+                                                if view.save_jev_api_key(window, cx) {
+                                                    view.jev_key_modal_open = false;
+                                                }
+                                            });
+                                        }),
+                                ),
+                        ),
+                )
         }
 
         fn render_skills_detail(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -7853,7 +9024,7 @@ fn main() {
             div()
                 .v_flex()
                 .gap_4()
-                .size_full()
+                .w_full()
                 .child(header)
                 .child(search_panel)
                 .child(list)
@@ -8276,7 +9447,7 @@ fn main() {
                 let project_id = project.id.clone();
                 let chooser = entity.clone();
                 return div()
-                    .size_full()
+                    .w_full()
                     .v_flex()
                     .gap_4()
                     .p_6()
@@ -8318,9 +9489,7 @@ fn main() {
                                     }),
                             ),
                     )
-                    .child(
-                        div().flex_1().min_h(px(0.)).child(self.render_documents_tab(&project, cx)),
-                    )
+                    .child(self.render_documents_tab(&project, cx))
                     .into_any_element();
             }
 
@@ -8395,6 +9564,7 @@ fn main() {
         /// Converts rendered pages to GPUI images; pages that fail to convert are skipped.
         fn raster_preview_pages(
             pages: Vec<circuitfabric_plugin_api::DocumentRasterPage>,
+            requested_width: u32,
         ) -> Vec<(u32, DocumentRasterPreviewPage)> {
             pages
                 .into_iter()
@@ -8402,8 +9572,7 @@ fn main() {
                     Some((
                         page.number,
                         DocumentRasterPreviewPage {
-                            width: page.width,
-                            height: page.height,
+                            requested_width,
                             image: Self::render_image_from_rgba(
                                 page.width,
                                 page.height,
@@ -8433,9 +9602,10 @@ fn main() {
             Some(DocumentRasterPreview {
                 data: std::sync::Arc::from(data),
                 page_sizes,
-                pages: Self::raster_preview_pages(initial).into_iter().collect(),
-                in_flight: std::collections::BTreeSet::new(),
+                pages: Self::raster_preview_pages(initial, 900).into_iter().collect(),
+                in_flight: BTreeMap::new(),
                 failed: std::collections::BTreeSet::new(),
+                retired_images: Vec::new(),
             })
         }
 
@@ -8450,6 +9620,9 @@ fn main() {
                 for (_, page) in std::mem::take(&mut raster.pages) {
                     window.drop_image(page.image).ok();
                 }
+                for image in std::mem::take(&mut raster.retired_images) {
+                    window.drop_image(image).ok();
+                }
             }
         }
 
@@ -8461,6 +9634,12 @@ fn main() {
             window: &mut Window,
             cx: &mut Context<Self>,
         ) {
+            let target_width = crate::pdf_zoom::raster_width(
+                (self.document_preview_width - 34.0).max(240.0),
+                self.preview_pdf_zoom.value,
+                window.scale_factor(),
+            );
+            let settled = self.preview_zoom_tick.is_none();
             let Some(preview) = self.document_preview.as_mut() else {
                 return;
             };
@@ -8469,36 +9648,74 @@ fn main() {
                 return;
             };
             let count = u32::try_from(raster.page_sizes.len()).unwrap_or(u32::MAX);
+            for image in std::mem::take(&mut raster.retired_images) {
+                window.drop_image(image).ok();
+            }
             let keep = first.saturating_sub(RASTER_KEEP_DISTANCE)
                 ..=last.saturating_add(RASTER_KEEP_DISTANCE);
-            let evicted: Vec<u32> =
-                raster.pages.keys().filter(|number| !keep.contains(number)).copied().collect();
+            let evicted: Vec<u32> = raster
+                .pages
+                .iter()
+                .filter(|(number, page)| {
+                    !keep.contains(number)
+                        || (!(first..=last).contains(number) && page.requested_width > 900)
+                })
+                .map(|(number, _)| *number)
+                .collect();
             for number in evicted {
                 if let Some(page) = raster.pages.remove(&number) {
                     window.drop_image(page.image).ok();
                 }
             }
-            let wanted: Vec<u32> = (first.saturating_sub(RASTER_PREFETCH_BEFORE).max(1)
-                ..=last.saturating_add(RASTER_PREFETCH_AFTER).min(count))
-                .filter(|number| {
-                    !raster.pages.contains_key(number)
-                        && !raster.in_flight.contains(number)
-                        && !raster.failed.contains(number)
+            let neighbors = first.saturating_sub(RASTER_PREFETCH_BEFORE).max(1)
+                ..=last.saturating_add(RASTER_PREFETCH_AFTER).min(count);
+            let mut wanted: Vec<(u32, u32)> = (first..=last.min(count))
+                .chain(neighbors.filter(|number| !(first..=last).contains(number)))
+                .filter_map(|number| {
+                    let width = if settled && (first..=last).contains(&number) {
+                        target_width
+                    } else {
+                        900
+                    };
+                    (!raster.pages.get(&number).is_some_and(|page| page.requested_width >= width)
+                        && !raster.in_flight.contains_key(&number)
+                        && !raster.failed.contains(&(number, width)))
+                    .then_some((number, width))
                 })
+                .take(3)
                 .collect();
             if wanted.is_empty() {
                 return;
             }
-            raster.in_flight.extend(&wanted);
+            // Large bitmaps are produced one at a time; neighbors stay at preview resolution.
+            if wanted[0].1 > 900 {
+                wanted.truncate(1);
+            }
+            raster.in_flight.extend(wanted.iter().copied());
             let data = raster.data.clone();
+            let source_data = data.clone();
             let project_id = preview.project_id.clone();
             let document_id = preview.document_id.clone();
             let requested = wanted.clone();
             let work = cx.background_spawn(async move {
-                match circuitfabric_document_opener::render_pdf_pages(&data, &requested) {
-                    Some(Ok(pages)) => Some(Self::raster_preview_pages(pages)),
-                    _ => None,
-                }
+                requested
+                    .into_iter()
+                    .map(|(number, width)| {
+                        let page = circuitfabric_document_opener::render_pdf_pages_at_width(
+                            &data,
+                            &[number],
+                            width,
+                        )
+                        .and_then(Result::ok)
+                        .and_then(|pages| {
+                            Self::raster_preview_pages(pages, width)
+                                .into_iter()
+                                .next()
+                                .map(|(_, page)| page)
+                        });
+                        (number, width, page)
+                    })
+                    .collect::<Vec<_>>()
             });
             cx.spawn(async move |view, cx| {
                 let rendered = work.await;
@@ -8512,13 +9729,21 @@ fn main() {
                     else {
                         return;
                     };
-                    if *shown_project != project_id || *shown_document != document_id {
+                    if *shown_project != project_id
+                        || *shown_document != document_id
+                        || !std::sync::Arc::ptr_eq(&raster.data, &source_data)
+                    {
                         return;
                     }
-                    raster.in_flight.retain(|number| !wanted.contains(number));
-                    match rendered {
-                        Some(pages) => raster.pages.extend(pages),
-                        None => raster.failed.extend(wanted),
+                    for (number, width, page) in rendered {
+                        raster.in_flight.remove(&number);
+                        if let Some(page) = page {
+                            if let Some(old) = raster.pages.insert(number, page) {
+                                raster.retired_images.push(old.image);
+                            }
+                        } else {
+                            raster.failed.insert((number, width));
+                        }
                     }
                     cx.notify();
                 })
@@ -8539,6 +9764,9 @@ fn main() {
             let entity = cx.entity().clone();
             let language = self.language;
             let pane_width = self.document_preview_width;
+            if !window.is_window_active() {
+                self.stop_pdf_interaction();
+            }
             let Some(preview) = &self.document_preview else {
                 return div().into_any_element();
             };
@@ -8629,7 +9857,10 @@ fn main() {
                                 .on_click(move |_, _, cx| {
                                     preview_tab.update(cx, |view, cx| {
                                         view.preview_show_data = false;
+                                        view.stop_pdf_interaction();
                                         view.preview_scroll.set_offset(gpui::Point::default());
+                                        #[cfg(windows)]
+                                        crate::pdf_cursors::set_area(None);
                                         cx.notify();
                                     });
                                 }),
@@ -8642,7 +9873,10 @@ fn main() {
                                 .on_click(move |_, _, cx| {
                                     data_tab.update(cx, |view, cx| {
                                         view.preview_show_data = true;
+                                        view.stop_pdf_interaction();
                                         view.preview_scroll.set_offset(gpui::Point::default());
+                                        #[cfg(windows)]
+                                        crate::pdf_cursors::clear();
                                         cx.notify();
                                     });
                                 }),
@@ -8693,6 +9927,7 @@ fn main() {
                             },
                         ),
                         focus.map(|focus| &focus.anchor),
+                        self.preview_row_anchor.as_ref(),
                     )
                     .into_any_element(),
                 ));
@@ -8731,10 +9966,16 @@ fn main() {
                                 .into_any_element(),
                         ));
                         items.extend(match raster {
-                            Some(raster) => {
-                                Self::render_document_raster_pages(raster, language, pane_width)
-                            }
-                            None => Self::render_document_view_items(&view.body, language),
+                            Some(raster) => Self::render_document_raster_pages(
+                                raster,
+                                language,
+                                pane_width,
+                                self.preview_pdf_zoom.value,
+                                focus,
+                                &entity,
+                                self.preview_pdf_pan.is_some(),
+                            ),
+                            None => Self::render_document_view_items(&view.body, language, focus),
                         });
                     }
                     DocumentPreviewState::Refused { denial } => {
@@ -8811,8 +10052,14 @@ fn main() {
             // Land on the cited page once its content is laid out; `scroll_to_top_of_item`
             // waits for the child bounds of the next layout.
             if self.preview_scroll_pending.get() {
-                let loading = matches!(preview.state, DocumentPreviewState::Loading) && !show_data;
-                if let Some(index) = target_page
+                let loading = matches!(preview.state, DocumentPreviewState::Loading);
+                if show_data
+                    && preview.extraction.is_some()
+                    && let Some(anchor) = &self.preview_row_anchor
+                {
+                    anchor.scroll_to(window, cx);
+                    self.preview_scroll_pending.set(false);
+                } else if let Some(index) = target_page
                     .and_then(|page| items.iter().position(|(number, _)| *number == Some(page)))
                 {
                     self.preview_scroll.scroll_to_top_of_item(index);
@@ -8822,39 +10069,301 @@ fn main() {
                 }
             }
 
-            let pane = div()
-                .flex_none()
-                .w(px(pane_width))
-                .h_full()
+            let zoom_anchor = self.preview_zoom_anchor.filter(|_| raster_shown);
+            // Apply the final scale's anchor once, then allow scrollbar dragging normally.
+            if self.preview_zoom_tick.is_none() {
+                self.preview_zoom_anchor = None;
+            }
+            let probe = std::rc::Rc::new(std::cell::Cell::new(None));
+            let scroll_content = div()
+                .id("document-preview-scroll")
+                .size_full()
+                .overflow_y_scroll()
+                .when(raster_shown, |scroll| scroll.overflow_x_scroll())
+                .track_scroll(&self.preview_scroll)
                 .v_flex()
-                .bg(rgb(CARD_BG))
-                .border_l_1()
-                .border_color(rgb(BORDER))
-                .child(header)
-                .when_some(tabs, ParentElement::child)
-                .child(
-                    div()
-                        .relative()
-                        .flex_1()
-                        .min_h(px(0.))
-                        .child(
-                            div()
-                                .id("document-preview-scroll")
-                                .size_full()
-                                .overflow_y_scroll()
-                                .track_scroll(&self.preview_scroll)
-                                .v_flex()
-                                .gap_2()
-                                .p_3()
-                                .children(items.into_iter().map(|(_, item)| item)),
-                        )
-                        .vertical_scrollbar(&self.preview_scroll),
-                )
+                .gap_2()
+                .p_3()
+                .children(items.into_iter().enumerate().map(|(index, (_, item))| {
+                    let content = div()
+                        .flex_none()
+                        .min_w(px(0.))
+                        .when(raster_shown, |item| {
+                            item.w(px(
+                                (pane_width - 34.0).max(240.0) * self.preview_pdf_zoom.value + 10.0
+                            ))
+                        })
+                        .child(item)
+                        .into_any_element();
+                    if zoom_anchor.is_some_and(|(target, _, _)| target == index) {
+                        crate::pdf_zoom::native::mark_layout(content, probe.clone())
+                    } else {
+                        content
+                    }
+                }))
                 .into_any_element();
+            let scroll_content = if let Some((_, fraction, pointer)) = zoom_anchor {
+                crate::pdf_zoom::native::anchor_viewport(
+                    scroll_content,
+                    probe,
+                    self.preview_scroll.clone(),
+                    fraction,
+                    pointer,
+                )
+            } else {
+                scroll_content
+            };
+            let pane =
+                div()
+                    .flex_none()
+                    .w(px(pane_width))
+                    .h_full()
+                    .v_flex()
+                    .bg(rgb(CARD_BG))
+                    .border_l_1()
+                    .border_color(rgb(BORDER))
+                    .child(header)
+                    .when_some(tabs, ParentElement::child)
+                    .child(
+                        div()
+                            .relative()
+                            .flex_1()
+                            .min_h(px(0.))
+                            .child(scroll_content)
+                            .when(raster_shown, |area| {
+                                let zoomer = entity.clone();
+                                let generation = self.preview_focus_generation;
+                                let zoom = self.preview_pdf_zoom.value;
+                                let animate = self.preview_zoom_tick.is_some();
+                                let grabbing = self.preview_pdf_pan.is_some();
+                                area.child(
+                                    div().absolute().top(px(0.)).left(px(0.)).size_full().child(
+                                        gpui::canvas(
+                                            |_, _, _| (),
+                                            move |bounds, (), window, _| {
+                                                if grabbing {
+                                                    window.set_window_cursor_style(crate::pdf_zoom::native::pan_cursor(true));
+                                                }
+                                                // Grab/grabbing cursor state: the area is live
+                                                // while this canvas paints; every mouse move
+                                                // recomputes it so leaving the pane restores
+                                                // the normal cursor.
+                                                #[cfg(windows)]
+                                                {
+                                                    let (x, y) = (f32::from(bounds.left()), f32::from(bounds.top()));
+                                                    let (width, height) =
+                                                        (f32::from(bounds.size.width), f32::from(bounds.size.height));
+                                                    crate::pdf_cursors::set_area(Some((x, y, width, height)));
+                                                    crate::pdf_cursors::set_dragging(grabbing);
+                                                    let pointer = window.mouse_position();
+                                                    crate::pdf_cursors::refresh((f32::from(pointer.x), f32::from(pointer.y)));
+                                                    window.on_mouse_event(
+                                                        move |event: &gpui::MouseMoveEvent, phase, _, _| {
+                                                            if phase == gpui::DispatchPhase::Capture {
+                                                                crate::pdf_cursors::refresh((
+                                                                    f32::from(event.position.x),
+                                                                    f32::from(event.position.y),
+                                                                ));
+                                                            }
+                                                        },
+                                                    );
+                                                }
+                                                // The new page bounds are available after this layout.
+                                                if animate {
+                                                    let anchored = zoomer.clone();
+                                                    window.on_next_frame(move |_, cx| {
+                                                        anchored.update(cx, |view, cx| {
+                                                            if view.preview_focus_generation == generation
+                                                                && view.preview_pdf_zoom.value == zoom
+                                                                && !view.preview_show_data
+                                                                && view.preview_zoom_tick.is_some()
+                                                            {
+                                                                let now = std::time::Instant::now();
+                                                                let elapsed = view.preview_zoom_tick.take().unwrap().elapsed().as_secs_f32();
+                                                                if view.preview_pdf_zoom.advance(elapsed) {
+                                                                    view.preview_zoom_tick = Some(now);
+                                                                }
+                                                                cx.notify();
+                                                            }
+                                                        });
+                                                    });
+                                                }
+                                                let interrupter = zoomer.clone();
+                                                window.on_mouse_event(move |event: &gpui::MouseDownEvent, phase, _, cx| {
+                                                    if phase == gpui::DispatchPhase::Capture && bounds.contains(&event.position) {
+                                                        interrupter.update(cx, |view, cx| {
+                                                            if view.preview_zoom_tick.is_some() {
+                                                                view.stop_pdf_interaction();
+                                                                cx.notify();
+                                                            }
+                                                        });
+                                                    }
+                                                });
+                                                let mover = zoomer.clone();
+                                                window.on_mouse_event(move |event: &gpui::MouseMoveEvent, phase, _, cx| {
+                                                    if phase == gpui::DispatchPhase::Capture {
+                                                        mover.update(cx, |view, cx| view.pan_pdf_preview(event, cx));
+                                                    }
+                                                });
+                                                let releaser = zoomer.clone();
+                                                window.on_mouse_event(move |event: &gpui::MouseUpEvent, phase, _, cx| {
+                                                    if phase == gpui::DispatchPhase::Capture && event.button == gpui::MouseButton::Left {
+                                                        releaser.update(cx, |view, cx| {
+                                                            if view.preview_pdf_pan.take().is_some() {
+                                                                cx.stop_propagation();
+                                                                cx.notify();
+                                                            }
+                                                        });
+                                                    }
+                                                });
+                                                window.on_mouse_event(move |event: &gpui::ScrollWheelEvent, phase, window, cx| {
+                                                    if phase == gpui::DispatchPhase::Capture
+                                                        && bounds.contains(&event.position)
+                                                    {
+                                                        if event.modifiers.control {
+                                                            cx.stop_propagation();
+                                                            zoomer.update(cx, |view, cx| view.zoom_pdf_preview(event, window, cx));
+                                                        } else {
+                                                            zoomer.update(cx, |view, cx| {
+                                                                let active = view.preview_zoom_tick.is_some() || view.preview_pdf_pan.is_some();
+                                                                view.stop_pdf_interaction();
+                                                                if active { cx.notify(); }
+                                                            });
+                                                        }
+                                                    }
+                                                });
+                                            },
+                                        ).size_full(),
+                                    ),
+                                )
+                            })
+                            .when(self.preview_pdf_pan.is_some(), |area| area.cursor(crate::pdf_zoom::native::pan_cursor(true)))
+                            .when(
+                                focus.is_some_and(|focus| focus.resolving),
+                                |area| {
+                                    area.child(
+                                        // Translucent mask over the document area while the
+                                        // source location is being resolved.
+                                        div().absolute().top(px(0.)).left(px(0.)).size_full().bg(
+                                            rgba(0xf8fafce0),
+                                        ),
+                                    )
+                                    .child(
+                                        div()
+                                            .absolute()
+                                            .top(px(0.))
+                                            .left(px(0.))
+                                            .size_full()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap_2()
+                                                    .px_3()
+                                                    .py_2()
+                                                    .rounded_lg()
+                                                    .border_1()
+                                                    .border_color(rgb(BORDER))
+                                                    .bg(rgb(CARD_BG))
+                                                    .shadow_sm()
+                                                    .child(status_dot(0x00e0_f2fe))
+                                                    .child(language.choose(
+                                                        "正在定位原文…",
+                                                        "Locating source…",
+                                                    )),
+                                            ),
+                                    )
+                                },
+                            )
+                            .scrollbar(&self.preview_scroll, gpui_component::scroll::ScrollbarAxis::Both),
+                    )
+                    .into_any_element();
             if let Some(visible) = visible_pages {
                 self.update_raster_window(visible, window, cx);
             }
             pane
+        }
+
+        fn zoom_pdf_preview(
+            &mut self,
+            event: &gpui::ScrollWheelEvent,
+            _window: &mut Window,
+            cx: &mut Context<Self>,
+        ) {
+            let delta = f32::from(event.delta.pixel_delta(px(30.0)).y);
+            if !self.preview_pdf_zoom.scroll(delta) {
+                return;
+            }
+            self.preview_pdf_pan = None;
+            let offset = self.preview_scroll.offset();
+            self.preview_zoom_anchor = (self.preview_scroll.top_item()
+                ..=self.preview_scroll.bottom_item())
+                .find_map(|index| {
+                    let item = self.preview_scroll.bounds_for_item(index)?;
+                    let y = event.position.y - item.top() - offset.y;
+                    if y < px(0.0) || y > item.size.height {
+                        return None;
+                    }
+                    let fraction = gpui::point(
+                        (f32::from(event.position.x - item.left() - offset.x)
+                            / f32::from(item.size.width).max(1.0))
+                        .clamp(0.0, 1.0),
+                        (f32::from(y) / f32::from(item.size.height).max(1.0)).clamp(0.0, 1.0),
+                    );
+                    Some((index, fraction, event.position))
+                });
+            self.preview_zoom_tick.get_or_insert_with(std::time::Instant::now);
+            if cx.reduce_motion() {
+                self.preview_pdf_zoom.finish();
+            }
+            cx.notify();
+        }
+
+        fn stop_pdf_interaction(&mut self) {
+            self.preview_pdf_zoom.stop();
+            self.preview_zoom_tick = None;
+            self.preview_zoom_anchor = None;
+            self.preview_pdf_pan = None;
+        }
+
+        /// Returns the PDF view to 100% with no pan or in-flight zoom animation. Every
+        /// navigation (opening a document, jumping from a search hit or a data row's source
+        /// link) starts from the fitted page so the landing position is predictable.
+        fn reset_pdf_view(&mut self) {
+            self.preview_pdf_zoom = crate::pdf_zoom::ZoomMotion::default();
+            self.preview_zoom_tick = None;
+            self.preview_pdf_pan = None;
+            self.preview_zoom_anchor = None;
+            #[cfg(windows)]
+            crate::pdf_cursors::set_dragging(false);
+        }
+
+        fn begin_pdf_pan(&mut self, position: gpui::Point<gpui::Pixels>, cx: &mut Context<Self>) {
+            self.stop_pdf_interaction();
+            self.preview_pdf_pan = Some((position, self.preview_scroll.offset()));
+            cx.stop_propagation();
+            cx.notify();
+        }
+
+        fn pan_pdf_preview(&mut self, event: &gpui::MouseMoveEvent, cx: &mut Context<Self>) {
+            let Some((start, offset)) = self.preview_pdf_pan else { return };
+            if !event.dragging() {
+                self.preview_pdf_pan = None;
+            } else {
+                let max = self.preview_scroll.max_offset();
+                let (x, y) = crate::pdf_zoom::pan_offset(
+                    (f32::from(offset.x), f32::from(offset.y)),
+                    (f32::from(start.x), f32::from(start.y)),
+                    (f32::from(event.position.x), f32::from(event.position.y)),
+                    (f32::from(max.x), f32::from(max.y)),
+                );
+                self.preview_scroll.set_offset(gpui::point(px(x), px(y)));
+                cx.stop_propagation();
+            }
+            cx.notify();
         }
 
         /// The cited line a search hit opened this preview for, with its extracted row when
@@ -8947,11 +10456,11 @@ fn main() {
                                 .text_color(rgb(0x000e_7490))
                                 .child(language.choose_owned(
                                     format!(
-                                        "检索定位 · {}",
+                                        "原文与数据定位 · {}",
                                         Self::evidence_anchor_label(&focus.anchor, language)
                                     ),
                                     format!(
-                                        "Search hit · {}",
+                                        "Source / data location · {}",
                                         Self::evidence_anchor_label(&focus.anchor, language)
                                     ),
                                 )),
@@ -8964,6 +10473,8 @@ fn main() {
                                 .on_click(move |_, _, cx| {
                                     closer.update(cx, |view, cx| {
                                         view.preview_focus = None;
+                                        view.preview_focus_generation += 1;
+                                        view.preview_row_anchor = None;
                                         cx.notify();
                                     });
                                 }),
@@ -8989,6 +10500,11 @@ fn main() {
                 .when_some(unrendered_page, |banner, note| {
                     banner.child(div().text_xs().text_color(rgb(0x00b4_5309)).child(note))
                 })
+                .when_some(focus.notice.clone(), |banner, note| {
+                    banner.child(
+                        div().text_xs().whitespace_normal().text_color(rgb(TEXT_MUTED)).child(note),
+                    )
+                })
                 .into_any_element()
         }
 
@@ -9007,6 +10523,7 @@ fn main() {
             elapsed_seconds: Option<u64>,
             can_resume: bool,
             focus: Option<&FragmentAnchor>,
+            row_anchor: Option<&gpui::ScrollAnchor>,
         ) -> Div {
             let focused_row = |wanted: &str| match focus {
                 Some(FragmentAnchor::DatasheetRow { section, row }) if section == wanted => {
@@ -9204,6 +10721,8 @@ fn main() {
                 language,
                 visible_rows,
                 focused_row("pins"),
+                row_anchor,
+                entity,
             ));
             content = content.child(Self::render_datasheet_parameter_table(
                 language.choose("绝对最大额定值", "Absolute Maximum Ratings"),
@@ -9211,6 +10730,9 @@ fn main() {
                 language,
                 visible_rows,
                 focused_row("absoluteMaximumRatings"),
+                row_anchor,
+                entity,
+                "absoluteMaximumRatings",
                 0x00fe_f2f2,
                 0x00b9_1c1c,
             ));
@@ -9220,6 +10742,9 @@ fn main() {
                 language,
                 visible_rows,
                 focused_row("electricalCharacteristics"),
+                row_anchor,
+                entity,
+                "electricalCharacteristics",
                 0x00e0_f2fe,
                 0x000e_7490,
             ));
@@ -9229,6 +10754,9 @@ fn main() {
                 language,
                 visible_rows,
                 focused_row("operatingConditions"),
+                row_anchor,
+                entity,
+                "operatingConditions",
                 0x00f3_e8ff,
                 0x0076_2ba3,
             ));
@@ -9278,6 +10806,8 @@ fn main() {
             language: UiLanguage,
             visible_rows: usize,
             focused_row: Option<usize>,
+            row_anchor: Option<&gpui::ScrollAnchor>,
+            entity: &Entity<Self>,
         ) -> Div {
             let mut table = div().v_flex().gap_1().child(
                 div().text_sm().font_weight(FontWeight::SEMIBOLD).child(language.choose_owned(
@@ -9318,6 +10848,10 @@ fn main() {
             for (index, pin) in pins.iter().enumerate().take(visible_rows) {
                 table = table.child(
                     div()
+                        .id(("datasheet-pin-row", index))
+                        .anchor_scroll(
+                            (focused_row == Some(index + 1)).then(|| row_anchor.cloned()).flatten(),
+                        )
                         .flex()
                         .gap_1()
                         .when(focused_row == Some(index + 1), |row| {
@@ -9356,19 +10890,30 @@ fn main() {
                                 .text_color(rgb(TEXT_SECONDARY))
                                 .whitespace_normal()
                                 .child(pin.description.clone()),
-                        ),
+                        )
+                        .child(Self::datasheet_source_link(
+                            entity,
+                            "pins",
+                            index,
+                            pin.evidence.is_some(),
+                            language,
+                        )),
                 );
             }
             table
         }
 
         /// One parameter table with min/typ/max/unit columns.
+        #[allow(clippy::too_many_arguments)]
         fn render_datasheet_parameter_table(
             title: &str,
             parameters: &[circuitfabric_contracts::DatasheetParameter],
             language: UiLanguage,
             visible_rows: usize,
             focused_row: Option<usize>,
+            row_anchor: Option<&gpui::ScrollAnchor>,
+            entity: &Entity<Self>,
+            section: &'static str,
             accent: u32,
             accent_text: u32,
         ) -> Div {
@@ -9438,6 +10983,10 @@ fn main() {
                 };
                 table = table.child(
                     div()
+                        .id((section, index))
+                        .anchor_scroll(
+                            (focused_row == Some(index + 1)).then(|| row_anchor.cloned()).flatten(),
+                        )
                         .flex()
                         .gap_1()
                         .when(focused_row == Some(index + 1), |row| {
@@ -9484,10 +11033,42 @@ fn main() {
                                     .whitespace_normal()
                                     .child(format!("({conditions})")),
                             )
-                        }),
+                        })
+                        .child(Self::datasheet_source_link(
+                            entity,
+                            section,
+                            index,
+                            parameter.evidence.is_some(),
+                            language,
+                        )),
                 );
             }
             table
+        }
+
+        /// The per-row link to the source PDF: a single icon on the row itself, with the
+        /// action explained by a hover tooltip instead of a wide text label.
+        fn datasheet_source_link(
+            entity: &Entity<Self>,
+            section: &'static str,
+            row: usize,
+            has_evidence: bool,
+            language: UiLanguage,
+        ) -> impl IntoElement {
+            let opener = entity.clone();
+            Button::new(("datasheet-source", row))
+                .ghost()
+                .compact()
+                .icon(IconName::ExternalLink)
+                .tooltip(if has_evidence {
+                    language.choose("查看原文", "View source").to_owned()
+                } else {
+                    language.choose("未记录原文证据", "No source evidence").to_owned()
+                })
+                .disabled(!has_evidence)
+                .on_click(move |_, _, cx| {
+                    opener.update(cx, |view, cx| view.open_datasheet_source(section, row, cx));
+                })
         }
 
         /// Displays the PDF as a scrollable, reader-like list with a slot for every page:
@@ -9500,10 +11081,14 @@ fn main() {
             raster: &DocumentRasterPreview,
             language: UiLanguage,
             pane_width: f32,
+            zoom: f32,
+            focus: Option<&PreviewFocus>,
+            entity: &Entity<Self>,
+            grabbing: bool,
         ) -> Vec<(Option<u32>, AnyElement)> {
             // Page bitmaps follow the divider: pane width minus the body padding, the page
             // card's own padding, and its border.
-            let bitmap_width = (pane_width - 34.0).max(240.0);
+            let bitmap_width = (pane_width - 34.0).max(240.0) * zoom;
             let page_count = raster.page_sizes.len();
             let mut content = vec![(
                 None,
@@ -9511,29 +11096,45 @@ fn main() {
                     .text_xs()
                     .text_color(rgb(TEXT_MUTED))
                     .child(language.choose_owned(
-                        format!("共 {page_count} 页（滚动时按需渲染）"),
-                        format!("{page_count} pages — rendered on demand as you scroll"),
+                        format!(
+                            "共 {page_count} 页 · {:.0}% · Ctrl＋滚轮缩放，左键拖动",
+                            zoom * 100.0
+                        ),
+                        format!(
+                            "{page_count} pages · {:.0}% · Ctrl + wheel to zoom; drag to pan",
+                            zoom * 100.0
+                        ),
                     ))
                     .into_any_element(),
             )];
             for (index, (width_points, height_points)) in raster.page_sizes.iter().enumerate() {
                 let number = u32::try_from(index + 1).unwrap_or(u32::MAX);
                 let rendered = raster.pages.get(&number);
-                let display_height = match rendered {
-                    Some(page) if page.width > 0 => {
-                        bitmap_width * page.height as f32 / page.width as f32
-                    }
-                    _ => bitmap_width * height_points / width_points,
-                };
+                let display_height = bitmap_width * height_points / width_points;
+                let grabber = entity.clone();
                 let frame = div()
+                    .id(("pdf-page-frame", number))
+                    .cursor(crate::pdf_zoom::native::pan_cursor(grabbing))
+                    .on_mouse_down(gpui::MouseButton::Left, move |event, _, cx| {
+                        grabber.update(cx, |view, cx| view.begin_pdf_pan(event.position, cx));
+                    })
                     .p_1()
                     .rounded_sm()
                     .border_1()
                     .border_color(rgb(BORDER))
                     .bg(rgb(SURFACE_BG));
                 let frame = match rendered {
-                    Some(page) => frame
-                        .child(img(page.image.clone()).w(px(bitmap_width)).h(px(display_height))),
+                    Some(page) => frame.child(
+                        div().relative().w(px(bitmap_width)).h(px(display_height))
+                            .child(img(page.image.clone()).w(px(bitmap_width)).h(px(display_height)))
+                            .children(focus.filter(|focus| matches!(focus.anchor, FragmentAnchor::PageLine { page, .. } if page == number))
+                                .into_iter().flat_map(|focus| &focus.regions).map(|region| {
+                                    div().absolute()
+                                        .left(px(region.left * bitmap_width)).top(px(region.top * display_height))
+                                        .w(px(region.width * bitmap_width)).h(px(region.height * display_height))
+                                        .bg(rgba(0xffd8_3d66)).border_1().border_color(rgba(0xe0a0_0090))
+                                })),
+                    ),
                     None => frame.child(
                         div()
                             .w(px(bitmap_width))
@@ -9544,7 +11145,7 @@ fn main() {
                             .bg(rgb(CARD_BG))
                             .text_xs()
                             .text_color(rgb(TEXT_MUTED))
-                            .child(if raster.failed.contains(&number) {
+                            .child(if raster.failed.iter().any(|(page, _)| *page == number) {
                                 language.choose("该页无法渲染", "This page could not be rendered")
                             } else {
                                 language.choose("正在渲染…", "Rendering…")
@@ -9578,6 +11179,7 @@ fn main() {
         fn render_document_view_items(
             view_body: &DocumentViewBody,
             language: UiLanguage,
+            focus: Option<&PreviewFocus>,
         ) -> Vec<(Option<u32>, AnyElement)> {
             let DocumentViewBody::PagedText { pages, truncated } = view_body else {
                 return vec![(
@@ -9614,7 +11216,14 @@ fn main() {
                     .into_any_element(),
                 ));
             }
-            for page in pages.iter().take(PREVIEW_MAX_RENDERED_PAGES) {
+            for page in pages.iter().enumerate().filter_map(|(index, page)| {
+                (index < PREVIEW_MAX_RENDERED_PAGES || focus.is_some_and(|focus|
+                    matches!(focus.anchor, FragmentAnchor::PageLine { page: number, .. } if number == page.number)
+                )).then_some(page)
+            }) {
+                let ranges = focus.filter(|focus| matches!(focus.anchor, FragmentAnchor::PageLine { page: number, .. } if number == page.number))
+                    .map(|focus| circuitfabric_document_opener::pdf_text_highlight_ranges(&page.text, &focus.terms))
+                    .unwrap_or_default();
                 content.push((
                     Some(page.number),
                     div()
@@ -9638,7 +11247,7 @@ fn main() {
                                 .text_sm()
                                 .text_color(rgb(TEXT_PRIMARY))
                                 .whitespace_normal()
-                                .child(page.text.clone()),
+                                .child(Self::render_highlighted_text(&page.text, &ranges)),
                         )
                         .into_any_element(),
                 ));
@@ -13683,6 +15292,16 @@ fn main() {
                 } else {
                     None
                 };
+            let jev_backend_modal = if self.jev_backend_modal_open {
+                Some(self.render_jev_backend_modal(cx).into_any_element())
+            } else {
+                None
+            };
+            let jev_key_modal = if self.jev_key_modal_open {
+                Some(self.render_jev_key_modal(cx).into_any_element())
+            } else {
+                None
+            };
             let document_preview_pane = if self.document_preview.is_some() {
                 Some(self.render_document_preview_pane(window, cx))
             } else {
@@ -14060,12 +15679,22 @@ fn main() {
                                 ))
                                 .child(
                                     div()
+                                        .relative()
                                         .flex_1()
                                         .min_w(px(0.))
-                                        .overflow_y_scrollbar()
-                                        .id("main-content-scroll")
+                                        .min_h(px(0.))
+                                        .h_full()
+                                        .overflow_hidden()
                                         .bg(rgb(SURFACE_BG))
-                                        .child(page),
+                                        .child(
+                                            div()
+                                                .id("main-content-scroll")
+                                                .size_full()
+                                                .overflow_y_scroll()
+                                                .track_scroll(&self.main_content_scroll)
+                                                .child(page),
+                                        )
+                                        .vertical_scrollbar(&self.main_content_scroll),
                                 )
                                 .when_some(document_preview_pane, |row, pane| {
                                     row.child(
@@ -14129,12 +15758,17 @@ fn main() {
                         )
                         .when_some(command_palette, ParentElement::child)
                         .when_some(vault_prompt, ParentElement::child)
-                        .when_some(vault_quick_unlock, ParentElement::child),
+                        .when_some(vault_quick_unlock, ParentElement::child)
+                        .when_some(jev_backend_modal, ParentElement::child)
+                        .when_some(jev_key_modal, ParentElement::child),
                 )
         }
     }
 
-    gpui_platform::application().run(move |cx| {
+    // gpui-component's icons (buttons, spinners, …) are SVG assets; without a registered
+    // asset source every `Icon` renders as empty space — the control still occupies its
+    // layout box and handles input, but nothing is visible.
+    gpui_platform::application().with_assets(gpui_component_assets::Assets).run(move |cx| {
         gpui_component::init(cx);
         cx.set_app_identity("io.circuitfabric.desktop", "CircuitFabric");
         cx.spawn(async move |cx| {
@@ -14152,6 +15786,9 @@ fn main() {
                     #[cfg(windows)]
                     windows_icon::apply(window)
                         .expect("failed to apply the CircuitFabric Windows window icon");
+
+                    #[cfg(windows)]
+                    pdf_cursors::install(window);
 
                     let view = cx.new(|cx| ControlPlaneView::new(window, cx));
                     cx.observe_keystrokes({

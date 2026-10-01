@@ -39,7 +39,28 @@ The bridge uses the Codex adapter's selected provider. The desktop image input r
 
 `adapters.codex_provider_id`, `adapters.claude_provider_id` and `adapters.dsh_provider_id` independently select providers; an empty binding uses the default. Disabled and missing bindings fail validation. Codex requires Responses, Claude Code requires Anthropic Messages, and DSH uses Chat Completions through its `llm-deepseek` adapter. A service must support that protocol and tool calling. Claude normalizes a trailing `/v1` to avoid duplicate path segments.
 
-Each task creates an isolated process/session from saved configuration. Results show the provider, model and service URL used by that task. Form changes affect the next task. The Codex Start button performs a separate JSON-RPC connection check; restart that process to change its configuration. Claude and DSH use per-task processes rather than a persistent idle server.
+Each task creates an isolated process/session from saved configuration. Results show the provider, model and service URL used by that task. Save form changes before running the next task. The Codex Start button performs a separate JSON-RPC connection check; restart that process to change its configuration. Claude and DSH use per-task processes rather than a persistent idle server.
+
+## 保存操作的范围
+
+「智能体与工具」取消右上角的总保存按钮，各配置在对应详情页保存：
+
+| 操作 | 保存内容 | 生效时间 |
+| --- | --- | --- |
+| 保存 Provider 列表 | 所有 Provider 的新增、编辑、删除、启停、Vision 配置及默认项 | 下次任务；运行中的服务重启后 |
+| 保存 Codex 配置 | Codex 命令、工作目录和 Provider 关联 | 下次任务；连接检查进程重启后 |
+| 保存 Claude Code / DSH 配置 | 对应运行时的命令和 Provider 关联 | 下次任务 |
+| EDA 服务：保存 Bridge 地址 | 此服务的监听地址 | 下次启动；运行中需重启 |
+| 技能 / MCP：导入、保存定义、启停、删除 | 技能与 MCP 定义 | 即时保存；取消当前任务，新任务使用新配置 |
+| 授权 / 撤销 | 选定的全局或项目作用域授权 | 即时保存，现有任务请求取消 |
+| Jev 弹窗：保存后端 / 密钥 | 判断后端配置 / 加密保险库中的对应变量 | 后端用于下次调用；密钥由保险库独立保存 |
+| 全局设置：保存全局设置 | 外观、语言、数据目录、密钥来源和日志级别 | 独立保存；主题、语言、密钥来源和日志级别的切换即时保存 |
+
+Provider 和各运行时详情展示是否存在未保存修改。切换页面、Provider 或运行时保留草稿，退出应用不保留未保存草稿。启动、连接测试、发起任务和文档判断不会代替保存；执行读取已保存配置（首次未配置时采用默认配置）。新增 Provider 必须先保存，才能保存引用它的运行时配置。Codex 显示当前进程使用的 Provider 快照和下次启动使用的配置；Bridge 监测和测试使用当前服务地址，未运行时使用已保存地址。
+
+每次局部保存先读取最新配置，只替换对应部分，再校验并原子写入。其他页面的草稿不会被顺带提交；读写或校验失败不会更新已保存快照，Jev 保存失败会保留弹窗及草稿供修正或重试。
+
+2026-10-01 本地验证：`cargo test -p circuitfabric-desktop --bin circuitfabric-desktop settings_persistence` 的 5 项测试通过，覆盖跨页面局部保存、连续保存后重新加载、其他页面无效草稿隔离、无效 Provider 引用及读写失败保护；`cargo check -p circuitfabric-desktop --features native-ui` 和 `cargo build -p circuitfabric-desktop --features native-ui` 通过。本次尚未进行原生界面逐项点击验收或外部运行时真实调用，不作为整项运行时功能验收完成的证据。
 
 ## Skills and MCP definitions
 
@@ -48,6 +69,8 @@ Import a directory containing SKILL.md or its full file path. The directory name
 MCP currently supports local stdio servers. Configure an executable, a JSON array of arguments and names of inherited environment variables. Save and authorize the definition before testing the connection. The test performs real initialize and tools/list requests; runtime tasks use native MCP clients to call tools.
 
 One server ships with the application: `typesafe-jev`, the TypeSafe Jev `evaluate` server built from `vendor/typesafe-mcp` (see `native/README.md`). Its catalog entry is added automatically when the bundled binary is present; it follows the same rules as any other server — explicit authorization and a `TYPESAFE_API_KEY` value from the vault or launch environment are still required before agents can call it.
+
+The Jev settings page can also switch this same server to an embedded Rust LLM adapter. Configure a Chat Completions-compatible base URL, model and key variable (DeepSeek/z.ai presets provided), then save the backend and its key. It supports probabilities/discrete answers, JSON Object/JSON Schema/prompted JSON, normalization, timeouts and malformed-output retries. The adapter retains the `evaluate` contract used by agents and datasheet review, and labels its estimates as uncalibrated. See [configuration and protocol details](llm-judgments.md).
 
 ```json
 {
