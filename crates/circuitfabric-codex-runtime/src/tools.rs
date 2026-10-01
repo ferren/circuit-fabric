@@ -19,6 +19,9 @@ pub struct ToolCatalog {
     pub skills: Vec<SkillDefinition>,
     #[serde(default)]
     pub mcp_servers: Vec<McpServerDefinition>,
+    /// Saved non-secret LLM judgment form, retained when switching to `TypeSafe`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_judge: Option<crate::judge::LlmJudgeSettings>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -130,6 +133,9 @@ impl ToolCatalog {
     /// # Errors
     /// Rejects duplicate/invalid identifiers, empty commands and literal credentials.
     pub fn validate(&self) -> Result<(), RuntimeError> {
+        if let Some(settings) = &self.llm_judge {
+            settings.validate()?;
+        }
         for ids in [
             self.skills.iter().map(|x| &x.id).collect::<Vec<_>>(),
             self.mcp_servers.iter().map(|x| &x.id).collect(),
@@ -149,6 +155,16 @@ impl ToolCatalog {
                 || server.environment_variables.iter().any(|x| !valid_env_name(x))
             {
                 return Err(invalid("MCP 需要启动命令与合法的环境变量名"));
+            }
+            if server.args.first().is_some_and(|arg| arg == crate::judge::MCP_FLAG) {
+                let settings = crate::judge::LlmJudgeSettings::from_server(server)
+                    .ok_or_else(|| invalid("LLM 判断工具配置无效"))?;
+                settings.validate()?;
+                if server.args.len() != 2
+                    || server.environment_variables != [settings.api_key_environment_variable]
+                {
+                    return Err(invalid("LLM 判断工具只允许注入配置指定的密钥变量"));
+                }
             }
         }
         Ok(())
@@ -503,6 +519,22 @@ mod tests {
                 })
                 .is_err()
         );
+    }
+    #[test]
+    fn llm_settings_survive_native_switch_and_validate_secret_whitelist() {
+        let settings = crate::judge::LlmJudgeSettings::default();
+        let mut catalog = ToolCatalog {
+            llm_judge: Some(settings.clone()),
+            mcp_servers: vec![settings.server(Path::new("app.exe"), true).unwrap()],
+            ..Default::default()
+        };
+        catalog.validate().unwrap();
+        catalog.mcp_servers[0].environment_variables.push("UNRELATED_SECRET".into());
+        assert!(catalog.validate().is_err());
+        catalog.mcp_servers.clear();
+        let restored: ToolCatalog =
+            serde_json::from_str(&serde_json::to_string(&catalog).unwrap()).unwrap();
+        assert_eq!(restored.llm_judge, Some(settings));
     }
     #[test]
     #[ignore = "requires scripts/build-typesafe-mcp.ps1 output and TYPESAFE_API_KEY in the environment"]
