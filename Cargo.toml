@@ -41,7 +41,8 @@ circuitfabric-store = { path = "crates/circuitfabric-store" }
 jlcircuit-eda-bridge = { path = "plugins/jlcircuit-eda-bridge" }
 calamine = "0.26"
 dunce = "1.0"
-pdf-extract = "0.7"
+# Route parser diagnostics through `log` instead of printing to stdout.
+pdf-extract = "0.10"
 pdfium-render = "0.8"
 pulldown-cmark = { version = "0.12", default-features = false }
 roxmltree = "0.20"

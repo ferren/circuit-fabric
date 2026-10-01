@@ -37,6 +37,7 @@ pub mod datasheet;
 mod excel;
 mod markdown;
 mod pdf;
+mod pdf_navigation;
 mod word;
 
 pub use datasheet::{
@@ -48,7 +49,11 @@ pub use excel::ExcelOpener;
 pub use markdown::MarkdownOpener;
 pub use pdf::PdfOpener;
 #[cfg(feature = "raster-pdf")]
-pub use pdf::{pdf_page_sizes, render_pdf_pages};
+pub use pdf::{
+    pdf_highlight_regions, pdf_locate_highlight, pdf_page_sizes, render_pdf_pages,
+    render_pdf_pages_at_width,
+};
+pub use pdf_navigation::{PdfHighlightRect, pdf_text_highlight_ranges};
 pub use word::WordOpener;
 
 /// Truncates view text to the protocol's per-fragment cap.

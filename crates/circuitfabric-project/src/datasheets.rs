@@ -119,7 +119,10 @@ impl crate::ProjectStorage {
         }
     }
 
-    fn datasheet_extraction_path(&self, document_id: &str) -> Result<PathBuf, ProjectStorageError> {
+    pub(crate) fn datasheet_extraction_path(
+        &self,
+        document_id: &str,
+    ) -> Result<PathBuf, ProjectStorageError> {
         let valid = !document_id.is_empty()
             && document_id.len() <= 64
             && document_id

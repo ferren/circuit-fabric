@@ -83,7 +83,47 @@ pub fn render_pdf_pages(
     data: &[u8],
     numbers: &[u32],
 ) -> Option<Result<Vec<circuitfabric_plugin_api::DocumentRasterPage>, String>> {
-    raster::with_pdfium(|pdfium| raster::render_numbers(pdfium, data, numbers))
+    render_pdf_pages_at_width(data, numbers, 900)
+}
+
+/// Re-renders PDF vectors and text at the requested physical pixel width. Page aspect
+/// ratio is preserved; dimensions are bounded to 8192 pixels and 24 million pixels per
+/// page. Hosts should request only visible pages at large sizes. `None` means no pdfium.
+#[cfg(feature = "raster-pdf")]
+#[must_use]
+pub fn render_pdf_pages_at_width(
+    data: &[u8],
+    numbers: &[u32],
+    width: u32,
+) -> Option<Result<Vec<circuitfabric_plugin_api::DocumentRasterPage>, String>> {
+    raster::with_pdfium(|pdfium| raster::render_numbers(pdfium, data, numbers, width))
+}
+
+/// Locate matching text on a page without rendering another bitmap. Coordinates follow
+/// the same page rotation and dimensions as the preview renderer. `None` means pdfium
+/// is unavailable; a successful empty result means the page has no matching text layer.
+#[cfg(feature = "raster-pdf")]
+#[must_use]
+pub fn pdf_highlight_regions(
+    data: &[u8],
+    number: u32,
+    terms: &[String],
+) -> Option<Result<Vec<crate::PdfHighlightRect>, String>> {
+    raster::with_pdfium(|pdfium| raster::highlight_regions(pdfium, data, number, terms))
+}
+
+/// Locates the search terms starting from a preferred page and highlights them there; when
+/// that page's text layer does not contain the terms, nearby and then remaining pages are
+/// tried, and the page the terms were actually found on is returned. `None` when pdfium is
+/// unavailable; a successful result with empty regions means no page matched.
+#[cfg(feature = "raster-pdf")]
+#[must_use]
+pub fn pdf_locate_highlight(
+    data: &[u8],
+    preferred: u32,
+    terms: &[String],
+) -> Option<Result<(u32, Vec<crate::PdfHighlightRect>), String>> {
+    raster::with_pdfium(|pdfium| raster::locate_highlight(pdfium, data, preferred, terms))
 }
 
 /// Positioned text lines for the datasheet extractor; `None` when pdfium is unavailable.
@@ -113,8 +153,6 @@ mod raster {
 
     /// Target bitmap width; the preview pane shows pages around this resolution.
     const TARGET_WIDTH: i32 = 900;
-    /// Guard against pathological page aspect ratios producing enormous bitmaps.
-    const MAX_HEIGHT: i32 = 3200;
     /// Pages rasterized by `open`, so the first screen appears quickly; hosts render the
     /// rest on demand with `render_pdf_pages`.
     const INITIAL_RASTER_PAGES: usize = 2;
@@ -295,6 +333,7 @@ mod raster {
         pdfium: &Pdfium,
         data: &[u8],
         numbers: &[u32],
+        width: u32,
     ) -> Result<Vec<DocumentRasterPage>, String> {
         let document = pdfium
             .load_pdf_from_byte_slice(data, None)
@@ -308,22 +347,162 @@ mod raster {
                     .and_then(|index| u16::try_from(index).ok())
                     .ok_or_else(|| format!("page {number} does not exist"))?;
                 let page = pages.get(index).map_err(|_| format!("page {number} does not exist"))?;
-                render_page(&page, usize::from(index))
+                render_page_at_width(&page, usize::from(index), width)
             })
             .collect()
     }
 
-    // The casts below are provably safe: the target width is a small constant and the
-    // height is rounded and clamped to [1, MAX_HEIGHT] before converting.
-    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    pub(super) fn highlight_regions(
+        pdfium: &Pdfium,
+        data: &[u8],
+        number: u32,
+        terms: &[String],
+    ) -> Result<Vec<crate::PdfHighlightRect>, String> {
+        let document = pdfium.load_pdf_from_byte_slice(data, None).map_err(|e| e.to_string())?;
+        let index = number
+            .checked_sub(1)
+            .and_then(|index| u16::try_from(index).ok())
+            .ok_or_else(|| format!("page {number} does not exist"))?;
+        let page = document.pages().get(index).map_err(|e| e.to_string())?;
+        regions_on_page(&page, terms)
+    }
+
+    /// Locates the terms near a preferred page first, then across the whole document, so a
+    /// page-number disagreement between the text extractor that indexed the document and
+    /// pdfium's own pagination cannot leave the hit unhighlighted. Returns the page the
+    /// regions were found on; empty regions mean no page's text layer matched.
+    pub(super) fn locate_highlight(
+        pdfium: &Pdfium,
+        data: &[u8],
+        preferred: u32,
+        terms: &[String],
+    ) -> Result<(u32, Vec<crate::PdfHighlightRect>), String> {
+        const SCAN_RADIUS: u32 = 3;
+        const MAX_SCANNED_PAGES: u32 = 300;
+        let document = pdfium.load_pdf_from_byte_slice(data, None).map_err(|e| e.to_string())?;
+        let count = u32::from(document.pages().len());
+        if count == 0 {
+            return Ok((preferred, Vec::new()));
+        }
+        let page_at = |number: u32| -> Option<PdfPage<'_>> {
+            number
+                .checked_sub(1)
+                .and_then(|index| u16::try_from(index).ok())
+                .filter(|_| number <= count)
+                .and_then(|index| document.pages().get(index).ok())
+        };
+        let mut order: Vec<u32> = Vec::new();
+        let push = |number: u32, order: &mut Vec<u32>| {
+            if (1..=count).contains(&number) && !order.contains(&number) {
+                order.push(number);
+            }
+        };
+        push(preferred, &mut order);
+        for offset in 1..=SCAN_RADIUS {
+            push(preferred.saturating_add(offset), &mut order);
+            push(preferred.saturating_sub(offset).max(1), &mut order);
+        }
+        for number in 1..=count.min(MAX_SCANNED_PAGES) {
+            push(number, &mut order);
+        }
+        for number in order {
+            let Some(page) = page_at(number) else { continue };
+            let regions = regions_on_page(&page, terms)?;
+            if !regions.is_empty() {
+                return Ok((number, regions));
+            }
+        }
+        Ok((preferred.clamp(1, count), Vec::new()))
+    }
+
+    fn regions_on_page(
+        page: &PdfPage<'_>,
+        terms: &[String],
+    ) -> Result<Vec<crate::PdfHighlightRect>, String> {
+        let text = page.text().map_err(|e| e.to_string())?;
+        let mut source = String::new();
+        let mut chars = Vec::new();
+        for character in text.chars().iter() {
+            if let Some(ch) = character.unicode_char() {
+                let start = source.len();
+                source.push(ch);
+                chars.push((start..source.len(), character.index()));
+            }
+        }
+        let (width, height) = preview_dimensions(page);
+        let config = pdfium_render::prelude::PdfRenderConfig::new()
+            .set_target_width(width)
+            .set_target_height(height);
+        let mut regions = Vec::new();
+        for range in crate::pdf_text_highlight_ranges(&source, terms).iter().take(200) {
+            let mut matching = chars
+                .iter()
+                .filter(|(bytes, _)| bytes.start < range.end && bytes.end > range.start);
+            let Some((_, first)) = matching.next() else { continue };
+            let last = matching.next_back().map_or(*first, |(_, index)| *index);
+            for segment in text.segments_subset(*first, last - *first + 1).iter() {
+                let bounds = segment.bounds();
+                let corners = [
+                    (bounds.left(), bounds.top()),
+                    (bounds.right(), bounds.top()),
+                    (bounds.left(), bounds.bottom()),
+                    (bounds.right(), bounds.bottom()),
+                ]
+                .into_iter()
+                .map(|(x, y)| page.points_to_pixels(x, y, &config))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+                #[allow(clippy::cast_precision_loss)]
+                let region = {
+                    let left = corners.iter().map(|(x, _)| *x).min().unwrap_or(0).max(0) as f32
+                        / width as f32;
+                    let top = corners.iter().map(|(_, y)| *y).min().unwrap_or(0).max(0) as f32
+                        / height as f32;
+                    let right = corners.iter().map(|(x, _)| *x).max().unwrap_or(0).min(width)
+                        as f32
+                        / width as f32;
+                    let bottom = corners.iter().map(|(_, y)| *y).max().unwrap_or(0).min(height)
+                        as f32
+                        / height as f32;
+                    crate::PdfHighlightRect { left, top, width: right - left, height: bottom - top }
+                };
+                if region.width > 0. && region.height > 0. && !regions.contains(&region) {
+                    regions.push(region);
+                }
+            }
+        }
+        Ok(regions)
+    }
+
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+    fn preview_dimensions(page: &PdfPage<'_>) -> (i32, i32) {
+        raster_dimensions(page.width().value, page.height().value, 900)
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    pub(super) fn raster_dimensions(width: f32, height: f32, requested_width: u32) -> (i32, i32) {
+        let width = f64::from(width).max(1.0);
+        let height = f64::from(height).max(1.0);
+        let scale = (f64::from(requested_width.max(1)) / width)
+            .min(8192.0 / width)
+            .min(8192.0 / height)
+            .min((24_000_000.0 / (width * height)).sqrt());
+        ((width * scale).floor().max(1.0) as i32, (height * scale).floor().max(1.0) as i32)
+    }
+
     fn render_page(page: &PdfPage<'_>, index: usize) -> Result<DocumentRasterPage, String> {
-        let width_points = page.width().value.max(1.0);
-        let height_points = page.height().value.max(1.0);
-        let scale = TARGET_WIDTH as f32 / width_points;
-        let target_height =
-            (height_points * scale).round().clamp(1.0, MAX_HEIGHT as f32).max(1.0) as i32;
+        render_page_at_width(page, index, u32::try_from(TARGET_WIDTH).unwrap_or(900))
+    }
+
+    fn render_page_at_width(
+        page: &PdfPage<'_>,
+        index: usize,
+        requested_width: u32,
+    ) -> Result<DocumentRasterPage, String> {
+        let (width, height) =
+            raster_dimensions(page.width().value, page.height().value, requested_width);
         let bitmap = page
-            .render(TARGET_WIDTH, target_height, None)
+            .render(width, height, None)
             .map_err(|error| format!("page {} could not be rendered: {error}", index + 1))?;
         let width = u32::try_from(bitmap.width()).unwrap_or(u32::MAX);
         let height = u32::try_from(bitmap.height()).unwrap_or(u32::MAX);
@@ -382,6 +561,44 @@ mod tests {
 
     #[cfg(feature = "raster-pdf")]
     #[test]
+    fn requested_resolution_preserves_aspect_and_bounds_memory() {
+        assert_eq!(raster::raster_dimensions(612.0, 792.0, 1800).0, 1800);
+        assert_eq!(raster::raster_dimensions(612.0, 792.0, 900).0, 900);
+        for (page_width, page_height) in [(612.0, 792.0), (792.0, 612.0), (10.0, 10000.0)] {
+            let (width, height) = raster::raster_dimensions(page_width, page_height, u32::MAX);
+            assert!((1..=8192).contains(&width) && (1..=8192).contains(&height));
+            assert!(i64::from(width) * i64::from(height) <= 24_000_000);
+        }
+    }
+
+    #[cfg(feature = "raster-pdf")]
+    #[test]
+    fn zoom_rerenders_the_pdf_at_a_higher_pixel_density() {
+        if !raster::pdfium_available() {
+            assert!(
+                std::env::var_os("CIRCUITFABRIC_PDFIUM_PATH").is_none(),
+                "configured pdfium failed to load"
+            );
+            eprintln!("pdfium unavailable; skipping raster resolution test");
+            return;
+        }
+        let bytes = testing::minimal_pdf(&["VIN supply input", "VOUT output"]);
+        let low = render_pdf_pages(&bytes, &[1]).unwrap().unwrap().remove(0);
+        let high = render_pdf_pages_at_width(&bytes, &[1], 1800).unwrap().unwrap().remove(0);
+        assert_eq!(high.width, low.width * 2);
+        assert!((i64::from(high.height) - i64::from(low.height) * 2).abs() <= 1);
+        assert_eq!(high.rgba.len(), high.width as usize * high.height as usize * 4);
+        // Newly rasterized glyph edges have subpixel detail inside a low-resolution
+        // pixel's 2x2 footprint; simply enlarging the old bitmap cannot produce it.
+        let stride = high.width as usize * 4;
+        assert!(high.rgba.chunks_exact(stride * 2).any(|rows| {
+            (0..stride).step_by(8).any(|x| rows[x] != rows[x + 4] || rows[x] != rows[stride + x])
+        }));
+        assert!(render_pdf_pages_at_width(&bytes, &[0], 1800).unwrap().is_err());
+    }
+
+    #[cfg(feature = "raster-pdf")]
+    #[test]
     fn when_pdfium_is_available_pages_are_rasterized() {
         if !raster::pdfium_available() {
             eprintln!("pdfium library not located; running the text-fallback path only");
@@ -400,6 +617,35 @@ mod tests {
         };
         assert_eq!(pages.len(), 1);
         assert!(!pages[0].rgba.is_empty());
+    }
+
+    #[cfg(feature = "raster-pdf")]
+    #[test]
+    fn locate_highlight_recovers_when_the_preferred_page_drifts() {
+        if !raster::pdfium_available() {
+            eprintln!("pdfium library not located; running nothing for this test");
+            return;
+        }
+        let bytes = testing::minimal_pdf(&["LM317 voltage regulator"]);
+        let terms = vec!["voltage".to_owned(), "regulator".to_owned()];
+
+        // The hit's page number claims page 7 of a one-page document — the drift case
+        // between the indexing extractor and pdfium. The scan must find page 1 and
+        // highlight the keywords there.
+        let Some(Ok((page, regions))) = pdf_locate_highlight(&bytes, 7, &terms) else {
+            panic!("pdfium is available, so locate must return a result");
+        };
+        assert_eq!(page, 1, "the scan falls back to the page holding the text");
+        assert!(!regions.is_empty(), "keywords must be highlighted on the found page");
+
+        // Terms that appear on no page come back anchored to the preferred page, empty.
+        let Some(Ok((page, regions))) =
+            pdf_locate_highlight(&bytes, 1, &["nonexistent".to_owned()])
+        else {
+            panic!("pdfium is available, so locate must return a result");
+        };
+        assert_eq!(page, 1);
+        assert!(regions.is_empty());
     }
 
     #[cfg(feature = "raster-pdf")]
@@ -464,6 +710,55 @@ mod tests {
         };
         let joined: String = pages.iter().map(|page| page.text.as_str()).collect();
         assert!(joined.contains("1uF"), "extracted: {joined:?}");
+    }
+
+    #[cfg(feature = "raster-pdf")]
+    #[test]
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn highlight_rectangles_cover_text_pixels_in_normal_and_rotated_pages() {
+        use pdfium_render::prelude::PdfPageRenderRotation;
+        if !raster::pdfium_available() {
+            return;
+        }
+        let original = testing::minimal_pdf(&["VIN supply input", "VOUT output", "VIN repeated"]);
+        for rotated in [false, true] {
+            let bytes = if rotated {
+                raster::with_pdfium(|pdfium| {
+                    let doc = pdfium.load_pdf_from_byte_slice(&original, None).unwrap();
+                    doc.pages().get(0).unwrap().set_rotation(PdfPageRenderRotation::Degrees90);
+                    doc.save_to_bytes().unwrap()
+                })
+                .unwrap()
+            } else {
+                original.clone()
+            };
+            let regions = pdf_highlight_regions(&bytes, 1, &["vin".to_owned()]).unwrap().unwrap();
+            assert_eq!(regions.len(), 2);
+            for requested_width in [900, 2700] {
+                let pages =
+                    render_pdf_pages_at_width(&bytes, &[1], requested_width).unwrap().unwrap();
+                let bitmap = &pages[0];
+                for region in &regions {
+                    assert!(region.left >= 0. && region.top >= 0.);
+                    assert!(
+                        region.left + region.width <= 1.001 && region.top + region.height <= 1.001
+                    );
+                    let x1 = (region.left * bitmap.width as f32).floor() as usize;
+                    let x2 = ((region.left + region.width) * bitmap.width as f32).ceil() as usize;
+                    let y1 = (region.top * bitmap.height as f32).floor() as usize;
+                    let y2 = ((region.top + region.height) * bitmap.height as f32).ceil() as usize;
+                    let dark = (y1..y2.min(bitmap.height as usize)).any(|y| {
+                        (x1..x2.min(bitmap.width as usize))
+                            .any(|x| bitmap.rgba[(y * bitmap.width as usize + x) * 4] < 128)
+                    });
+                    assert!(dark, "highlight misses glyphs, rotated={rotated}: {region:?}");
+                }
+            }
+            assert!(
+                pdf_highlight_regions(&bytes, 1, &["absent".into()]).unwrap().unwrap().is_empty()
+            );
+            assert!(pdf_highlight_regions(&bytes, 0, &["VIN".into()]).unwrap().is_err());
+        }
     }
 
     #[test]

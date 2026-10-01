@@ -239,10 +239,9 @@ impl crate::ProjectStorage {
     /// The bytes are hashed with SHA-256 and stored with a content-addressed file name.
     /// `directory_id: None` targets the category's built-in directory; `Some(id)` must name an
     /// existing directory record (see [`crate::ProjectStorage::create_document_directory`]).
-    /// Re-importing the same source file is idempotent: the existing record is returned with
-    /// `created: false` and no new record appears. Distinct sources with identical content
-    /// share a managed copy while it lives in the same directory, and each keeps its own
-    /// source locator and authorization.
+    /// Identical content is listed once per project: re-importing the same bytes — from the
+    /// same or a different source — returns the existing record with `created: false` and no
+    /// new record appears.
     ///
     /// # Errors
     ///
@@ -275,28 +274,22 @@ impl crate::ProjectStorage {
 
         let mut index = self.load_document_index()?;
         let target = crate::directories::resolve_import_target(&index, category, directory_id)?;
-        if let Some(existing) = index.documents.iter().find(|document| {
-            document.content_hash == content_hash
-                && (document.source_locator == source_locator
-                    || sources_match(&document.source_locator, source))
-        }) {
+        // Content-addressed identity: one project lists identical content exactly once.
+        // Re-importing the same bytes — whatever the source path — returns the existing
+        // record instead of adding another entry.
+        if let Some(existing) =
+            index.documents.iter().find(|document| document.content_hash == content_hash)
+        {
             self.verify_managed_copy(&existing.relative_path, &content_hash)?;
             return Ok(DocumentImport { document: existing.clone(), created: false });
         }
-        // Reuse an existing copy only when it already lives in the target directory; a copy in
-        // another directory stays where it is so each directory remains self-contained.
-        let existing_copy = index.documents.iter().find(|document| {
-            document.content_hash == content_hash && document.directory_id == target.directory_id
-        });
-        let relative_path = if let Some(existing) = existing_copy {
-            self.verify_managed_copy(&existing.relative_path, &content_hash)?;
-            existing.relative_path.clone()
-        } else {
+        let relative_path = {
             let path = target
                 .relative_directory
                 .join(format!("{digest}.{}", managed_extension(&original_file_name)));
             let absolute = self.resolve_relative_path(&path)?;
             if absolute.exists() {
+                // An orphaned copy of the same content (its record was removed): adopt it.
                 self.verify_managed_copy(&path, &content_hash)?;
             } else {
                 if let Some(parent) = absolute.parent() {
@@ -422,7 +415,69 @@ impl crate::ProjectStorage {
                 });
             }
         }
+        self.deduplicate_identical_documents(&mut index)?;
         Ok(index)
+    }
+
+    /// Collapses records with identical content hashes into one, so a project lists the
+    /// same bytes exactly once regardless of how many times it was imported.
+    ///
+    /// Older imports created a record per source, which left duplicates like three entries
+    /// for one datasheet. The keeper is the record that carries the most state: an existing
+    /// datasheet extraction first, then an intact managed copy, then the earliest record.
+    /// When duplicates are dropped the deduplicated index is persisted immediately, so the
+    /// cleanup survives restarts; managed copies referenced only by dropped records are left
+    /// in place (content-addressed, harmless) rather than deleted.
+    fn deduplicate_identical_documents(
+        &self,
+        index: &mut DocumentIndex,
+    ) -> Result<(), ProjectStorageError> {
+        let mut distinct_hashes = std::collections::BTreeSet::new();
+        if index
+            .documents
+            .iter()
+            .all(|document| distinct_hashes.insert(document.content_hash.as_str()))
+        {
+            return Ok(());
+        }
+        let candidates_by_hash: std::collections::BTreeMap<&str, Vec<&ProjectDocument>> =
+            index.documents.iter().fold(std::collections::BTreeMap::new(), |mut map, document| {
+                map.entry(document.content_hash.as_str()).or_default().push(document);
+                map
+            });
+        let extraction_for = |document: &ProjectDocument| -> bool {
+            self.datasheet_extraction_path(&document.id).is_ok_and(|path| path.exists())
+        };
+        let copy_intact = |document: &ProjectDocument| -> bool {
+            self.resolve_relative_path(&document.relative_path)
+                .is_ok_and(|absolute| absolute.is_file())
+        };
+        let keeper_ids: Vec<String> = candidates_by_hash
+            .values()
+            .map(|candidates| {
+                candidates
+                    .iter()
+                    .enumerate()
+                    .max_by_key(|(position, candidate)| {
+                        (
+                            extraction_for(candidate),
+                            copy_intact(candidate),
+                            u64::MAX - candidate.imported_at_unix_seconds,
+                            usize::MAX - position,
+                        )
+                    })
+                    .expect("candidate groups are non-empty")
+                    .1
+                    .id
+                    .clone()
+            })
+            .collect();
+        let before = index.documents.len();
+        index.documents.retain(|document| keeper_ids.contains(&document.id));
+        if index.documents.len() != before {
+            self.save_document_index(index)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn save_document_index(
@@ -453,21 +508,6 @@ impl crate::ProjectStorage {
         }
         Ok(())
     }
-}
-
-/// Whether a stored source locator refers to the same origin file being imported now.
-///
-/// Paths are compared exactly first, then via canonicalization so case or separator differences
-/// for one and the same file still match.
-fn sources_match(locator: &str, source: &Path) -> bool {
-    let locator_path = Path::new(locator);
-    if locator_path == source {
-        return true;
-    }
-    matches!(
-        (dunce::canonicalize(locator_path), dunce::canonicalize(source)),
-        (Ok(locator_canonical), Ok(source_canonical)) if locator_canonical == source_canonical
-    )
 }
 
 fn managed_extension(original_file_name: &str) -> String {
@@ -597,7 +637,7 @@ mod tests {
     }
 
     #[test]
-    fn identical_content_from_another_source_keeps_a_distinct_record() {
+    fn identical_content_from_another_source_is_listed_once() {
         let root = test_root("dedupe-other-source");
         let storage =
             ProjectStorage::create(&root, project("dedupe-other-source")).expect("create project");
@@ -614,26 +654,110 @@ mod tests {
         let second = storage
             .import_document(
                 &second_source,
-                DocumentCategory::ReferenceDesign,
+                DocumentCategory::Datasheet,
                 second_source.display().to_string(),
             )
             .expect("second import");
 
         assert!(first.created);
-        assert!(second.created, "a different source is its own document record");
-        // Each category directory stays self-contained: identical content imported into two
-        // categories keeps one copy per directory instead of cross-linking them.
-        assert_ne!(first.document.relative_path, second.document.relative_path);
-        assert!(first.document.relative_path.starts_with("documents/datasheets"));
-        assert!(second.document.relative_path.starts_with("documents/reference-designs"));
-        assert_ne!(first.document.id, second.document.id);
-        assert_eq!(second.document.category, DocumentCategory::ReferenceDesign);
-        assert_eq!(second.document.original_file_name, "b.md");
-        assert_eq!(storage.list_documents().expect("list").len(), 2);
+        assert!(!second.created, "identical content is not re-recorded, whatever its source");
+        assert_eq!(second.document.id, first.document.id);
+        assert_eq!(storage.list_documents().expect("list").len(), 1);
         let datasheets = storage.root().join("documents/datasheets");
         assert_eq!(fs::read_dir(datasheets).expect("list datasheets").count(), 1);
-        let reference_designs = storage.root().join("documents/reference-designs");
-        assert_eq!(fs::read_dir(reference_designs).expect("list reference designs").count(), 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn duplicate_records_for_identical_content_collapse_on_load() {
+        let root = test_root("dedupe-legacy");
+        let storage = ProjectStorage::create(&root, project("dedupe-legacy")).expect("project");
+        let source = write_source(&root, "a.md", "same bytes");
+        let document = storage
+            .import_document(&source, DocumentCategory::Datasheet, source.display().to_string())
+            .expect("import")
+            .document;
+
+        // Forge the legacy duplicate shape: three records, one content hash, one file.
+        let mut duplicated = document.clone();
+        duplicated.id = format!("{}-clone", document.id);
+        let mut tripled = document.clone();
+        tripled.id = format!("{}-clone2", document.id);
+        let index_path = storage.document_index_path();
+        let raw = fs::read_to_string(&index_path).expect("read index");
+        let mut value: serde_json::Value = serde_json::from_str(&raw).expect("parse index");
+        value["documents"].as_array_mut().expect("documents array").extend([
+            serde_json::to_value(&duplicated).expect("serialize clone"),
+            serde_json::to_value(&tripled).expect("serialize clone2"),
+        ]);
+        fs::write(&index_path, serde_json::to_vec_pretty(&value).expect("write index"))
+            .expect("forge duplicates");
+
+        let listed = storage.list_documents().expect("list documents");
+        assert_eq!(listed.len(), 1, "duplicates collapse to one entry");
+        assert_eq!(listed[0].id, document.id, "the earliest intact record is kept");
+
+        // The cleanup is persisted: a fresh open sees the deduplicated index.
+        let reopened = ProjectStorage::open(&root).expect("reopen");
+        assert_eq!(reopened.list_documents().expect("list").len(), 1);
+        let raw = fs::read_to_string(&index_path).expect("read index");
+        assert!(!raw.contains("clone"), "duplicate ids are removed from the index file");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dedupe_keeps_the_record_that_carries_the_extraction() {
+        let root = test_root("dedupe-extraction");
+        let storage = ProjectStorage::create(&root, project("dedupe-extraction")).expect("project");
+        let source = write_source(&root, "a.md", "same bytes");
+        let plain = storage
+            .import_document(&source, DocumentCategory::Datasheet, "first.md".to_owned())
+            .expect("import")
+            .document;
+        let mut extracted = plain.clone();
+        extracted.id = format!("{}-extracted", plain.id);
+        let index_path = storage.document_index_path();
+        let raw = fs::read_to_string(&index_path).expect("read index");
+        let mut value: serde_json::Value = serde_json::from_str(&raw).expect("parse index");
+        value["documents"]
+            .as_array_mut()
+            .expect("documents array")
+            .push(serde_json::to_value(&extracted).expect("serialize duplicate"));
+        fs::write(&index_path, serde_json::to_vec_pretty(&value).expect("write index"))
+            .expect("forge duplicate");
+
+        // Attach the extraction sidecar to the duplicate by writing it directly: the save
+        // API itself loads (and now dedupes) the index, which would drop the duplicate
+        // before its sidecar could influence the keeper choice.
+        let sidecar = circuitfabric_contracts::DatasheetExtraction {
+            schema_version: circuitfabric_contracts::DATASHEET_EXTRACTION_SCHEMA_VERSION,
+            document_id: extracted.id.clone(),
+            content_hash: extracted.content_hash.clone(),
+            extracted_at_unix_seconds: 1,
+            overview: circuitfabric_contracts::DatasheetOverview {
+                title: "kept".to_owned(),
+                ..circuitfabric_contracts::DatasheetOverview::default()
+            },
+            pins: Vec::new(),
+            absolute_maximum_ratings: Vec::new(),
+            electrical_characteristics: Vec::new(),
+            operating_conditions: Vec::new(),
+            notes: Vec::new(),
+        };
+        let sidecar_directory = storage.root().join(".circuitfabric/datasheets");
+        fs::create_dir_all(&sidecar_directory).expect("create sidecar directory");
+        fs::write(
+            sidecar_directory.join(format!("{}.json", extracted.id)),
+            serde_json::to_vec_pretty(&sidecar).expect("serialize sidecar"),
+        )
+        .expect("forge extraction sidecar");
+
+        let listed = storage.list_documents().expect("list documents");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].id, extracted.id,
+            "the duplicate holding the extraction survives, not the first record"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 

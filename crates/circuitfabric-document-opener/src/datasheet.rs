@@ -601,6 +601,37 @@ fn select_category_pages(pages: &[String], category: usize) -> AgentPageSelectio
     });
     AgentPageSelection { text, page_indices, page_numbers, notes }
 }
+/// Locate a saved row's evidence in a verified PDF. Prefer its table category over
+/// an earlier overview quote; existing extractions do not need to be regenerated.
+///
+/// # Errors
+/// Returns an error when the PDF text cannot be read.
+pub fn locate_datasheet_evidence(
+    request: &DocumentOpenerRequest,
+    section: &str,
+    evidence: &str,
+) -> Result<Option<u32>, String> {
+    let pages = pdf_extract::extract_text_from_mem_by_pages(request.managed_copy.data())
+        .map_err(|error| format!("PDF text extraction failed: {error}"))?;
+    let needle = normalize_evidence(evidence);
+    if needle.is_empty() {
+        return Ok(None);
+    }
+    let category =
+        ["pins", "absoluteMaximumRatings", "electricalCharacteristics", "operatingConditions"]
+            .iter()
+            .position(|field| *field == section);
+    let mut preferred = category
+        .map(|category| select_category_pages(&pages, category).page_indices)
+        .unwrap_or_default();
+    preferred.sort_by_key(|&index| std::cmp::Reverse(datasheet_page_score(&pages[index])));
+    Ok(preferred
+        .into_iter()
+        .chain(0..pages.len())
+        .find(|&index| normalize_evidence(&pages[index]).contains(&needle))
+        .and_then(|index| u32::try_from(index + 1).ok()))
+}
+
 #[must_use]
 pub fn extract_datasheet(request: &DocumentOpenerRequest) -> DatasheetExtraction {
     #[cfg(feature = "raster-pdf")]
@@ -1805,6 +1836,22 @@ mod tests {
         )
         .expect("selected pin table should supply Jev context");
         assert_eq!(extraction.pins.len(), 1);
+    }
+
+    #[test]
+    fn source_link_finds_existing_evidence_in_its_table_page() {
+        let bytes = multipage_pdf(&[
+            vec!["Overview quote: 1 VIN Power supply input".to_owned()],
+            vec!["Device features".to_owned()],
+            vec!["Pin Description".to_owned(), "1 VIN Power supply input".to_owned()],
+        ]);
+        let request = crate::testing::request_for("source-links.pdf", &bytes);
+        assert_eq!(
+            locate_datasheet_evidence(&request, "pins", "1 VIN  Power\nsupply input").unwrap(),
+            Some(3)
+        );
+        assert_eq!(locate_datasheet_evidence(&request, "pins", "invented line").unwrap(), None);
+        assert_eq!(locate_datasheet_evidence(&request, "pins", " ").unwrap(), None);
     }
 
     #[test]

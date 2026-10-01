@@ -939,10 +939,23 @@ mod tests {
         let storage = ProjectStorage::create(&root, project("move-doc")).expect("create project");
         let inbox = storage.create_document_directory(None, "inbox").expect("inbox");
         let archive = storage.create_document_directory(None, "archive").expect("archive");
-        // Two records with identical content in the same directory share one managed copy.
+        // Imports dedupe identical content now, so forge the legacy shared-record shape by
+        // hand: two index records pointing at one managed copy. The second record carries a
+        // distinct (hand-written) hash so the load-time dedupe leaves both in place.
         let first = import_markdown(&storage, &root, "a.md", "same bytes", Some(&inbox.id));
-        let second = import_markdown(&storage, &root, "b.md", "same bytes", Some(&inbox.id));
-        assert_eq!(first.relative_path, second.relative_path, "one copy is shared");
+        let mut second = first.clone();
+        second.id = format!("{}-share", first.id);
+        second.content_hash = "sha256:hand-forged-share".to_owned();
+        second.original_file_name = "b.md".to_owned();
+        let index_path = storage.document_index_path();
+        let raw = fs::read_to_string(&index_path).expect("read index");
+        let mut value: serde_json::Value = serde_json::from_str(&raw).expect("parse index");
+        value["documents"]
+            .as_array_mut()
+            .expect("documents array")
+            .push(serde_json::to_value(&second).expect("serialize share"));
+        fs::write(&index_path, serde_json::to_vec_pretty(&value).expect("write index"))
+            .expect("forge shared record");
 
         let moved = storage.move_document(&first.id, Some(&archive.id)).expect("move first record");
 
@@ -951,13 +964,14 @@ mod tests {
         assert!(storage.root().join(&second.relative_path).is_file(), "the shared copy stays");
         assert!(storage.root().join(&moved.relative_path).is_file(), "the moved copy exists");
         storage.read_verified_document_content(&moved).expect("moved copy verifies");
-        let untouched = storage
-            .list_documents()
-            .expect("list")
-            .into_iter()
-            .find(|document| document.id == second.id)
-            .expect("second record");
-        assert!(untouched.relative_path.starts_with("documents/inbox"));
+        assert!(
+            storage
+                .root()
+                .join("documents/inbox")
+                .join(second.relative_path.file_name().expect("file name"))
+                .is_file(),
+            "the remaining record keeps its copy in the inbox"
+        );
         assert!(storage.check_document_consistency().expect("consistency").is_consistent());
         let _ = fs::remove_dir_all(&root);
     }
