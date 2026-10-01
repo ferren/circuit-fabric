@@ -1794,6 +1794,176 @@ fn main() {
                 })
         }
 
+        /// One numbered section card on a runtime-adapter settings page. The step badge gives
+        /// the page a stable, scannable operation order — run, settings, verification for the
+        /// supervised Codex endpoint; settings, verification for the per-task adapters.
+        fn adapter_section_card(step: &'static str, title: &'static str) -> Div {
+            div()
+                .v_flex()
+                .gap_3()
+                .p_4()
+                .rounded_lg()
+                .border_1()
+                .border_color(rgb(BORDER))
+                .bg(rgb(SURFACE_BG))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .size(px(22.))
+                                .flex()
+                                .flex_none()
+                                .items_center()
+                                .justify_center()
+                                .rounded_full()
+                                .bg(rgb(0x000e_7490))
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(CARD_BG))
+                                .child(step),
+                        )
+                        .child(
+                            div()
+                                .text_base()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(TEXT_PRIMARY))
+                                .child(title),
+                        ),
+                )
+        }
+
+        /// Clickable provider binding for one runtime adapter. Chips for every saved provider
+        /// (plus the default fallback) replace typo-prone free-text entry; the raw ID field
+        /// stays beneath for manual override and always shows the exact value in effect.
+        fn render_provider_binding(
+            &self,
+            adapter: RuntimeAdapter,
+            cx: &Context<Self>,
+        ) -> impl IntoElement {
+            let entity = cx.entity().clone();
+            let language = self.language;
+            let provider_state = self.runtime_fields(adapter).1.clone();
+            let current = provider_state.read(cx).value().trim().to_owned();
+            let saved_providers = self.saved_settings.providers.clone();
+            let field_id = match adapter {
+                RuntimeAdapter::CodexAppServer => "codex-provider",
+                RuntimeAdapter::ClaudeCode => "claude-provider",
+                RuntimeAdapter::Dsh => "dsh-provider",
+            };
+            let unknown_binding = !current.is_empty()
+                && saved_providers.iter().all(|provider| provider.id != current);
+
+            let mut chips = div().flex().flex_wrap().gap_2();
+            let default_chooser = entity.clone();
+            let default_selected = current.is_empty();
+            chips = chips.child(
+                div()
+                    .id(format!("bind-default-{}", adapter.backend_id()))
+                    .px_3()
+                    .h(px(28.))
+                    .flex()
+                    .items_center()
+                    .rounded_full()
+                    .cursor_pointer()
+                    .text_xs()
+                    .border_1()
+                    .border_color(rgb(if default_selected { 0x000e_7490 } else { BORDER }))
+                    .when(default_selected, |this| {
+                        this.bg(rgb(0x000e_7490))
+                            .text_color(rgb(CARD_BG))
+                            .font_weight(FontWeight::SEMIBOLD)
+                    })
+                    .when(!default_selected, |this| {
+                        this.bg(rgb(CARD_BG)).text_color(rgb(TEXT_SECONDARY))
+                    })
+                    .on_click(move |_, window, cx| {
+                        default_chooser.update(cx, |view, cx| {
+                            let (_, state) = view.runtime_fields(adapter);
+                            state.update(cx, |state, cx| state.set_value("", window, cx));
+                            cx.notify();
+                        });
+                    })
+                    .child(language.choose("默认 Provider", "Default provider")),
+            );
+            for provider in saved_providers {
+                let chooser = entity.clone();
+                let selected = current == provider.id;
+                let label = if provider.enabled {
+                    format!("{} · {}", provider.id, provider.model)
+                } else {
+                    format!(
+                        "{} · {}{}",
+                        provider.id,
+                        provider.model,
+                        language.choose("（已停用）", " (disabled)")
+                    )
+                };
+                chips = chips.child(
+                    div()
+                        .id(format!("bind-{}-{}", adapter.backend_id(), provider.id))
+                        .px_3()
+                        .h(px(28.))
+                        .flex()
+                        .items_center()
+                        .rounded_full()
+                        .cursor_pointer()
+                        .text_xs()
+                        .border_1()
+                        .border_color(rgb(if selected { 0x000e_7490 } else { BORDER }))
+                        .when(selected, |this| {
+                            this.bg(rgb(0x000e_7490))
+                                .text_color(rgb(CARD_BG))
+                                .font_weight(FontWeight::SEMIBOLD)
+                        })
+                        .when(!selected, |this| {
+                            this.bg(rgb(CARD_BG)).text_color(rgb(TEXT_SECONDARY))
+                        })
+                        .on_click(move |_, window, cx| {
+                            let id = provider.id.clone();
+                            chooser.update(cx, |view, cx| {
+                                let (_, state) = view.runtime_fields(adapter);
+                                state.update(cx, |state, cx| state.set_value(id, window, cx));
+                                cx.notify();
+                            });
+                        })
+                        .child(label),
+                );
+            }
+
+            div()
+                .v_flex()
+                .gap_1()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(language.choose("Provider 关联", "Provider binding")),
+                )
+                .child(chips)
+                .child(Self::labeled_field(
+                    language.choose(
+                        "Provider ID（点选上方或手动填写，留空使用默认项）",
+                        "Provider ID (pick above or type; empty uses the default)",
+                    ),
+                    field_id,
+                    None,
+                    &provider_state,
+                ))
+                .when(unknown_binding, |this| {
+                    this.child(
+                        div().text_xs().text_color(rgb(0x00b4_5309)).child(
+                            language.choose(
+                                "此 ID 不在已保存的 Provider 列表中；请先在 Provider 详情中保存。",
+                                "This ID is not among the saved providers; save it in provider details first.",
+                            ),
+                        ),
+                    )
+                })
+        }
+
         fn save_bridge_settings(&mut self, cx: &mut Context<Self>) {
             let update = crate::settings_persistence::SettingsUpdate::Bridge {
                 listen_address: self.bridge_address.read(cx).value().trim().to_owned(),
@@ -5126,6 +5296,14 @@ fn main() {
                     )
                     .to_owned(),
             };
+            let active_provider_note = self
+                .codex_active_provider
+                .clone()
+                .map(|provider| {
+                    format!("｜{}{provider}", language.choose("当前进程：", "current process: "))
+                })
+                .unwrap_or_default();
+            let codex_dirty = self.runtime_dirty(RuntimeAdapter::CodexAppServer, cx);
             div()
                 .flex_1()
                 .min_w(px(0.))
@@ -5182,100 +5360,121 @@ fn main() {
                         ),
                 )
                 .child(
-                    div()
-                        .v_flex()
-                        .gap_2()
-                        .p_4()
-                        .rounded_lg()
-                        .border_1()
-                        .border_color(rgb(BORDER))
-                        .bg(rgb(SURFACE_BG))
-                        .child(
-                            div()
-                                .flex()
-                                .gap_2()
-                                .child(
-                                    Button::new("start-codex-runtime")
-                                        .primary()
-                                        .disabled(is_running || is_starting)
-                                        .label(language.choose("启动", "Start"))
-                                        .on_click(move |_, window, cx| {
-                                            starter.update(cx, |view, cx| {
-                                                view.start_codex_runtime(window, cx);
-                                            });
-                                        }),
-                                )
-                                .child(
-                                    Button::new("stop-codex-runtime")
-                                        .disabled(!is_running && self.task_cancel.is_none())
-                                        .label(language.choose("停止", "Stop"))
-                                        .on_click(move |_, _, cx| {
-                                            stopper.update(cx, ControlPlaneView::stop_codex_runtime);
-                                        }),
-                                ),
-                        )
-                        .child(
-                            div().text_xs().text_color(rgb(TEXT_SECONDARY)).child(format!(
-                                "{}{}",
+                    Self::adapter_section_card(
+                        "1",
+                        language.choose("运行 · 启动与停止", "Run · start and stop"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                Button::new("start-codex-runtime")
+                                    .primary()
+                                    .disabled(is_running || is_starting)
+                                    .label(language.choose("启动", "Start"))
+                                    .on_click(move |_, window, cx| {
+                                        starter.update(cx, |view, cx| {
+                                            view.start_codex_runtime(window, cx);
+                                        });
+                                    }),
+                            )
+                            .child(
+                                Button::new("stop-codex-runtime")
+                                    .disabled(!is_running && self.task_cancel.is_none())
+                                    .label(language.choose("停止", "Stop"))
+                                    .on_click(move |_, _, cx| {
+                                        stopper.update(
+                                            cx,
+                                            ControlPlaneView::stop_codex_runtime,
+                                        );
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(TEXT_SECONDARY))
+                            .child(format!(
+                                "{}{}{active_provider_note}",
                                 language.choose(
-                                    "下次启动使用 Provider：",
+                                    "下次启动 Provider：",
                                     "Next launch provider: "
                                 ),
                                 launch_provider_summary,
                             )),
-                        )
-                        .when_some(self.codex_active_provider.clone(), |this, provider| {
-                            this.child(div().text_xs().text_color(rgb(TEXT_SECONDARY)).child(format!(
-                                "{}{}", language.choose("当前进程使用：", "Current process uses: "), provider
-                            )))
-                        })
-                        .child(
-                            div().text_xs().text_color(rgb(TEXT_MUTED)).child(
-                                language.choose(
-                                    "启动读取已保存配置；退出应用时清理子进程。此处保存 Codex 命令、工作目录及 Provider 关联；运行中的连接检查进程需重启，新任务使用新配置。Provider 的模型与地址请在其详情中保存。",
-                                    "Start reads saved configuration; child processes end with the app. Save here updates the Codex command, working directory and provider binding. Restart a running connection-check process; new tasks use the new configuration. Save provider models and URLs in provider details.",
-                                ),
+                    )
+                    .child(
+                        div().text_xs().text_color(rgb(TEXT_MUTED)).child(
+                            language.choose(
+                                "启动与停止读取下方「设置」中已保存的配置；停止只终止进程，不修改设置；退出应用时清理子进程。",
+                                "Start and stop read the configuration saved in Settings below; stop terminates the process without changing settings; child processes are cleaned up when the app exits.",
                             ),
                         ),
+                    ),
                 )
                 .child(
-                    div()
-                        .v_flex()
-                        .gap_3()
-                        .child(Self::labeled_field(
-                            language.choose("Codex 命令", "Codex command"),
-                            "codex-command",
-                            None,
-                            &self.command,
-                        ))
-                        .child(Self::labeled_field(
-                            language.choose("工作目录", "Working directory"),
-                            "working-directory",
-                            None,
-                            &self.working_directory,
-                        ))
-                        .child(
-                            div().text_xs().text_color(rgb(TEXT_MUTED)).child(
-                                language.choose(
-                                    "JLC bridge 监听地址属于 EDA 侧服务，在「EDA 服务」页配置。",
-                                    "The JLC bridge listen address belongs to the EDA side and is configured on the EDA services page.",
-                                ),
+                    Self::adapter_section_card(
+                        "2",
+                        language.choose(
+                            "设置 · 命令、目录与 Provider 关联",
+                            "Settings · command, directory, provider binding",
+                        ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap_3()
+                            .child(Self::labeled_field(
+                                language.choose("Codex 命令", "Codex command"),
+                                "codex-command",
+                                None,
+                                &self.command,
+                            ))
+                            .child(Self::labeled_field(
+                                language.choose("工作目录", "Working directory"),
+                                "working-directory",
+                                None,
+                                &self.working_directory,
+                            )),
+                    )
+                    .child(self.render_provider_binding(RuntimeAdapter::CodexAppServer, cx))
+                    .child(
+                        div().text_xs().text_color(rgb(TEXT_MUTED)).child(
+                            language.choose(
+                                "保存范围：Codex 命令、工作目录与 Provider 关联。Provider 的模型与地址在 Provider 详情中保存；API Key 变量名也在 Provider 中配置，密钥值由密钥保险库或进程环境提供。JLC bridge 地址在「EDA 服务」页配置。",
+                                "Save scope: the Codex command, working directory, and provider binding. Provider models and URLs are saved in provider details; API key variable names are configured there too, with values supplied by the secrets vault or the process environment. The JLC bridge address is configured on the EDA services page.",
                             ),
                         ),
+                    )
+                    .child(Self::save_state_note(codex_dirty, language))
+                    .child(
+                        Button::new("save-codex-settings")
+                            .primary()
+                            .label(language.choose("保存 Codex 配置", "Save Codex configuration"))
+                            .on_click(move |_, _, cx| {
+                                binding_saver.update(cx, |view, cx| {
+                                    view.save_runtime(RuntimeAdapter::CodexAppServer, cx);
+                                });
+                            }),
+                    ),
                 )
-                .child(Self::info_note(
-                    "此处只保存 Provider 关联；API Key 变量名在 Provider 中配置，密钥值由密钥保险库单独加密保存或由进程环境提供。",
-                    "This pane saves provider bindings only; API key variable names are configured per provider. Values are stored separately in the encrypted vault or supplied by the process environment.",
-                    language,
-                ))
-                .child(Self::labeled_field("Provider ID（留空使用默认项）", "codex-provider", None, &self.codex_provider))
-                .child(Self::save_state_note(self.runtime_dirty(RuntimeAdapter::CodexAppServer, cx), language))
-                .child(Button::new("save-codex-settings").primary().label(language.choose("保存 Codex 配置", "Save Codex configuration")).on_click(move |_, _, cx| {
-                    binding_saver.update(cx, |view, cx| {
-                        view.save_runtime(RuntimeAdapter::CodexAppServer, cx);
-                    });
-                }))
-                .child(self.render_task_controls(RuntimeAdapter::CodexAppServer, cx))
+                .child(
+                    Self::adapter_section_card(
+                        "3",
+                        language.choose("快速验证 · 提交一个任务", "Quick check · run one task"),
+                    )
+                    .child(
+                        div().text_xs().text_color(rgb(TEXT_MUTED)).child(
+                            language.choose(
+                                "用已保存的配置发起一次性任务，验证端到端链路（模型、密钥、工具授权）；结果只显示在下方，不会修改任何配置。",
+                                "Run a one-off task with the saved configuration to verify the end-to-end path (model, secrets, tool grants); the result appears below and changes no configuration.",
+                            ),
+                        ),
+                    )
+                    .child(self.render_task_controls(RuntimeAdapter::CodexAppServer, cx)),
+                )
         }
 
         /// Global tool grants narrowed by the selected project's allowlist.
@@ -5910,18 +6109,108 @@ fn main() {
         ) -> impl IntoElement {
             let saver = cx.entity().clone();
             let language = self.language;
-            let (command, provider) = self.runtime_fields(adapter);
-            div().flex_1().min_w(px(0.)).v_flex().gap_3().p_5().bg(rgb(CARD_BG)).rounded_xl()
-                .child(div().text_xl().child(adapter.label()))
-                .child("每次执行创建独立任务进程；完成、失败或取消后清理。Claude Code 使用 Anthropic Messages 协议。")
-                .child(Self::labeled_field("运行时命令", "adapter-command", None, command))
-                .child(Self::labeled_field("Provider ID（留空使用默认项）", "adapter-provider", None, provider))
-                .child(Self::info_note("仅保存此运行时的命令和 Provider 关联；下次任务生效。新增 Provider 请先在其详情中保存。", "Saves only this runtime's command and provider binding; applies to the next task. Save new providers in provider details first.", language))
-                .child(Self::save_state_note(self.runtime_dirty(adapter, cx), language))
-                .child(Button::new("save-adapter").primary().label(language.choose_owned(format!("保存 {} 配置", adapter.label()), format!("Save {} configuration", adapter.label()))).on_click(move |_, _, cx| { saver.update(cx, |view, cx| {
-                    view.save_runtime(adapter, cx);
-                }); }))
-                .child(self.render_task_controls(adapter, cx))
+            let command = self.runtime_fields(adapter).0.clone();
+            let dirty = self.runtime_dirty(adapter, cx);
+            let description = match adapter {
+                RuntimeAdapter::ClaudeCode => language.choose(
+                    "每次执行创建独立任务进程；完成、失败或取消后清理。使用 Anthropic Messages 协议。",
+                    "Each run creates an isolated task process, cleaned up on completion, failure, or cancellation. Uses the Anthropic Messages protocol.",
+                ),
+                RuntimeAdapter::Dsh | RuntimeAdapter::CodexAppServer => language.choose(
+                    "每次执行创建独立任务进程；完成、失败或取消后清理。",
+                    "Each run creates an isolated task process, cleaned up on completion, failure, or cancellation.",
+                ),
+            };
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .v_flex()
+                .gap_4()
+                .p_5()
+                .rounded_xl()
+                .border_1()
+                .border_color(rgb(BORDER))
+                .bg(rgb(CARD_BG))
+                .child(
+                    div()
+                        .flex()
+                        .items_start()
+                        .justify_between()
+                        .gap_3()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .v_flex()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_xl()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(adapter.label()),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(rgb(TEXT_SECONDARY))
+                                        .whitespace_normal()
+                                        .child(description),
+                                ),
+                        ),
+                )
+                .child(
+                    Self::adapter_section_card(
+                        "1",
+                        language.choose(
+                            "设置 · 命令与 Provider 关联",
+                            "Settings · command and provider binding",
+                        ),
+                    )
+                    .child(Self::labeled_field(
+                        language.choose("运行时命令", "Runtime command"),
+                        "adapter-command",
+                        None,
+                        &command,
+                    ))
+                    .child(self.render_provider_binding(adapter, cx))
+                    .child(
+                        div().text_xs().text_color(rgb(TEXT_MUTED)).child(
+                            language.choose(
+                                "保存范围：此运行时的命令与 Provider 关联；下次任务生效。Provider 的模型与地址在 Provider 详情中保存。",
+                                "Save scope: this runtime's command and provider binding; applies to the next task. Provider models and URLs are saved in provider details.",
+                            ),
+                        ),
+                    )
+                    .child(Self::save_state_note(dirty, language))
+                    .child(
+                        Button::new("save-adapter")
+                            .primary()
+                            .label(language.choose_owned(
+                                format!("保存 {} 配置", adapter.label()),
+                                format!("Save {} configuration", adapter.label()),
+                            ))
+                            .on_click(move |_, _, cx| {
+                                saver.update(cx, |view, cx| {
+                                    view.save_runtime(adapter, cx);
+                                });
+                            }),
+                    ),
+                )
+                .child(
+                    Self::adapter_section_card(
+                        "2",
+                        language.choose("快速验证 · 提交一个任务", "Quick check · run one task"),
+                    )
+                    .child(
+                        div().text_xs().text_color(rgb(TEXT_MUTED)).child(
+                            language.choose(
+                                "用已保存的配置发起一次性任务，验证端到端链路（模型、密钥、工具授权）；结果只显示在下方，不会修改任何配置。",
+                                "Run a one-off task with the saved configuration to verify the end-to-end path (model, secrets, tool grants); the result appears below and changes no configuration.",
+                            ),
+                        ),
+                    )
+                    .child(self.render_task_controls(adapter, cx)),
+                )
         }
 
         fn render_provider_detail(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
