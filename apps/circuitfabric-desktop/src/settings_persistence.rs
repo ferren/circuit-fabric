@@ -15,6 +15,7 @@ pub enum SettingsUpdate {
     Bridge { listen_address: String },
     Catalog(ToolCatalog),
     Authorizations(ToolAuthorizationSettings),
+    RemoveResource { kind: circuitfabric_codex_runtime::ToolAuthorizationKind, id: String },
 }
 
 impl SettingsUpdate {
@@ -39,6 +40,21 @@ impl SettingsUpdate {
             Self::Bridge { listen_address } => saved.bridge.listen_address = listen_address,
             Self::Catalog(catalog) => saved.catalog = catalog,
             Self::Authorizations(tools) => saved.tools = tools,
+            Self::RemoveResource { kind, id } => match kind {
+                circuitfabric_codex_runtime::ToolAuthorizationKind::Skill => {
+                    saved.catalog.skills.retain(|s| s.id != id);
+                    saved.tools.authorized_skill_ids.retain(|s| s != &id);
+                }
+                circuitfabric_codex_runtime::ToolAuthorizationKind::McpServer => {
+                    saved.catalog.mcp_servers.retain(|s| s.id != id);
+                    saved.tools.authorized_mcp_server_ids.retain(|s| s != &id);
+                    if id == circuitfabric_codex_runtime::tools::BUNDLED_JEV_SERVER_ID
+                        && !saved.catalog.removed_bundled_servers.contains(&id)
+                    {
+                        saved.catalog.removed_bundled_servers.push(id);
+                    }
+                }
+            },
         }
     }
 }
@@ -245,5 +261,30 @@ mod tests {
             .is_err()
         );
         assert_eq!(fs::read(parent).unwrap(), b"preserve");
+    }
+
+    #[test]
+    fn deleting_a_definition_removes_global_grants_and_bundled_restore_without_other_saves() {
+        use circuitfabric_codex_runtime::{ToolAuthorizationKind, tools::BUNDLED_JEV_SERVER_ID};
+        let fixture = Fixture::new();
+        let path = fixture.path();
+        let mut initial = RuntimeSettings::default();
+        initial.tools.authorized_mcp_server_ids =
+            vec![BUNDLED_JEV_SERVER_ID.into(), "other".into()];
+        initial.providers[0].model = "saved-model".into();
+        initial.save(&path).unwrap();
+        let saved = save_update(
+            &path,
+            SettingsUpdate::RemoveResource {
+                kind: ToolAuthorizationKind::McpServer,
+                id: BUNDLED_JEV_SERVER_ID.into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(saved.tools.authorized_mcp_server_ids, ["other"]);
+        assert_eq!(saved.providers, initial.providers);
+        assert!(saved.catalog.removed_bundled_servers.contains(&BUNDLED_JEV_SERVER_ID.into()));
+        let restored = RuntimeSettings::load_or_default(&path).unwrap();
+        assert!(!restored.catalog.mcp_servers.iter().any(|s| s.id == BUNDLED_JEV_SERVER_ID));
     }
 }

@@ -258,6 +258,9 @@ fn main() {
 }
 
 #[cfg(feature = "native-ui")]
+include!("tool_management.rs");
+
+#[cfg(feature = "native-ui")]
 #[allow(clippy::too_many_lines)]
 fn main() {
     if circuitfabric_codex_runtime::judge::run_from_args() {
@@ -924,6 +927,17 @@ fn main() {
         catalog_source: Entity<InputState>,
         catalog_args: Entity<InputState>,
         catalog_env: Entity<InputState>,
+        catalog_name: Entity<InputState>,
+        catalog_search: Entity<InputState>,
+        selected_skill: Option<String>,
+        selected_mcp: Option<String>,
+        catalog_editor: Option<CatalogEditor>,
+        catalog_error: Option<String>,
+        tool_feedback: String,
+        tool_reports: BTreeMap<String, ToolReport>,
+        tool_revision: u64,
+        tool_call_name: Entity<InputState>,
+        tool_call_args: Entity<InputState>,
         // Non-secret LLM adapter form and a write-only masked credential entry.
         jev_api_key: Entity<InputState>,
         jev_base_url: Entity<InputState>,
@@ -1480,6 +1494,17 @@ fn main() {
                 catalog_source,
                 catalog_args,
                 catalog_env,
+                catalog_name: Self::input(window, String::new(), "显示名称", cx),
+                catalog_search: Self::input(window, String::new(), "搜索名称、标识或来源", cx),
+                selected_skill: None,
+                selected_mcp: None,
+                catalog_editor: None,
+                catalog_error: None,
+                tool_feedback: "请选择技能或 MCP server。".into(),
+                tool_reports: BTreeMap::new(),
+                tool_revision: 0,
+                tool_call_name: Self::input(window, String::new(), "工具名称", cx),
+                tool_call_args: Self::input(window, "{}".into(), "调用参数 JSON 对象", cx),
                 jev_api_key,
                 jev_base_url,
                 jev_model,
@@ -1713,7 +1738,19 @@ fn main() {
             &mut self,
             update: crate::settings_persistence::SettingsUpdate,
         ) -> Result<(), circuitfabric_codex_runtime::RuntimeError> {
+            let tools_changed = matches!(
+                &update,
+                crate::settings_persistence::SettingsUpdate::Catalog(_)
+                    | crate::settings_persistence::SettingsUpdate::Authorizations(_)
+                    | crate::settings_persistence::SettingsUpdate::RemoveResource { .. }
+            );
+            if let crate::settings_persistence::SettingsUpdate::Catalog(catalog) = &update {
+                catalog.validate_secret_references(self.vault.as_ref().map(|v| v.values()))?;
+            }
             let saved = crate::settings_persistence::save_update(&self.settings_path, update)?;
+            if tools_changed {
+                self.invalidate_tool_runs();
+            }
             self.adapters = saved.adapters.clone();
             self.saved_settings = saved;
             Ok(())
@@ -3003,6 +3040,7 @@ fn main() {
                             .set_configuration(&project_id, configuration.clone())
                         {
                             Ok(()) => {
+                                self.invalidate_tool_runs();
                                 self.new_tool_id
                                     .update(cx, |state, cx| state.set_value("", window, cx));
                                 self.status = format!(
@@ -3085,6 +3123,7 @@ fn main() {
                             .set_configuration(&project_id, configuration.clone())
                         {
                             Ok(()) => {
+                                self.invalidate_tool_runs();
                                 self.status = format!(
                                     "已撤销{kind_label} `{id}` 在项目 `{project_id}` 中的授权，已写入 {}。",
                                     storage.configuration_path().display()
@@ -3162,6 +3201,7 @@ fn main() {
         }
 
         fn select_project(&mut self, project_id: ProjectId, cx: &mut Context<Self>) {
+            self.invalidate_tool_runs();
             if let Some(cancel) = &self.task_cancel {
                 cancel.cancel();
             }
@@ -3933,7 +3973,7 @@ fn main() {
                         .prepare_document_open(&project_id, &document_id)
                         .map_err(|error| error.to_string())?;
                     let tools = catalog
-                        .list_tools_with_secrets(BUNDLED_JEV_SERVER_ID, &grants, secrets.as_ref())
+                        .request_with_cancellation(BUNDLED_JEV_SERVER_ID, &grants, None, secrets.as_ref(), &run_cancel)
                         .map_err(|error| error.to_string())?;
                     if !tools["tools"]
                         .as_array()
@@ -4094,12 +4134,12 @@ fn main() {
                             jev_evaluate_calls += 1;
                             log(&format!("▶ Jev evaluate 第 {jev_evaluate_calls} 次…\n"));
                             let response = catalog
-                                .call_tool_with_secrets(
+                                .request_with_cancellation(
                                     BUNDLED_JEV_SERVER_ID,
                                     &grants,
-                                    "evaluate",
-                                    arguments,
+                                    Some(("evaluate", arguments)),
                                     secrets.as_ref(),
+                                    &run_cancel,
                                 )
                                 .map_err(|error| error.to_string());
                             if let Ok(value) = &response
@@ -4559,71 +4599,6 @@ fn main() {
                 .when_some(hint, |this, hint| {
                     this.child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(hint))
                 })
-        }
-
-        fn tool_authorization_row(
-            scope: ToolScope,
-            kind: ToolAuthorizationKind,
-            id: &str,
-            language: UiLanguage,
-            entity: &Entity<Self>,
-        ) -> impl IntoElement {
-            let revoker = entity.clone();
-            let owned_id = id.to_owned();
-            let scope_key = match scope {
-                ToolScope::Global => "global",
-                ToolScope::Project => "project",
-            };
-            let scope_label = match scope {
-                ToolScope::Global => language.choose("全局", "Global"),
-                ToolScope::Project => language.choose("项目", "Project"),
-            };
-            let (badge_background, badge_foreground) = match kind {
-                ToolAuthorizationKind::Skill => (0x00e0_f2fe, 0x000e_7490),
-                ToolAuthorizationKind::McpServer => (0x00f3_e8ff, 0x0076_2ba3),
-            };
-            div()
-                .id(format!("tool-row-{scope_key}-{kind:?}-{owned_id}"))
-                .flex()
-                .items_center()
-                .gap_2()
-                .p_2()
-                .rounded_md()
-                .border_1()
-                .border_color(rgb(BORDER))
-                .bg(rgb(CARD_BG))
-                .child(
-                    div()
-                        .px_1p5()
-                        .py_0p5()
-                        .rounded_sm()
-                        .text_xs()
-                        .bg(rgb(badge_background))
-                        .text_color(rgb(badge_foreground))
-                        .child(Self::tool_kind_label(kind, language)),
-                )
-                .child(div().flex_1().min_w(px(0.)).truncate().text_sm().child(owned_id.clone()))
-                .child(
-                    div()
-                        .ml_auto()
-                        .px_1p5()
-                        .py_0p5()
-                        .rounded_sm()
-                        .text_xs()
-                        .bg(rgb(SURFACE_BG))
-                        .text_color(rgb(TEXT_SECONDARY))
-                        .child(scope_label),
-                )
-                .child(
-                    Button::new(format!("revoke-{scope_key}-{kind:?}-{owned_id}"))
-                        .ghost()
-                        .label(language.choose("撤销", "Revoke"))
-                        .on_click(move |_, _, cx| {
-                            revoker.update(cx, |view, cx| {
-                                view.revoke_tool(scope, kind, &owned_id, cx);
-                            });
-                        }),
-                )
         }
 
         fn persist_plugin_governance(&mut self) -> Result<(), String> {
@@ -5308,7 +5283,7 @@ fn main() {
                         .min_h(px(0.))
                         .flex()
                         .gap_4()
-                        .child(
+                        .when(!tools_selected, |row| row.child(
                             div()
                                 .id("agents-list-scroll")
                                 .min_h(px(0.))
@@ -5339,7 +5314,7 @@ fn main() {
                                 ))
                                 .child(tools_card)
                                 .child(jev_card),
-                        )
+                        ))
                         .child(detail),
                 )
                 .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(self.status.clone()))
@@ -6032,23 +6007,21 @@ fn main() {
         /// it; a missing project configuration grants no project tools.
         fn effective_grants(&self) -> ToolAuthorizationSettings {
             let Some(project_id) = self.selected_project.as_ref() else {
-                return self.tool_authorizations.clone();
+                return self.catalog.effective_grants(&self.tool_authorizations, None);
             };
             self.effective_grants_for(project_id)
         }
 
         fn effective_grants_for(&self, project_id: &ProjectId) -> ToolAuthorizationSettings {
-            let mut grants = self.tool_authorizations.clone();
-            let Some(configuration) = self.workspace.configuration(project_id) else {
-                grants.authorized_skill_ids.clear();
-                grants.authorized_mcp_server_ids.clear();
-                return grants;
-            };
-            grants.authorized_skill_ids.retain(|id| configuration.enabled_skill_ids.contains(id));
-            grants
-                .authorized_mcp_server_ids
-                .retain(|id| configuration.enabled_mcp_server_ids.contains(id));
-            grants
+            let project = self
+                .workspace
+                .configuration(project_id)
+                .map(|configuration| ToolAuthorizationSettings {
+                    authorized_skill_ids: configuration.enabled_skill_ids.clone(),
+                    authorized_mcp_server_ids: configuration.enabled_mcp_server_ids.clone(),
+                })
+                .unwrap_or_default();
+            self.catalog.effective_grants(&self.tool_authorizations, Some(&project))
         }
 
         /// Reports which source currently supplies one variable name: the
@@ -6966,322 +6939,6 @@ fn main() {
                 )
         }
 
-        #[allow(clippy::too_many_lines)]
-        fn render_catalog(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-            let entity = cx.entity().clone();
-            let skill_importer = entity.clone();
-            let mcp_saver = entity.clone();
-            let env_names = Self::parse_tool_ids(&self.catalog_env.read(cx).value());
-            let env_hints = if env_names.is_empty() {
-                None
-            } else {
-                let mut list = div().v_flex().gap_1();
-                for name in &env_names {
-                    if let Some(hint) = self.secret_source_hint(name, &entity) {
-                        list = list.child(hint);
-                    }
-                }
-                Some(list)
-            };
-            let mut rows = div().v_flex().gap_2();
-            for skill in self.catalog.skills.clone() {
-                let remover = entity.clone();
-                let toggler = entity.clone();
-                let id = skill.id.clone();
-                let toggle_id = id.clone();
-                let authorizer = entity.clone();
-                let grant_id = id.clone();
-                let previewer = entity.clone();
-                let preview_id = id.clone();
-                rows = rows.child(
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .gap_2()
-                        .child(div().flex_1().min_w(px(0.)).whitespace_normal().child(format!(
-                            "技能 {} · {} · {}",
-                            skill.id,
-                            if skill.enabled { "启用" } else { "停用" },
-                            skill.path.display()
-                        )))
-                        .child(
-                            Button::new(format!("skill-grant-{id}"))
-                                .label("授权到所选作用域")
-                                .on_click(move |_, window, cx| {
-                                    authorizer.update(cx, |view, cx| {
-                                        view.new_tool_kind = ToolAuthorizationKind::Skill;
-                                        view.new_tool_id.update(cx, |input, cx| {
-                                            input.set_value(grant_id.clone(), window, cx)
-                                        });
-                                        view.authorize_tool(window, cx);
-                                    });
-                                }),
-                        )
-                        .child(Button::new(format!("skill-preview-{id}")).label("详情").on_click(
-                            move |_, _, cx| {
-                                previewer.update(cx, |view, cx| {
-                                    view.status = match view.catalog.skill_instructions(
-                                        &ToolAuthorizationSettings {
-                                            authorized_skill_ids: vec![preview_id.clone()],
-                                            authorized_mcp_server_ids: vec![],
-                                        },
-                                    ) {
-                                        Ok(text) => text,
-                                        Err(error) => format!("无法读取技能：{error}"),
-                                    };
-                                    cx.notify();
-                                });
-                            },
-                        ))
-                        .child(
-                            Button::new(format!("skill-toggle-{id}")).label("启用/停用").on_click(
-                                move |_, _, cx| {
-                                    toggler.update(cx, |view, cx| {
-                                        let previous = view.catalog.clone();
-                                        if let Some(s) = view
-                                            .catalog
-                                            .skills
-                                            .iter_mut()
-                                            .find(|s| s.id == toggle_id)
-                                        {
-                                            s.enabled = !s.enabled;
-                                        }
-                                        view.persist_catalog(previous, cx);
-                                    });
-                                },
-                            ),
-                        )
-                        .child(Button::new(format!("skill-delete-{id}")).label("删除").on_click(
-                            move |_, _, cx| {
-                                remover.update(cx, |view, cx| {
-                                    let previous = view.catalog.clone();
-                                    view.catalog.skills.retain(|s| s.id != id);
-                                    view.persist_catalog(previous, cx);
-                                });
-                            },
-                        )),
-                );
-            }
-            for server in self.catalog.mcp_servers.clone() {
-                let remover = entity.clone();
-                let tester = entity.clone();
-                let editor = entity.clone();
-                let toggler = entity.clone();
-                let id = server.id.clone();
-                let test_id = id.clone();
-                let toggle_id = id.clone();
-                let authorizer = entity.clone();
-                let grant_id = id.clone();
-                rows = rows.child(
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .gap_2()
-                        .child(div().flex_1().min_w(px(0.)).whitespace_normal().child(format!(
-                            "MCP {} · {} · {}",
-                            server.id,
-                            if server.enabled { "启用" } else { "停用" },
-                            server.command
-                        )))
-                        .child(
-                            Button::new(format!("mcp-grant-{id}"))
-                                .label("授权到所选作用域")
-                                .on_click(move |_, window, cx| {
-                                    authorizer.update(cx, |view, cx| {
-                                        view.new_tool_kind = ToolAuthorizationKind::McpServer;
-                                        view.new_tool_id.update(cx, |input, cx| {
-                                            input.set_value(grant_id.clone(), window, cx)
-                                        });
-                                        view.authorize_tool(window, cx);
-                                    });
-                                }),
-                        )
-                        .child(Button::new(format!("mcp-edit-{id}")).label("编辑").on_click(
-                            move |_, window, cx| {
-                                editor.update(cx, |view, cx| {
-                                    view.catalog_id.update(cx, |input, cx| {
-                                        input.set_value(server.id.clone(), window, cx);
-                                    });
-                                    view.catalog_source.update(cx, |input, cx| {
-                                        input.set_value(server.command.clone(), window, cx);
-                                    });
-                                    view.catalog_args.update(cx, |input, cx| {
-                                        input.set_value(
-                                            serde_json::to_string(&server.args).unwrap_or_default(),
-                                            window,
-                                            cx,
-                                        );
-                                    });
-                                    view.catalog_env.update(cx, |input, cx| {
-                                        input.set_value(
-                                            server.environment_variables.join(","),
-                                            window,
-                                            cx,
-                                        );
-                                    });
-                                    cx.notify();
-                                });
-                            },
-                        ))
-                        .child(Button::new(format!("mcp-toggle-{id}")).label("启用/停用").on_click(
-                            move |_, _, cx| {
-                                toggler.update(cx, |view, cx| {
-                                    let previous = view.catalog.clone();
-                                    if let Some(s) = view
-                                        .catalog
-                                        .mcp_servers
-                                        .iter_mut()
-                                        .find(|s| s.id == toggle_id)
-                                    {
-                                        s.enabled = !s.enabled;
-                                    }
-                                    view.persist_catalog(previous, cx);
-                                });
-                            },
-                        ))
-                        .child(
-                            Button::new(format!("mcp-test-{id}")).label("连接并发现工具").on_click(
-                                move |_, window, cx| {
-                                    tester.update(cx, |view, cx| {
-                                        let catalog = view.catalog.clone();
-                                        let grants = view.effective_grants();
-                                        let secrets =
-                                            view.vault.as_ref().map(|vault| vault.values().clone());
-                                        let id = test_id.clone();
-                                        view.status = "正在连接 MCP…".into();
-                                        let work = cx.background_spawn(async move {
-                                            catalog
-                                                .list_tools_with_secrets(
-                                                    &id,
-                                                    &grants,
-                                                    secrets.as_ref(),
-                                                )
-                                                .map(|value| value.to_string())
-                                                .map_err(|e| e.to_string())
-                                        });
-                                        cx.spawn_in(window, async move |view, cx| {
-                                            let result = work.await;
-                                            cx.update(|_, cx| {
-                                                view.update(cx, |view, cx| {
-                                                    view.status = match result {
-                                                        Ok(tools) => {
-                                                            format!("MCP 已连接，工具：{tools}")
-                                                        }
-                                                        Err(error) => {
-                                                            format!("MCP 连接失败：{error}")
-                                                        }
-                                                    };
-                                                    cx.notify();
-                                                })
-                                                .ok();
-                                            })
-                                            .ok();
-                                        })
-                                        .detach();
-                                        cx.notify();
-                                    });
-                                },
-                            ),
-                        )
-                        .child(Button::new(format!("mcp-delete-{id}")).label("删除").on_click(
-                            move |_, _, cx| {
-                                remover.update(cx, |view, cx| {
-                                    let previous = view.catalog.clone();
-                                    view.catalog.mcp_servers.retain(|s| s.id != id);
-                                    view.persist_catalog(previous, cx);
-                                });
-                            },
-                        )),
-                );
-            }
-            div()
-                .v_flex()
-                .gap_2()
-                .child("技能与 MCP 定义（保存定义后，在下方选择作用域授权）")
-                .child(Self::info_note(
-                    "导入、保存定义、启停、删除和授权操作均即时保存，仅更新定义或选定作用域的授权。",
-                    "Imports, definition saves, toggles, removal and grants save immediately, updating only definitions or grants in the selected scope.",
-                    self.language,
-                ))
-                .child(Self::labeled_field("MCP 标识", "catalog-id", None, &self.catalog_id))
-                .child(Self::labeled_field(
-                    "技能文件/目录路径，或 MCP 启动程序",
-                    "catalog-source",
-                    None,
-                    &self.catalog_source,
-                ))
-                .child(Self::labeled_field(
-                    "MCP 参数（JSON 数组）",
-                    "catalog-args",
-                    None,
-                    &self.catalog_args,
-                ))
-                .child(Self::labeled_field(
-                    "MCP 环境变量名（逗号分隔）",
-                    "catalog-env",
-                    None,
-                    &self.catalog_env,
-                ))
-                .when_some(env_hints, ParentElement::child)
-                .child(
-                    div()
-                        .flex()
-                        .gap_2()
-                        .child(Button::new("import-skill").label("导入技能").on_click(
-                            move |_, _, cx| {
-                                skill_importer.update(cx, |view, cx| {
-                                    let previous = view.catalog.clone();
-                                    let path = PathBuf::from(
-                                        view.catalog_source.read(cx).value().to_string(),
-                                    );
-                                    match view.catalog.import_skill(&path) {
-                                        Ok(_) => {
-                                            view.persist_catalog(previous, cx);
-                                        }
-                                        Err(error) => {
-                                            view.status = format!("导入失败：{error}");
-                                            cx.notify();
-                                        }
-                                    }
-                                });
-                            },
-                        ))
-                        .child(Button::new("save-mcp").label("新增/保存 MCP").on_click(
-                            move |_, _, cx| {
-                                mcp_saver.update(cx, |view, cx| {
-                                    let Ok(args) = serde_json::from_str::<Vec<String>>(
-                                        &view.catalog_args.read(cx).value(),
-                                    ) else {
-                                        view.status = "参数必须是字符串 JSON 数组".into();
-                                        cx.notify();
-                                        return;
-                                    };
-                                    let previous = view.catalog.clone();
-                                    let id = view.catalog_id.read(cx).value().to_string();
-                                    view.catalog.mcp_servers.retain(|s| s.id != id);
-                                    view.catalog.mcp_servers.push(
-                                        circuitfabric_codex_runtime::tools::McpServerDefinition {
-                                            id,
-                                            command: view
-                                                .catalog_source
-                                                .read(cx)
-                                                .value()
-                                                .to_string(),
-                                            args,
-                                            environment_variables: Self::parse_tool_ids(
-                                                &view.catalog_env.read(cx).value(),
-                                            ),
-                                            enabled: true,
-                                        },
-                                    );
-                                    view.persist_catalog(previous, cx);
-                                });
-                            },
-                        )),
-                )
-                .child(rows)
-        }
-
         fn persist_catalog(
             &mut self,
             previous: circuitfabric_codex_runtime::tools::ToolCatalog,
@@ -7382,6 +7039,7 @@ fn main() {
             match storage.save_configuration(&configuration) {
                 Ok(()) => match self.workspace.set_configuration(&project_id, configuration) {
                     Ok(()) => {
+                        self.invalidate_tool_runs();
                         self.status = format!(
                             "项目 `{project_id}` Jev 授权已{}。",
                             if authorized { "开启" } else { "撤销" }
@@ -8519,314 +8177,7 @@ fn main() {
         }
 
         fn render_skills_detail(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-            let entity = cx.entity().clone();
-            let language = self.language;
-
-            let scope_note = match self.new_tool_scope {
-                ToolScope::Global => format!(
-                    "{} {}",
-                    language.choose(
-                        "全局授权会立即写入",
-                        "Global authorizations are written immediately to"
-                    ),
-                    self.settings_path.display()
-                ),
-                ToolScope::Project => {
-                    match self
-                        .selected_project
-                        .as_deref()
-                        .and_then(|project_id| self.project_storages.get(project_id))
-                    {
-                        Some(storage) => format!(
-                            "{} {}",
-                            language.choose(
-                                "项目授权会立即写入",
-                                "Project authorizations are written immediately to",
-                            ),
-                            storage.configuration_path().display()
-                        ),
-                        None => language
-                            .choose(
-                                "请先在「项目」页选择并打开一个项目。",
-                                "Select and open a project on the Projects page first.",
-                            )
-                            .to_owned(),
-                    }
-                }
-            };
-
-            let kind_skill = entity.clone();
-            let kind_mcp = entity.clone();
-            let scope_global = entity.clone();
-            let scope_project = entity.clone();
-            let authorizer = entity.clone();
-
-            let mut global_rows = div().v_flex().gap_2();
-            let mut global_count = 0_usize;
-            for kind in [ToolAuthorizationKind::Skill, ToolAuthorizationKind::McpServer] {
-                for id in self.tool_authorizations.ids_for_kind(kind).to_vec() {
-                    global_rows = global_rows.child(Self::tool_authorization_row(
-                        ToolScope::Global,
-                        kind,
-                        &id,
-                        language,
-                        &entity,
-                    ));
-                    global_count += 1;
-                }
-            }
-            if global_count == 0 {
-                global_rows = global_rows.child(
-                    div()
-                        .p_3()
-                        .rounded_lg()
-                        .border_1()
-                        .border_color(rgb(BORDER))
-                        .bg(rgb(SURFACE_BG))
-                        .text_sm()
-                        .text_color(rgb(TEXT_MUTED))
-                        .child(language.choose(
-                            "尚无全局授权——在上方添加第一条技能或 MCP 服务器。",
-                            "No global authorizations yet — add the first skill or MCP server above.",
-                        )),
-                );
-            }
-
-            let project_section = if let Some(project_id) = self.selected_project.clone() {
-                let configuration =
-                    self.workspace.configuration(&project_id).cloned().unwrap_or_default();
-                let mut rows = div().v_flex().gap_2();
-                let mut count = 0_usize;
-                for kind in [ToolAuthorizationKind::Skill, ToolAuthorizationKind::McpServer] {
-                    let ids = match kind {
-                        ToolAuthorizationKind::Skill => configuration.enabled_skill_ids.clone(),
-                        ToolAuthorizationKind::McpServer => {
-                            configuration.enabled_mcp_server_ids.clone()
-                        }
-                    };
-                    for id in ids {
-                        rows = rows.child(Self::tool_authorization_row(
-                            ToolScope::Project,
-                            kind,
-                            &id,
-                            language,
-                            &entity,
-                        ));
-                        count += 1;
-                    }
-                }
-                if count == 0 {
-                    rows = rows.child(
-                        div()
-                            .p_3()
-                            .rounded_lg()
-                            .border_1()
-                            .border_color(rgb(BORDER))
-                            .bg(rgb(SURFACE_BG))
-                            .text_sm()
-                            .text_color(rgb(TEXT_MUTED))
-                            .child(language.choose(
-                                "此项目尚未授权任何技能或 MCP 服务器。",
-                                "This project has no authorized skills or MCP servers yet.",
-                            )),
-                    );
-                }
-                div()
-                    .v_flex()
-                    .gap_2()
-                    .child(div().text_base().font_weight(FontWeight::SEMIBOLD).child(
-                        language.choose_owned(
-                            format!("项目作用域 · {project_id}"),
-                            format!("Project scope · {project_id}"),
-                        ),
-                    ))
-                    .child(rows)
-                    .into_any_element()
-            } else {
-                div()
-                    .p_3()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(rgb(BORDER))
-                    .bg(rgb(SURFACE_BG))
-                    .text_sm()
-                    .text_color(rgb(TEXT_MUTED))
-                    .child(language.choose(
-                        "在「项目」页选择一个项目后，可在这里管理它的项目级授权。",
-                        "Select a project on the Projects page to manage its project-scoped authorizations here.",
-                    ))
-                    .into_any_element()
-            };
-
-            Self::detail_pane("skills-detail")
-                .gap_4()
-                .p_5()
-                .rounded_xl()
-                .border_1()
-                .border_color(rgb(BORDER))
-                .bg(rgb(CARD_BG))
-                .child(
-                    div()
-                        .v_flex()
-                        .gap_1()
-                        .child(
-                            div()
-                                .text_xl()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(language.choose("技能与 MCP 授权", "Skills & MCP")),
-                        )
-                        .child(
-                            div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(
-                                language.choose(
-                                    "全局授权与当前项目授权取并集；从一个作用域撤销，不会删除另一作用域的授权。停用定义对所有作用域生效。",
-                                    "Runtimes may only load authorized skills and MCP servers: the global scope applies to every project, the project scope writes to that project's own configuration file.",
-                                ),
-                            ),
-                        ),
-                )
-                .child(self.render_catalog(cx))
-                .child(
-                    div()
-                        .v_flex()
-                        .gap_2()
-                        .p_4()
-                        .rounded_lg()
-                        .border_1()
-                        .border_color(rgb(BORDER))
-                        .bg(rgb(SURFACE_BG))
-                        .child(
-                            div()
-                                .flex()
-                                .flex_wrap()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w(px(220.))
-                                        .h(px(36.))
-                                        .px_2()
-                                        .flex()
-                                        .items_center()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(rgb(BORDER))
-                                        .bg(rgb(CARD_BG))
-                                        .child(
-                                            InputBase::new("new-tool-id")
-                                                .flex_1()
-                                                .h_full()
-                                                .flex()
-                                                .items_center()
-                                                .child(self.new_tool_id.clone()),
-                                        ),
-                                )
-                                .child(
-                                    Button::new("tool-kind-skill")
-                                        .label(language.choose("技能", "Skill"))
-                                        .when(
-                                            self.new_tool_kind == ToolAuthorizationKind::Skill,
-                                            ButtonVariants::primary,
-                                        )
-                                        .on_click(move |_, _, cx| {
-                                            kind_skill.update(cx, |view, cx| {
-                                                view.new_tool_kind =
-                                                    ToolAuthorizationKind::Skill;
-                                                cx.notify();
-                                            });
-                                        }),
-                                )
-                                .child(
-                                    Button::new("tool-kind-mcp")
-                                        .label(language.choose("MCP 服务器", "MCP server"))
-                                        .when(
-                                            self.new_tool_kind == ToolAuthorizationKind::McpServer,
-                                            ButtonVariants::primary,
-                                        )
-                                        .on_click(move |_, _, cx| {
-                                            kind_mcp.update(cx, |view, cx| {
-                                                view.new_tool_kind =
-                                                    ToolAuthorizationKind::McpServer;
-                                                cx.notify();
-                                            });
-                                        }),
-                                )
-                                .child(
-                                    div()
-                                        .w(px(1.))
-                                        .h(px(24.))
-                                        .flex_none()
-                                        .bg(rgb(BORDER)),
-                                )
-                                .child(
-                                    Button::new("tool-scope-global")
-                                        .label(language.choose("全局", "Global"))
-                                        .when(self.new_tool_scope == ToolScope::Global, |button| {
-                                            button.primary()
-                                        })
-                                        .on_click(move |_, _, cx| {
-                                            scope_global.update(cx, |view, cx| {
-                                                view.new_tool_scope = ToolScope::Global;
-                                                cx.notify();
-                                            });
-                                        }),
-                                )
-                                .child(
-                                    Button::new("tool-scope-project")
-                                        .label(language.choose("当前项目", "This project"))
-                                        .when(self.new_tool_scope == ToolScope::Project, |button| {
-                                            button.primary()
-                                        })
-                                        .on_click(move |_, _, cx| {
-                                            scope_project.update(cx, |view, cx| {
-                                                view.new_tool_scope = ToolScope::Project;
-                                                cx.notify();
-                                            });
-                                        }),
-                                )
-                                .child(
-                                    Button::new("authorize-tool")
-                                        .primary()
-                                        .label(language.choose("授权", "Authorize"))
-                                        .on_click(move |_, window, cx| {
-                                            authorizer.update(cx, |view, cx| {
-                                                view.authorize_tool(window, cx);
-                                            });
-                                        }),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(TEXT_MUTED))
-                                .child(language.choose(
-                                    "可以一次粘贴多个 ID（逗号或空格分隔）：每一项都会成为清单中的一行，可单独撤销。",
-                                    "Paste several IDs at once (comma- or space-separated): each becomes its own list row with an individual revoke.",
-                                )),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(TEXT_MUTED))
-                                .child(scope_note),
-                        ),
-                )
-                .child(
-                    div()
-                        .v_flex()
-                        .gap_2()
-                        .child(
-                            div()
-                                .text_base()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(language.choose(
-                                    "全局作用域（所有项目）",
-                                    "Global scope (all projects)",
-                                )),
-                        )
-                        .child(global_rows),
-                )
-                .child(project_section)
+            self.render_tool_management(cx)
         }
     }
 
@@ -16035,6 +15386,8 @@ fn main() {
         }
     }
 
+    tool_management!();
+
     impl Render for ControlPlaneView {
         #[allow(clippy::too_many_lines)]
         fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -16058,6 +15411,11 @@ fn main() {
                 } else {
                     None
                 };
+            let catalog_modal = if self.catalog_editor.is_some() {
+                Some(self.render_catalog_modal(cx).into_any_element())
+            } else {
+                None
+            };
             let jev_backend_modal = if self.jev_backend_modal_open {
                 Some(self.render_jev_backend_modal(cx).into_any_element())
             } else {
@@ -16526,7 +15884,8 @@ fn main() {
                         .when_some(vault_prompt, ParentElement::child)
                         .when_some(vault_quick_unlock, ParentElement::child)
                         .when_some(jev_backend_modal, ParentElement::child)
-                        .when_some(jev_key_modal, ParentElement::child),
+                        .when_some(jev_key_modal, ParentElement::child)
+                        .when_some(catalog_modal, ParentElement::child),
                 )
         }
     }

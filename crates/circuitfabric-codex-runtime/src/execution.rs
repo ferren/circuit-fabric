@@ -202,6 +202,9 @@ fn run_task_in(
     on_delta: &mut dyn FnMut(crate::TurnDelta, &str),
 ) -> Result<String, RuntimeError> {
     settings.validate()?;
+    settings.catalog.validate_secret_references(secrets)?;
+    let effective = settings.catalog.effective_grants(&settings.tools, Some(grants));
+    let grants = &effective;
     if cancel.0.load(Ordering::SeqCst) {
         return Err(invalid("任务已取消"));
     }

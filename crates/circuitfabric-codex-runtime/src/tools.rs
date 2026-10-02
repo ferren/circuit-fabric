@@ -22,6 +22,9 @@ pub struct ToolCatalog {
     /// Saved non-secret LLM judgment form, retained when switching to `TypeSafe`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llm_judge: Option<crate::judge::LlmJudgeSettings>,
+    /// Explicitly removed bundled servers must not reappear after restart.
+    #[serde(default)]
+    pub removed_bundled_servers: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -32,9 +35,63 @@ pub struct SkillDefinition {
     pub enabled: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SkillPreview {
+    pub name: String,
+    pub description: String,
+    pub content: String,
+}
+
+impl SkillDefinition {
+    /// Read a definition without granting it runtime access (including disabled skills).
+    /// # Errors
+    /// Returns an error for unreadable, empty or oversized instruction files.
+    pub fn preview(&self) -> Result<SkillPreview, RuntimeError> {
+        let content = fs::read_to_string(&self.path)?;
+        if content.trim().is_empty() || content.len() > 256 * 1024 {
+            return Err(invalid("SKILL.md 不能为空或超过 256 KiB"));
+        }
+        Ok(SkillPreview {
+            name: frontmatter_value(&content, "name").unwrap_or_else(|| self.id.clone()),
+            description: frontmatter_value(&content, "description")
+                .unwrap_or_else(|| "未提供 description；请查看内容预览".into()),
+            content,
+        })
+    }
+}
+
+fn frontmatter_value(text: &str, field: &str) -> Option<String> {
+    let mut lines = text.trim_start_matches('\u{feff}').lines();
+    if lines.next()? != "---" {
+        return None;
+    }
+    let prefix = format!("{field}:");
+    while let Some(line) = lines.next() {
+        if line == "---" {
+            break;
+        }
+        if let Some(value) = line.strip_prefix(&prefix) {
+            let value = value.trim();
+            if matches!(value, ">" | "|" | ">-" | "|-") {
+                return Some(
+                    lines
+                        .take_while(|l| l.starts_with(' ') || l.is_empty())
+                        .map(str::trim)
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                );
+            }
+            return Some(value.trim_matches(['\'', '"']).to_owned());
+        }
+    }
+    None
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct McpServerDefinition {
     pub id: String,
+    #[serde(default)]
+    pub display_name: String,
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
@@ -81,6 +138,7 @@ pub fn bundled_mcp_servers() -> Vec<McpServerDefinition> {
     let Some(binary) = bundled_jev_binary() else { return Vec::new() };
     vec![McpServerDefinition {
         id: BUNDLED_JEV_SERVER_ID.to_owned(),
+        display_name: "Jev".to_owned(),
         command: binary.to_string_lossy().into_owned(),
         // `mcp` serves stdio; `--no-update-check` keeps startup offline.
         args: vec!["mcp".to_owned(), "--no-update-check".to_owned()],
@@ -114,16 +172,47 @@ fn bundled_jev_binary() -> Option<PathBuf> {
 }
 
 impl ToolCatalog {
+    /// Effective permissions: a project can only restrict global grants; missing
+    /// and disabled definitions never enter a runtime configuration.
+    #[must_use]
+    pub fn effective_grants(
+        &self,
+        global: &ToolAuthorizationSettings,
+        project: Option<&ToolAuthorizationSettings>,
+    ) -> ToolAuthorizationSettings {
+        ToolAuthorizationSettings {
+            authorized_skill_ids: global
+                .authorized_skill_ids
+                .iter()
+                .filter(|id| {
+                    self.skills.iter().any(|s| &s.id == *id && s.enabled)
+                        && project.is_none_or(|p| p.authorized_skill_ids.contains(id))
+                })
+                .cloned()
+                .collect(),
+            authorized_mcp_server_ids: global
+                .authorized_mcp_server_ids
+                .iter()
+                .filter(|id| {
+                    self.mcp_servers.iter().any(|s| &s.id == *id && s.enabled)
+                        && project.is_none_or(|p| p.authorized_mcp_server_ids.contains(id))
+                })
+                .cloned()
+                .collect(),
+        }
+    }
     /// Register bundled MCP servers whose ids are not already defined, so an
-    /// entry the user edited or disabled is never overwritten. Deleting the
-    /// entry only lasts until the next load while the binary still ships.
+    /// entry the user edited or disabled is never overwritten. Explicit removal
+    /// markers prevent a deleted bundled entry from returning on the next load.
     pub fn ensure_bundled(&mut self) {
         self.insert_bundled(&bundled_mcp_servers());
     }
 
     fn insert_bundled(&mut self, bundled: &[McpServerDefinition]) {
         for server in bundled {
-            if !self.mcp_servers.iter().any(|existing| existing.id == server.id) {
+            if !self.removed_bundled_servers.contains(&server.id)
+                && !self.mcp_servers.iter().any(|existing| existing.id == server.id)
+            {
                 self.mcp_servers.push(server.clone());
             }
         }
@@ -156,6 +245,17 @@ impl ToolCatalog {
             {
                 return Err(invalid("MCP 需要启动命令与合法的环境变量名"));
             }
+            if server.args.iter().any(|arg| {
+                let lower = arg.to_ascii_lowercase();
+                ["--api-key", "--apikey", "--token", "--password", "--secret"]
+                    .iter()
+                    .any(|flag| lower == *flag || lower.starts_with(&format!("{flag}=")))
+                    || lower.starts_with("sk-")
+                    || lower.starts_with("authorization:")
+                    || lower.starts_with("bearer ")
+            }) {
+                return Err(invalid("认证只允许引用环境变量或保险库变量，不得写入 MCP 参数"));
+            }
             if server.args.first().is_some_and(|arg| arg == crate::judge::MCP_FLAG) {
                 let settings = crate::judge::LlmJudgeSettings::from_server(server)
                     .ok_or_else(|| invalid("LLM 判断工具配置无效"))?;
@@ -170,25 +270,54 @@ impl ToolCatalog {
         Ok(())
     }
 
+    /// Reject resolved credentials embedded in a definition before persisting or launching it.
+    /// # Errors
+    /// Returns a generic error without echoing any credential value.
+    pub fn validate_secret_references(
+        &self,
+        secrets: Option<&crate::secrets::SecretValues>,
+    ) -> Result<(), RuntimeError> {
+        self.validate()?;
+        for server in &self.mcp_servers {
+            for text in std::iter::once(&server.command)
+                .chain(std::iter::once(&server.display_name))
+                .chain(&server.args)
+            {
+                if crate::execution::redact(text, "", &[server], secrets) != *text {
+                    return Err(invalid("MCP 定义包含已知密钥值；请移除明文，仅填写认证变量名"));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Import a skill directory or SKILL.md; duplicate identifiers update the entry.
     /// # Errors
     /// Returns file, UTF-8 or invalid identifier errors.
     pub fn import_skill(&mut self, path: &Path) -> Result<String, RuntimeError> {
         let path = if path.is_dir() { path.join("SKILL.md") } else { path.to_owned() };
         let path = fs::canonicalize(path)?;
-        let text = fs::read_to_string(&path)?;
-        if text.trim().is_empty() {
-            return Err(invalid("SKILL.md 为空"));
+        if path.file_name().is_none_or(|name| name != "SKILL.md") {
+            return Err(invalid("请选择技能目录或 SKILL.md"));
         }
-        let id = path
-            .parent()
-            .and_then(Path::file_name)
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| invalid("技能目录没有有效名称"))?
-            .to_owned();
+        let text = fs::read_to_string(&path)?;
+        if text.trim().is_empty() || text.len() > 256 * 1024 {
+            return Err(invalid("SKILL.md 不能为空或超过 256 KiB"));
+        }
+        let id = frontmatter_value(&text, "name").unwrap_or(
+            path.parent()
+                .and_then(Path::file_name)
+                .and_then(|s| s.to_str())
+                .ok_or_else(|| invalid("技能目录没有有效名称"))?
+                .to_owned(),
+        );
         let mut next = self.clone();
+        if next.skills.iter().any(|s| s.id == id && s.path != path) {
+            return Err(invalid("该技能标识已由另一目录使用，请先编辑或删除现有条目"));
+        }
+        let enabled = next.skills.iter().find(|s| s.id == id).is_none_or(|s| s.enabled);
         next.skills.retain(|s| s.id != id);
-        next.skills.push(SkillDefinition { id: id.clone(), path, enabled: true });
+        next.skills.push(SkillDefinition { id: id.clone(), path, enabled });
         next.validate()?;
         *self = next;
         Ok(id)
@@ -209,8 +338,8 @@ impl ToolCatalog {
                 .find(|s| &s.id == id && s.enabled)
                 .ok_or_else(|| invalid(format!("技能 {id} 未定义或已停用")))?;
             let text = fs::read_to_string(&skill.path)?;
-            if text.len() > 256 * 1024 {
-                return Err(invalid("技能文件超过 256 KiB"));
+            if text.trim().is_empty() || text.len() > 256 * 1024 {
+                return Err(invalid("技能文件不能为空或超过 256 KiB"));
             }
             let _ = write!(result, "\n\n## Skill: {id}\n{text}");
         }
@@ -238,7 +367,7 @@ impl ToolCatalog {
         grants: &ToolAuthorizationSettings,
         secrets: Option<&crate::secrets::SecretValues>,
     ) -> Result<Value, RuntimeError> {
-        self.mcp_request(id, grants, "tools/list", &json!({}), secrets)
+        self.mcp_request(id, grants, "tools/list", &json!({}), secrets, None)
     }
 
     /// Call an authorized server; re-evaluate grants at every invocation.
@@ -272,10 +401,31 @@ impl ToolCatalog {
             "tools/call",
             &json!({"name":name,"arguments":arguments}),
             secrets,
+            None,
         )
     }
 
-    #[allow(clippy::too_many_lines)]
+    /// Cancellable discovery/call used by the desktop. A revoked snapshot is
+    /// invalidated by cancelling its operation; the process tree is then stopped.
+    /// # Errors
+    /// Returns authorization, validation, protocol, process or cancellation errors.
+    #[allow(clippy::too_many_arguments)]
+    pub fn request_with_cancellation(
+        &self,
+        id: &str,
+        grants: &ToolAuthorizationSettings,
+        call: Option<(&str, &Value)>,
+        secrets: Option<&crate::secrets::SecretValues>,
+        cancel: &crate::execution::Cancellation,
+    ) -> Result<Value, RuntimeError> {
+        let (method, params) = call.map_or_else(
+            || ("tools/list", json!({})),
+            |(name, arguments)| ("tools/call", json!({"name":name,"arguments":arguments})),
+        );
+        self.mcp_request(id, grants, method, &params, secrets, Some(cancel))
+    }
+
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     fn mcp_request(
         &self,
         id: &str,
@@ -283,7 +433,10 @@ impl ToolCatalog {
         method: &str,
         params: &Value,
         secrets: Option<&crate::secrets::SecretValues>,
+        cancel: Option<&crate::execution::Cancellation>,
     ) -> Result<Value, RuntimeError> {
+        check_cancel(cancel)?;
+        self.validate_secret_references(secrets)?;
         if !grants.authorized_mcp_server_ids.iter().any(|s| s == id) {
             return Err(invalid(format!("MCP {id} 未授权")));
         }
@@ -333,9 +486,7 @@ impl ToolCatalog {
                 input.flush()?;
                 let deadline = std::time::Instant::now() + Duration::from_secs(20);
                 loop {
-                    let line = receiver
-                        .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
-                        .map_err(|_| invalid("MCP 连接关闭或响应超时"))??;
+                    let line = receive_line(&receiver, deadline, cancel)?;
                     let message: Value = serde_json::from_str(&line)?;
                     if message.get("method").is_some() && message.get("id").is_some() {
                         writeln!(
@@ -367,9 +518,7 @@ impl ToolCatalog {
             let mut tools = Vec::new();
             let mut cursors = BTreeSet::new();
             loop {
-                let line = receiver
-                    .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
-                    .map_err(|_| invalid("MCP 连接关闭或响应超时"))??;
+                let line = receive_line(&receiver, deadline, cancel)?;
                 let message: Value = serde_json::from_str(&line)?;
                 if message.get("method").is_some() && message.get("id").is_some() {
                     writeln!(
@@ -405,6 +554,9 @@ impl ToolCatalog {
                         }
                         return Ok(json!({"tools":tools}));
                     }
+                    if !message["result"].is_object() || !message["result"]["content"].is_array() {
+                        return Err(invalid("MCP 工具未返回有效的调用结果"));
+                    }
                     if message["result"]["isError"] == true {
                         // The server's own message is the only clue to the cause (for
                         // example an upstream 401/429); surface it redacted and bounded.
@@ -433,10 +585,37 @@ impl ToolCatalog {
         drop(ownership);
         drop(receiver);
         let _ = reader.join();
+        check_cancel(cancel)?;
         result.map(|mut value| {
             redact_value(&mut value, server, secrets);
             value
         })
+    }
+}
+
+fn check_cancel(cancel: Option<&crate::execution::Cancellation>) -> Result<(), RuntimeError> {
+    if cancel.is_some_and(|c| c.0.load(std::sync::atomic::Ordering::SeqCst)) {
+        return Err(invalid("MCP 操作已取消，授权或配置可能已变化"));
+    }
+    Ok(())
+}
+
+fn receive_line(
+    receiver: &mpsc::Receiver<Result<String, std::io::Error>>,
+    deadline: std::time::Instant,
+    cancel: Option<&crate::execution::Cancellation>,
+) -> Result<String, RuntimeError> {
+    loop {
+        check_cancel(cancel)?;
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(invalid("MCP 响应超时"));
+        }
+        match receiver.recv_timeout(remaining.min(Duration::from_millis(100))) {
+            Ok(line) => return Ok(line?),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Err(invalid("MCP 连接关闭")),
+        }
     }
 }
 
@@ -503,6 +682,7 @@ mod tests {
         let catalog = ToolCatalog {
             mcp_servers: vec![McpServerDefinition {
                 id: "test".into(),
+                display_name: "Test".into(),
                 command: "must-not-run".into(),
                 args: vec![],
                 environment_variables: vec![],
@@ -587,10 +767,34 @@ mod tests {
     }
 
     #[test]
+    fn known_vault_credentials_cannot_be_embedded_in_command_arguments_or_names() {
+        let secrets = crate::secrets::SecretValues::single("MCP_KEY", "fixture-secret-value");
+        let mut catalog = ToolCatalog {
+            mcp_servers: vec![McpServerDefinition {
+                id: "safe".into(),
+                display_name: "safe".into(),
+                command: "server".into(),
+                args: vec![],
+                environment_variables: vec!["MCP_KEY".into()],
+                enabled: true,
+            }],
+            ..Default::default()
+        };
+        catalog.validate_secret_references(Some(&secrets)).unwrap();
+        catalog.mcp_servers[0].args.push("--custom=fixture-secret-value".into());
+        let error = catalog.validate_secret_references(Some(&secrets)).unwrap_err().to_string();
+        assert!(!error.contains("fixture-secret-value"));
+        catalog.mcp_servers[0].args.clear();
+        catalog.mcp_servers[0].display_name = "fixture-secret-value".into();
+        assert!(catalog.validate_secret_references(Some(&secrets)).is_err());
+    }
+
+    #[test]
     fn bundled_servers_merge_once_and_never_overwrite_user_entries() {
         let bundled = bundled_mcp_servers();
         let definition = McpServerDefinition {
             id: BUNDLED_JEV_SERVER_ID.to_owned(),
+            display_name: "Jev".into(),
             command: "evaluate".to_owned(),
             args: vec!["mcp".to_owned()],
             environment_variables: vec!["TYPESAFE_API_KEY".to_owned()],

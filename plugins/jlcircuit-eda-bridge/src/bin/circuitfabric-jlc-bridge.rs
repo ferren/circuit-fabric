@@ -141,6 +141,7 @@ fn serve_connection(mut stream: TcpStream, config_path: &std::path::Path) -> Res
                     .and_then(Value::as_str)
                     .filter(|value| !value.trim().is_empty())
                     .ok_or_else(|| "chat requires text".to_owned())?;
+                let runtime_snapshot = std::fs::read(config_path).map_err(|e| e.to_string())?;
                 let settings =
                     RuntimeSettings::load_or_default(config_path).map_err(|e| e.to_string())?;
                 let registry =
@@ -148,14 +149,15 @@ fn serve_connection(mut stream: TcpStream, config_path: &std::path::Path) -> Res
                         .map_err(|e| e.to_string())?;
                 let root = registry.root_for(project_id).ok_or_else(|| "项目未注册".to_owned())?;
                 let storage = ProjectStorage::open(root).map_err(|e| e.to_string())?;
+                let project_snapshot =
+                    std::fs::read(storage.configuration_path()).map_err(|e| e.to_string())?;
                 let configuration = storage.load_configuration().map_err(|e| e.to_string())?;
-                let mut grants = settings.tools.clone();
-                grants.authorized_skill_ids.extend(configuration.enabled_skill_ids);
-                grants.authorized_mcp_server_ids.extend(configuration.enabled_mcp_server_ids);
-                grants.authorized_skill_ids.sort();
-                grants.authorized_skill_ids.dedup();
-                grants.authorized_mcp_server_ids.sort();
-                grants.authorized_mcp_server_ids.dedup();
+                let project_grants = circuitfabric_codex_runtime::ToolAuthorizationSettings {
+                    authorized_skill_ids: configuration.enabled_skill_ids.clone(),
+                    authorized_mcp_server_ids: configuration.enabled_mcp_server_ids.clone(),
+                };
+                let grants =
+                    settings.catalog.effective_grants(&settings.tools, Some(&project_grants));
                 let thread_id = format!("{project_id}:{session_id}");
                 send_json(
                     &mut stream,
@@ -173,11 +175,14 @@ fn serve_connection(mut stream: TcpStream, config_path: &std::path::Path) -> Res
                 let done = std::sync::atomic::AtomicBool::new(false);
                 let project_path = storage.configuration_path();
                 let configuration_files = [config_path.to_owned(), project_path];
-                let snapshots = configuration_files
+                let snapshots = vec![runtime_snapshot, project_snapshot];
+                if configuration_files
                     .iter()
-                    .map(std::fs::read)
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| e.to_string())?;
+                    .zip(&snapshots)
+                    .any(|(path, original)| std::fs::read(path).ok().as_ref() != Some(original))
+                {
+                    return Err("配置或授权已变化，请重试任务".into());
+                }
                 if previous_snapshot.as_ref() != Some(&snapshots) {
                     threads.clear();
                 }

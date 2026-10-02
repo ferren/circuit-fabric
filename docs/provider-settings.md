@@ -101,7 +101,7 @@ Existing deployments that already export `JLCIRCUIT_LLM_API_KEY` etc. keep worki
 
 ## Scope, persistence and cleanup
 
-Provider, runtime and catalog definitions are global. Projects persist their own grants and instructions. Effective grants are the deduplicated union of global and current-project grants; another project's grants never participate. A disabled or missing definition fails closed even if its ID remains authorized. Revoking a project grant does not override a global grant: revoke globally or disable the definition to prohibit it everywhere.
+Provider, runtime and catalog definitions are global. Projects persist their own grants and instructions. Without a selected project, effective grants come from enabled global definitions. With a project, effective grants are the intersection of global and current-project grants, restricted to existing, enabled definitions; another project's grants never participate. A project cannot expand global permissions. Revoking either the global or current-project grant prevents subsequent project-scoped use. See [skills and MCP management](skills-mcp-management.md) for the management flow and validation evidence.
 
 Desktop revocation, catalog changes and project switches cancel the active task. Bridge tasks monitor configuration files and cancel when they change. New tasks recalculate authorization. Configuration writes validate first, then replace the destination through a temporary file. Failed catalog/grant writes restore prior in-memory configuration and report failure.
 

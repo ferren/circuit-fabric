@@ -2,6 +2,18 @@
 
 2026-09-06，Windows 本机。验证代码位于 `crates/circuitfabric-codex-runtime/tests/`，探针为 `examples/runtime_probe.rs`。
 
+## 2026-10-03 工作区编译修复与补交
+
+技能/MCP 子任务 #490 的运行时、桌面界面、bridge、测试和操作说明此前留在工作区，未包含在工作目录提交 `604f30d` 中，本次一起补交。原生界面首次构建报新接口不存在，而接口实际已在源码中：先前隔离工作副本与当前工作区共用了 `target`，依赖产物沿用了旧源码版本。执行以下命令后，当前工作区原生构建通过，三个包回归共 74 项通过、1 项 Jev 外部依赖测试忽略。
+
+```powershell
+cargo clean -p circuitfabric-codex-runtime -p circuitfabric-document-opener
+cargo build -p circuitfabric-desktop --features native-ui
+cargo test -p circuitfabric-codex-runtime -p circuitfabric-desktop -p jlcircuit-eda-bridge
+```
+
+隔离工作副本验证必须使用该副本自己的默认 `target` 或独立的 `CARGO_TARGET_DIR`，不能指向用户工作区的 `target`。本次不改动其他任务的 PDF 文本选择/原文定位源码。技能/MCP 的原生记录与 Claude/DSH 尚未通过的链路见 [子功能验收说明](skills-mcp-management.md)；以下 2026-09-06 记录是历史验证，不能覆盖最新未完成项。
+
 ## 可复现命令
 
 ```powershell

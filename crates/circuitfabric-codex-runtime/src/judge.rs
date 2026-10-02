@@ -99,6 +99,7 @@ impl LlmJudgeSettings {
         self.validate()?;
         Ok(McpServerDefinition {
             id: BUNDLED_JEV_SERVER_ID.into(),
+            display_name: "Jev".into(),
             command: executable.to_string_lossy().into_owned(),
             args: vec![MCP_FLAG.into(), serde_json::to_string(self)?],
             environment_variables: vec![self.api_key_environment_variable.clone()],
