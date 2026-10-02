@@ -8,6 +8,7 @@ license.workspace = true
 
 [features]
 default = []
+ui-test-support = ["native-ui", "gpui/test-support"]
 native-ui = [
   "dep:gpui",
   "dep:gpui-component",

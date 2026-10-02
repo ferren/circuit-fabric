@@ -3,7 +3,7 @@
 //! Windows ships no system grab cursors, and the pinned GPUI backend maps
 //! `OpenHand`/`ClosedHand` to the plain arrow, so the preview previously fell back to the
 //! pointing hand. This module renders its own 32×32 open-hand and closed-hand cursors
-//! (black silhouette, white outline, classic cursor look), loads them as Win32 cursors,
+//! (white palm, black contour and finger creases), loads them as Win32 cursors,
 //! and shows them through a window subclass that intercepts `WM_SETCURSOR` while the
 //! pointer is over the PDF page area.
 //!
@@ -12,12 +12,12 @@
 //! window-level mouse-move hook (`refresh`) recomputes whether the grab or grabbing
 //! cursor should be active. `clear` drops the area when the pane closes.
 
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, AtomicU32, Ordering};
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallWindowProcW, GWLP_WNDPROC, HCURSOR, IMAGE_CURSOR, LR_LOADFROMFILE, LR_SHARED, LoadImageW,
-    SetCursor, SetWindowLongPtrW, WM_SETCURSOR, WM_USER,
+    CallWindowProcW, GWLP_WNDPROC, HCURSOR, IDC_IBEAM, IMAGE_CURSOR, LR_LOADFROMFILE, LR_SHARED,
+    LoadCursorW, LoadImageW, SetCursor, SetWindowLongPtrW, WM_SETCURSOR, WM_USER,
 };
 use windows::core::PCWSTR;
 
@@ -25,6 +25,7 @@ use windows::core::PCWSTR;
 const PAN_NONE: u8 = 0;
 const PAN_GRAB: u8 = 1;
 const PAN_GRABBING: u8 = 2;
+const PAN_TEXT: u8 = 3;
 
 static PAN_STATE: AtomicU8 = AtomicU8::new(PAN_NONE);
 static PAN_DRAGGING: AtomicBool = AtomicBool::new(false);
@@ -33,6 +34,8 @@ static ORIGINAL_PROC: AtomicIsize = AtomicIsize::new(0);
 static INSTALLED: AtomicBool = AtomicBool::new(false);
 static GRAB_CURSOR: std::sync::OnceLock<isize> = std::sync::OnceLock::new();
 static GRABBING_CURSOR: std::sync::OnceLock<isize> = std::sync::OnceLock::new();
+static TEXT_CURSOR: std::sync::OnceLock<isize> = std::sync::OnceLock::new();
+static CURSOR_LOAD_SEQUENCE: AtomicU32 = AtomicU32::new(0);
 
 /// The page-area rectangle in window coordinates. Paint and mouse handlers both run on
 /// the UI thread, so a mutex is enough.
@@ -69,6 +72,9 @@ pub fn install(window: &gpui::Window) {
 /// raster pages (closed or on the data tab).
 pub fn set_area(area: Option<(f32, f32, f32, f32)>) {
     *PAN_AREA.0.lock().expect("pan area lock") = area;
+    if area.is_none() {
+        PAN_STATE.store(PAN_NONE, Ordering::Release);
+    }
 }
 
 /// Updates whether a pan drag is currently held.
@@ -95,16 +101,32 @@ pub fn refresh(position: (f32, f32)) {
         {
             if PAN_DRAGGING.load(Ordering::Acquire) {
                 PAN_GRABBING
+            } else if crate::pdf_text_layer::over_text(gpui::point(
+                gpui::px(position.0),
+                gpui::px(position.1),
+            )) {
+                PAN_TEXT
             } else {
                 PAN_GRAB
             }
         }
         _ => PAN_NONE,
     };
-    PAN_STATE.store(state, Ordering::Release);
+    if PAN_STATE.swap(state, Ordering::AcqRel) != state
+        && let Some(handle) = cursor_for(state)
+    {
+        // Update immediately even when moving between text and paper inside one hitbox.
+        unsafe { SetCursor(Some(HCURSOR(handle as *mut _))) };
+    }
 }
 
 fn cursor_for(state: u8) -> Option<isize> {
+    if state == PAN_TEXT {
+        let handle = *TEXT_CURSOR.get_or_init(|| unsafe {
+            LoadCursorW(None, IDC_IBEAM).map_or(0, |cursor| cursor.0 as isize)
+        });
+        return (handle != 0).then_some(handle);
+    }
     let slot = match state {
         PAN_GRAB => &GRAB_CURSOR,
         PAN_GRABBING => &GRABBING_CURSOR,
@@ -162,11 +184,11 @@ fn load_cursor(grabbing: bool) -> isize {
     cursor.extend_from_slice(&22u32.to_le_bytes()); // image offset
     cursor.extend_from_slice(&entry);
 
-    let path = std::env::temp_dir().join(if grabbing {
-        "circuitfabric-grabbing.cur"
-    } else {
-        "circuitfabric-grab.cur"
-    });
+    let path = std::env::temp_dir().join(format!(
+        "circuitfabric-hand-{}-{}.cur",
+        std::process::id(),
+        CURSOR_LOAD_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+    ));
     if std::fs::write(&path, cursor).is_err() {
         return 0;
     }
@@ -175,10 +197,13 @@ fn load_cursor(grabbing: bool) -> isize {
     wide.push(0);
     // SAFETY: a plain path load with no module handle; the shared cursor outlives the
     // process and is never destroyed.
-    unsafe {
+    let handle = unsafe {
         LoadImageW(None, PCWSTR(wide.as_ptr()), IMAGE_CURSOR, 0, 0, LR_SHARED | LR_LOADFROMFILE)
             .map_or(0, |handle| handle.0 as isize)
-    }
+    };
+    // LoadImage has copied the payload; no shared filename or persistent file is needed.
+    let _ = std::fs::remove_file(path);
+    handle
 }
 
 unsafe extern "system" fn intercept_proc(
@@ -201,7 +226,7 @@ unsafe extern "system" fn intercept_proc(
         {
             // SAFETY: `handle` came from LoadImageW and stays valid for the process.
             unsafe { SetCursor(Some(HCURSOR(handle as *mut _))) };
-            return LRESULT(0);
+            return LRESULT(1);
         }
     }
     let previous = ORIGINAL_PROC.load(Ordering::Acquire);
@@ -223,7 +248,7 @@ unsafe extern "system" fn intercept_proc(
     }
 }
 
-/// Renders a 32×32 hand cursor as RGBA: black silhouette with a white outline, drawn with
+/// Renders a 32×32 hand cursor as RGBA: white palm with black outline, drawn with
 /// signed-distance shapes and 4× supersampling. `false` is the open grab hand, `true` the
 /// closed grabbing fist.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -242,9 +267,9 @@ fn render_hand(grabbing: bool) -> Vec<u8> {
                         y as f32 + (sub_y as f32 + 0.5) / SCALE as f32,
                     );
                     let distance = hand_distance(point, grabbing);
-                    if distance <= 0.0 {
+                    if distance <= -0.65 && crease_distance(point, grabbing) > 0.48 {
                         inside += 1;
-                    } else if distance <= 1.6 {
+                    } else if distance <= 0.65 {
                         outline += 1;
                     }
                 }
@@ -254,10 +279,10 @@ fn render_hand(grabbing: bool) -> Vec<u8> {
             if coverage == 0 {
                 continue;
             }
-            // Straight-alpha compositing: black fill over a white outline, with the mix
+            // Straight-alpha compositing: white fill and black ink, with the mix
             // and opacity driven by the sub-sample coverage of each.
             let alpha = ((coverage * 255) / samples).min(255) as u8;
-            let luminance = ((outline * 255) / coverage.max(1)).min(255) as u8;
+            let luminance = ((inside * 255) / coverage.max(1)).min(255) as u8;
             let index = (y * SIZE + x) * 4;
             pixels[index] = luminance;
             pixels[index + 1] = luminance;
@@ -266,6 +291,28 @@ fn render_hand(grabbing: bool) -> Vec<u8> {
         }
     }
     pixels
+}
+
+/// Short ink strokes distinguish folded fingers and the thumb from a solid silhouette.
+fn crease_distance(point: (f32, f32), grabbing: bool) -> f32 {
+    let strokes = if grabbing {
+        &[
+            ((12.5, 13.0), (12.5, 16.0)),
+            ((16.0, 12.5), (16.0, 16.0)),
+            ((19.5, 12.5), (19.5, 16.0)),
+            ((11.0, 18.0), (15.0, 20.8)),
+            ((15.0, 20.8), (19.0, 20.8)),
+        ][..]
+    } else {
+        &[
+            ((13.9, 14.5), (13.9, 17.5)),
+            ((17.7, 14.5), (17.7, 17.0)),
+            ((21.4, 15.0), (21.4, 17.5)),
+            ((10.0, 20.0), (12.0, 22.0)),
+            ((14.0, 24.0), (19.5, 24.0)),
+        ][..]
+    };
+    strokes.iter().map(|&(start, end)| segment(point, start, end, 0.0)).fold(f32::MAX, f32::min)
 }
 
 /// Signed distance to the hand silhouette; negative inside.
@@ -291,7 +338,7 @@ fn hand_distance(point: (f32, f32), grabbing: bool) -> f32 {
             segment(point, (19.6, 6.5), (19.6, 15.0), 1.7),
             segment(point, (23.2, 8.5), (23.2, 15.5), 1.7),
             rounded_box(point, (17.0, 20.5), (6.8, 4.8), 3.5),
-            segment(point, (9.5, 15.5), (6.8, 21.0), 1.7),
+            segment(point, (7.0, 17.0), (11.5, 22.0), 1.7),
         ]
         .into_iter()
         .fold(f32::MAX, f32::min)
@@ -342,10 +389,23 @@ mod tests {
             }
             assert!(covered > 120, "the {grabbing} hand silhouette covers a real area");
             assert!(filled < 400, "the {grabbing} hand is a cursor, not a blob");
+            assert!(covered > filled + 40, "the palm must have a visible white interior");
             // Margins stay transparent: corners of the canvas are outside every shape.
             for (x, y) in [(0_usize, 0_usize), (31, 0), (0, 31), (31, 31)] {
                 assert_eq!(pixels[(y * 32 + x) * 4 + 3], 0);
             }
+        }
+        assert_ne!(render_hand(false), render_hand(true));
+        if let Some(path) = std::env::var_os("CIRCUITFABRIC_CURSOR_PREVIEW") {
+            let mut preview =
+                image::RgbaImage::from_pixel(64, 32, image::Rgba([200, 200, 200, 255]));
+            for (x, grabbing) in [(0_i64, false), (32, true)] {
+                let hand = image::RgbaImage::from_raw(32, 32, render_hand(grabbing)).unwrap();
+                image::imageops::overlay(&mut preview, &hand, x, 0);
+            }
+            image::imageops::resize(&preview, 512, 256, image::imageops::FilterType::Nearest)
+                .save(path)
+                .unwrap();
         }
     }
 
@@ -369,20 +429,11 @@ mod tests {
         for grabbing in [false, true] {
             let handle = load_cursor(grabbing);
             if handle == 0 {
-                let path = std::env::temp_dir().join(if grabbing {
-                    "circuitfabric-grabbing.cur"
-                } else {
-                    "circuitfabric-grab.cur"
-                });
-                let size = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or_default();
-                panic!(
-                    "the {grabbing} hand cursor must load as a Win32 cursor (file {size} bytes)"
-                );
+                panic!("the {grabbing} hand cursor must load as a Win32 cursor");
             }
         }
         assert_eq!(cursor_for(PAN_GRAB).unwrap(), *GRAB_CURSOR.get().unwrap());
         assert_eq!(cursor_for(PAN_GRABBING).unwrap(), *GRABBING_CURSOR.get().unwrap());
         assert_eq!(cursor_for(PAN_NONE), None);
-        clear();
     }
 }

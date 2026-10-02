@@ -112,6 +112,32 @@ pub fn pdf_highlight_regions(
     raster::with_pdfium(|pdfium| raster::highlight_regions(pdfium, data, number, terms))
 }
 
+/// Reads exact Unicode glyph bounds for selection without rendering bitmaps. Coordinates
+/// follow the same rotation as the raster preview. Only verified in-memory bytes are used.
+/// `None` means pdfium is unavailable.
+#[cfg(feature = "raster-pdf")]
+#[must_use]
+pub fn pdf_page_text(
+    data: &[u8],
+    numbers: &[u32],
+) -> Option<Result<Vec<crate::PdfPageText>, String>> {
+    raster::with_pdfium(|pdfium| {
+        let document =
+            pdfium.load_pdf_from_byte_slice(data, None).map_err(|error| error.to_string())?;
+        numbers
+            .iter()
+            .map(|&number| {
+                let index = number
+                    .checked_sub(1)
+                    .and_then(|index| u16::try_from(index).ok())
+                    .ok_or_else(|| "invalid PDF page number".to_owned())?;
+                let page = document.pages().get(index).map_err(|error| error.to_string())?;
+                raster::selection_text(&page, number)
+            })
+            .collect()
+    })
+}
+
 /// Locates the search terms starting from a preferred page and highlights them there; when
 /// that page's text layer does not contain the terms, nearby and then remaining pages are
 /// tried, and the page the terms were actually found on is returned. `None` when pdfium is
@@ -415,6 +441,71 @@ mod raster {
         Ok((preferred.clamp(1, count), Vec::new()))
     }
 
+    pub(super) fn selection_text(
+        page: &PdfPage<'_>,
+        number: u32,
+    ) -> Result<crate::PdfPageText, String> {
+        let text = page.text().map_err(|error| error.to_string())?;
+        let (width, height) = preview_dimensions(page);
+        let config = pdfium_render::prelude::PdfRenderConfig::new()
+            .set_target_width(width)
+            .set_target_height(height);
+        let mut result = crate::PdfPageText { number, ..Default::default() };
+        // Bound unusually large text layers; ordinary datasheet pages are far below this.
+        for character in text.chars().iter().take(100_000) {
+            let Some(ch) = character.unicode_char() else { continue };
+            let start = result.text.len();
+            result.text.push(ch);
+            if ch.is_whitespace() {
+                continue;
+            }
+            let Ok(bounds) = character.loose_bounds().or_else(|_| character.tight_bounds()) else {
+                continue;
+            };
+            let corners = [
+                (bounds.left(), bounds.top()),
+                (bounds.right(), bounds.top()),
+                (bounds.left(), bounds.bottom()),
+                (bounds.right(), bounds.bottom()),
+            ]
+            .into_iter()
+            .map(|(x, y)| page.points_to_pixels(x, y, &config))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+            #[allow(clippy::cast_precision_loss)]
+            let fraction = |(x, y): (i32, i32)| (x as f32 / width as f32, y as f32 / height as f32);
+            let corners: Vec<_> = corners.into_iter().map(fraction).collect();
+            let left = corners.iter().map(|p| p.0).fold(1., f32::min).max(0.);
+            let top = corners.iter().map(|p| p.1).fold(1., f32::min).max(0.);
+            let right = corners.iter().map(|p| p.0).fold(0., f32::max).min(1.);
+            let bottom = corners.iter().map(|p| p.1).fold(0., f32::max).min(1.);
+            if right <= left || bottom <= top {
+                continue;
+            }
+            let center_y = (bounds.top() + bounds.bottom()) / 2.0;
+            let leading = fraction(
+                page.points_to_pixels(bounds.left(), center_y, &config)
+                    .map_err(|e| e.to_string())?,
+            );
+            let trailing = fraction(
+                page.points_to_pixels(bounds.right(), center_y, &config)
+                    .map_err(|e| e.to_string())?,
+            );
+            result.characters.push(crate::PdfTextCharacter {
+                bytes: start..result.text.len(),
+                leading,
+                trailing,
+                bounds: crate::PdfHighlightRect {
+                    left,
+                    top,
+                    width: right - left,
+                    height: bottom - top,
+                },
+            });
+        }
+        Ok(result)
+    }
+
     fn regions_on_page(
         page: &PdfPage<'_>,
         terms: &[String],
@@ -710,6 +801,60 @@ mod tests {
         };
         let joined: String = pages.iter().map(|page| page.text.as_str()).collect();
         assert!(joined.contains("1uF"), "extracted: {joined:?}");
+    }
+
+    #[cfg(feature = "raster-pdf")]
+    #[test]
+    fn selectable_glyphs_follow_rotation_and_copy_original_line_breaks() {
+        use pdfium_render::prelude::PdfPageRenderRotation;
+        if !raster::pdfium_available() {
+            return;
+        }
+        let original = testing::minimal_pdf(&["VIN supply input", "VOUT output"]);
+        for rotated in [false, true] {
+            let bytes = if rotated {
+                raster::with_pdfium(|pdfium| {
+                    let doc = pdfium.load_pdf_from_byte_slice(&original, None).unwrap();
+                    doc.pages().get(0).unwrap().set_rotation(PdfPageRenderRotation::Degrees90);
+                    doc.save_to_bytes().unwrap()
+                })
+                .unwrap()
+            } else {
+                original.clone()
+            };
+            let pages = pdf_page_text(&bytes, &[1]).unwrap().unwrap();
+            let page = &pages[0];
+            let start = 0;
+            let end = page.text.trim_end().len();
+            let first = page.characters.iter().find(|ch| ch.bytes.start == start).unwrap();
+            let last = page.characters.iter().find(|ch| ch.bytes.end == end).unwrap();
+            assert_eq!(page.nearest_boundary(first.leading), start);
+            assert_eq!(page.nearest_boundary(last.trailing), end);
+            let copied = &page.text[start..end];
+            assert!(copied.contains("VIN supply input"));
+            assert!(copied.contains("VOUT output"));
+            assert!(copied.contains('\n'));
+            let rect = first.bounds;
+            assert!(page.hit_test((rect.left + rect.width / 2., rect.top + rect.height / 2.)));
+            assert!(!page.hit_test((0.99, 0.99)));
+            assert_eq!(
+                page.selection_rects(start..end).len(),
+                copied.chars().filter(|ch| !ch.is_whitespace()).count()
+            );
+            if rotated {
+                assert!(
+                    (first.leading.1 - first.trailing.1).abs()
+                        > (first.leading.0 - first.trailing.0).abs()
+                );
+            } else {
+                assert!(
+                    (first.leading.0 - first.trailing.0).abs()
+                        > (first.leading.1 - first.trailing.1).abs()
+                );
+            }
+        }
+        assert!(pdf_page_text(&original, &[0]).unwrap().is_err());
+        assert!(pdf_page_text(&original, &[2]).unwrap().is_err());
     }
 
     #[cfg(feature = "raster-pdf")]

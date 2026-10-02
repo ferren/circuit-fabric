@@ -23,6 +23,9 @@ mod plugin_governance;
 #[cfg_attr(not(feature = "native-ui"), allow(dead_code))]
 mod pdf_zoom;
 
+#[cfg(feature = "native-ui")]
+mod pdf_text_layer;
+
 #[cfg(all(feature = "native-ui", windows))]
 #[allow(unsafe_code)]
 mod pdf_cursors;
@@ -720,12 +723,15 @@ fn main() {
     struct DocumentRasterPreview {
         /// The verified bytes pages are rendered from.
         data: std::sync::Arc<[u8]>,
+        content_hash: String,
         /// Size in points of every page.
         page_sizes: Vec<(f32, f32)>,
         pages: BTreeMap<u32, DocumentRasterPreviewPage>,
         in_flight: BTreeMap<u32, u32>,
         failed: std::collections::BTreeSet<(u32, u32)>,
         retired_images: Vec<std::sync::Arc<gpui::RenderImage>>,
+        /// Small, resolution-independent glyph metadata is reused across zoom renders.
+        text_pages: BTreeMap<u32, std::sync::Arc<circuitfabric_document_opener::PdfPageText>>,
     }
 
     /// What the preview pane shows for one selected document.
@@ -858,6 +864,12 @@ fn main() {
         // Background PDF full-text indexing per (project, document); indexed documents
         // leave the map, failed ones stay so they are not retried every time.
         pdf_index_state: BTreeMap<(ProjectId, String), PdfIndexState>,
+        /// Source-page lookup reuses the full-text indexing pass. Scoped by project/document
+        /// and checked against the newly verified file hash before every navigation.
+        datasheet_source_indexes: BTreeMap<
+            (ProjectId, String),
+            std::sync::Arc<circuitfabric_document_opener::datasheet::DatasheetEvidenceIndex>,
+        >,
         datasheet_rows_visible: usize,
         pre_preview_window_size: Option<Size<gpui::Pixels>>,
         usage_period: UsagePeriod,
@@ -875,6 +887,8 @@ fn main() {
         evidence_visible: usize,
         preview_focus: Option<PreviewFocus>,
         preview_scroll: gpui::ScrollHandle,
+        preview_text_focus: gpui::FocusHandle,
+        selection_pressed: std::rc::Rc<std::cell::Cell<bool>>,
         preview_pdf_zoom: crate::pdf_zoom::ZoomMotion,
         preview_zoom_tick: Option<std::time::Instant>,
         preview_pdf_pan: Option<(gpui::Point<gpui::Pixels>, gpui::Point<gpui::Pixels>)>,
@@ -1430,6 +1444,7 @@ fn main() {
                 datasheet_cancel: None,
                 datasheet_checkpoint: None,
                 pdf_index_state: BTreeMap::new(),
+                datasheet_source_indexes: BTreeMap::new(),
                 datasheet_rows_visible: 40,
                 pre_preview_window_size: None,
                 usage_period: UsagePeriod::All,
@@ -1445,6 +1460,8 @@ fn main() {
                 evidence_visible: EVIDENCE_PAGE_SIZE,
                 preview_focus: None,
                 preview_scroll: gpui::ScrollHandle::new(),
+                preview_text_focus: cx.focus_handle(),
+                selection_pressed: std::rc::Rc::new(std::cell::Cell::new(false)),
                 preview_pdf_zoom: crate::pdf_zoom::ZoomMotion::default(),
                 preview_zoom_tick: None,
                 preview_pdf_pan: None,
@@ -3257,13 +3274,26 @@ fn main() {
                 let work = cx.background_spawn({
                     let storage = storage.clone();
                     let document = document.clone();
-                    async move { circuitfabric_project::extract_pdf_pages(&storage, &document) }
+                    async move {
+                        let pages = circuitfabric_project::extract_pdf_pages(&storage, &document)?;
+                        let source_index = std::sync::Arc::new(
+                            circuitfabric_document_opener::datasheet::DatasheetEvidenceIndex::from_pages(
+                                &document.content_hash, &pages,
+                            ),
+                        );
+                        Some((pages, source_index))
+                    }
                 });
                 cx.spawn(async move |view, cx| {
                     let pages = work.await;
                     view.update(cx, |view, cx| {
-                        let indexed = pages.is_some_and(|pages| {
-                            view.workspace.register_pdf_pages(&key.0, &document, &pages).is_ok()
+                        let indexed = pages.is_some_and(|(pages, source_index)| {
+                            if view.workspace.register_pdf_pages(&key.0, &document, &pages).is_err()
+                            {
+                                return false;
+                            }
+                            view.datasheet_source_indexes.insert(key.clone(), source_index);
+                            true
                         });
                         if indexed {
                             view.pdf_index_state.remove(&key);
@@ -3446,6 +3476,12 @@ fn main() {
                 Some(self.language.choose("正在定位原文…", "Locating source…").to_owned());
             focus.resolving = true;
             let focus = focus.clone();
+            let source_key = (focus.project_id.clone(), focus.document_id.clone());
+            let mut source_index = self
+                .datasheet_source_indexes
+                .get(&source_key)
+                .filter(|index| index.content_hash() == focus.content_hash)
+                .cloned();
             let generation = self.preview_focus_generation;
             let work = cx.background_spawn(async move {
                 let request = storage
@@ -3477,12 +3513,15 @@ fn main() {
                         .unwrap_or((page, Vec::new()))
                     }
                     _ => {
-                        let page =
-                            circuitfabric_document_opener::datasheet::locate_datasheet_evidence(
-                                &request,
-                                section.as_deref().unwrap_or_default(),
-                                &focus.text,
-                            )?
+                        // Cold navigation before search indexing finishes builds once off the
+                        // UI thread; its result is retained for subsequent row clicks too.
+                        if source_index.is_none() {
+                            source_index = Some(std::sync::Arc::new(
+                                circuitfabric_document_opener::datasheet::DatasheetEvidenceIndex::from_request(&request)?,
+                            ));
+                        }
+                        let page = source_index.as_ref().expect("source index prepared")
+                            .locate(&request, section.as_deref().unwrap_or_default(), &focus.text)?
                             .ok_or_else(|| {
                                 "未能在当前 PDF 中定位这条证据，请对照原文核对。".to_owned()
                             })?;
@@ -3496,7 +3535,7 @@ fn main() {
                         (page, regions)
                     }
                 };
-                Ok::<_, String>((page, regions))
+                Ok::<_, String>((page, regions, source_index))
             });
             cx.spawn(async move |view, cx| {
                 let result = work.await;
@@ -3504,7 +3543,10 @@ fn main() {
                     if view.preview_focus_generation != generation { return }
                     let Some(focus) = view.preview_focus.as_mut() else { return };
                     match result {
-                        Ok((page, regions)) => {
+                        Ok((page, regions, source_index)) => {
+                            if let Some(index) = source_index {
+                                view.datasheet_source_indexes.insert(source_key, index);
+                            }
                             focus.resolving = false;
                             match focus.anchor {
                                 FragmentAnchor::PageLine { page: anchored, line } if page != anchored => {
@@ -3795,6 +3837,7 @@ fn main() {
             window: &mut Window,
             cx: &mut Context<Self>,
         ) {
+            gpui_base::TextSelection::clear(window, cx);
             let storage = self.project_storages.get(&project_id).cloned();
             let document_id = document.id.clone();
             if self.document_preview.is_none() && !window.is_fullscreen() && !window.is_maximized()
@@ -4315,6 +4358,7 @@ fn main() {
         }
 
         fn close_document_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+            gpui_base::TextSelection::clear(window, cx);
             self.release_preview_images(window);
             self.document_preview = None;
             self.stop_pdf_interaction();
@@ -9707,6 +9751,15 @@ fn main() {
                 return None;
             };
             let initial = std::mem::take(pages);
+            let text_pages = circuitfabric_document_opener::pdf_page_text(
+                data,
+                &initial.iter().map(|page| page.number).collect::<Vec<_>>(),
+            )
+            .and_then(Result::ok)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|page| (page.number, std::sync::Arc::new(page)))
+            .collect();
             let fallback = initial.first().map_or((612.0, 792.0), |page| {
                 (page.width.max(1) as f32, page.height.max(1) as f32)
             });
@@ -9716,11 +9769,13 @@ fn main() {
                 .unwrap_or_else(|| vec![fallback; *page_count]);
             Some(DocumentRasterPreview {
                 data: std::sync::Arc::from(data),
+                content_hash: view.content_hash.clone(),
                 page_sizes,
                 pages: Self::raster_preview_pages(initial, 900).into_iter().collect(),
                 in_flight: BTreeMap::new(),
                 failed: std::collections::BTreeSet::new(),
                 retired_images: Vec::new(),
+                text_pages,
             })
         }
 
@@ -9812,7 +9867,22 @@ fn main() {
             let project_id = preview.project_id.clone();
             let document_id = preview.document_id.clone();
             let requested = wanted.clone();
+            let missing_text: Vec<_> = wanted
+                .iter()
+                .map(|(number, _)| *number)
+                .filter(|number| !raster.text_pages.contains_key(number))
+                .collect();
             let work = cx.background_spawn(async move {
+                let mut text_pages: BTreeMap<_, _> = if missing_text.is_empty() {
+                    BTreeMap::new()
+                } else {
+                    circuitfabric_document_opener::pdf_page_text(&data, &missing_text)
+                        .and_then(Result::ok)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|page| (page.number, std::sync::Arc::new(page)))
+                        .collect()
+                };
                 requested
                     .into_iter()
                     .map(|(number, width)| {
@@ -9828,7 +9898,7 @@ fn main() {
                                 .next()
                                 .map(|(_, page)| page)
                         });
-                        (number, width, page)
+                        (number, width, page, text_pages.remove(&number))
                     })
                     .collect::<Vec<_>>()
             });
@@ -9850,8 +9920,11 @@ fn main() {
                     {
                         return;
                     }
-                    for (number, width, page) in rendered {
+                    for (number, width, page, text) in rendered {
                         raster.in_flight.remove(&number);
+                        if let Some(text) = text {
+                            raster.text_pages.insert(number, text);
+                        }
                         if let Some(page) = page {
                             if let Some(old) = raster.pages.insert(number, page) {
                                 raster.retired_images.push(old.image);
@@ -9969,7 +10042,8 @@ fn main() {
                                 .when(!show_data, Button::primary)
                                 .when(show_data, Button::ghost)
                                 .label(language.choose("文档", "Document"))
-                                .on_click(move |_, _, cx| {
+                                .on_click(move |_, window, cx| {
+                                    gpui_base::TextSelection::clear(window, cx);
                                     preview_tab.update(cx, |view, cx| {
                                         view.preview_show_data = false;
                                         view.stop_pdf_interaction();
@@ -9985,7 +10059,8 @@ fn main() {
                                 .when(show_data, Button::primary)
                                 .when(!show_data, Button::ghost)
                                 .label(language.choose("数据", "Data"))
-                                .on_click(move |_, _, cx| {
+                                .on_click(move |_, window, cx| {
+                                    gpui_base::TextSelection::clear(window, cx);
                                     data_tab.update(cx, |view, cx| {
                                         view.preview_show_data = true;
                                         view.stop_pdf_interaction();
@@ -10228,8 +10303,13 @@ fn main() {
             } else {
                 scroll_content
             };
+            let text_focus = self.preview_text_focus.clone();
             let pane =
                 div()
+                    .track_focus(&self.preview_text_focus)
+                    .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
+                        window.focus(&text_focus, cx);
+                    })
                     .flex_none()
                     .w(px(pane_width))
                     .h_full()
@@ -10457,6 +10537,11 @@ fn main() {
         }
 
         fn begin_pdf_pan(&mut self, position: gpui::Point<gpui::Pixels>, cx: &mut Context<Self>) {
+            // Let the window's text-selection layer own gestures starting on glyphs.
+            // A drag which began on blank paper stays a pan even when it crosses text.
+            if crate::pdf_text_layer::over_text(position) {
+                return;
+            }
             self.stop_pdf_interaction();
             self.preview_pdf_pan = Some((position, self.preview_scroll.offset()));
             cx.stop_propagation();
@@ -10779,7 +10864,11 @@ fn main() {
                         .text_sm()
                         .font_weight(FontWeight::SEMIBOLD)
                         .whitespace_normal()
-                        .child(overview.title.clone()),
+                        .cursor(gpui::CursorStyle::IBeam)
+                        .child(gpui_base::SelectableText::new(
+                            "datasheet-title",
+                            overview.title.clone(),
+                        )),
                 );
             let identity_line = [
                 overview.manufacturer.clone(),
@@ -10796,7 +10885,8 @@ fn main() {
                         .text_xs()
                         .text_color(rgb(TEXT_MUTED))
                         .whitespace_normal()
-                        .child(identity_line),
+                        .cursor(gpui::CursorStyle::IBeam)
+                        .child(gpui_base::SelectableText::new("datasheet-identity", identity_line)),
                 );
             }
             if !overview.features.is_empty() {
@@ -10811,12 +10901,16 @@ fn main() {
                                 .text_color(rgb(0x000e_7490))
                                 .child(language.choose("特性", "Features")),
                         )
-                        .children(overview.features.iter().map(|feature| {
+                        .children(overview.features.iter().enumerate().map(|(index, feature)| {
                             div()
                                 .text_xs()
                                 .text_color(rgb(TEXT_PRIMARY))
                                 .whitespace_normal()
-                                .child(format!("• {feature}"))
+                                .cursor(gpui::CursorStyle::IBeam)
+                                .child(gpui_base::SelectableText::new(
+                                    ("datasheet-feature", index),
+                                    format!("• {feature}"),
+                                ))
                         })),
                 );
             }
@@ -10826,7 +10920,11 @@ fn main() {
                         .text_xs()
                         .text_color(rgb(TEXT_SECONDARY))
                         .whitespace_normal()
-                        .child(overview.description.clone()),
+                        .cursor(gpui::CursorStyle::IBeam)
+                        .child(gpui_base::SelectableText::new(
+                            "datasheet-description",
+                            overview.description.clone(),
+                        )),
                 );
             }
             content = content.child(overview_card);
@@ -10902,12 +11000,16 @@ fn main() {
             if !extraction.notes.is_empty() {
                 content = content.child(
                     div().v_flex().gap_0p5().p_2().rounded_md().bg(rgb(SURFACE_BG)).children(
-                        extraction.notes.iter().map(|note| {
+                        extraction.notes.iter().enumerate().map(|(index, note)| {
                             div()
                                 .text_xs()
                                 .text_color(rgb(TEXT_MUTED))
                                 .whitespace_normal()
-                                .child(format!("· {note}"))
+                                .cursor(gpui::CursorStyle::IBeam)
+                                .child(gpui_base::SelectableText::new(
+                                    ("datasheet-note", index),
+                                    format!("· {note}"),
+                                ))
                         }),
                     ),
                 );
@@ -10923,8 +11025,8 @@ fn main() {
             focused_row: Option<usize>,
             row_anchor: Option<&gpui::ScrollAnchor>,
             entity: &Entity<Self>,
-        ) -> Div {
-            let mut table = div().v_flex().gap_1().child(
+        ) -> gpui::Stateful<Div> {
+            let mut table = div().id("datasheet-pins").v_flex().gap_1().child(
                 div().text_sm().font_weight(FontWeight::SEMIBOLD).child(language.choose_owned(
                     format!("引脚（{}）", pins.len()),
                     format!("Pins ({})", pins.len()),
@@ -10945,7 +11047,11 @@ fn main() {
                     .text_xs()
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(rgb(TEXT_MUTED))
-                    .child(label.to_owned())
+                    .cursor(gpui::CursorStyle::IBeam)
+                    .child(gpui_base::SelectableText::new(
+                        gpui::SharedString::from(format!("pin-header-{label}")),
+                        label.to_owned(),
+                    ))
             };
             table = table.child(
                 div()
@@ -10978,7 +11084,11 @@ fn main() {
                                 .w(px(34.0))
                                 .text_xs()
                                 .text_color(rgb(TEXT_PRIMARY))
-                                .child(pin.number.clone()),
+                                .cursor(gpui::CursorStyle::IBeam)
+                                .child(gpui_base::SelectableText::new(
+                                    "number",
+                                    pin.number.clone(),
+                                )),
                         )
                         .child(
                             div()
@@ -10987,7 +11097,8 @@ fn main() {
                                 .text_xs()
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(rgb(TEXT_PRIMARY))
-                                .child(pin.name.clone()),
+                                .cursor(gpui::CursorStyle::IBeam)
+                                .child(gpui_base::SelectableText::new("name", pin.name.clone())),
                         )
                         .child(
                             div()
@@ -10995,7 +11106,11 @@ fn main() {
                                 .w(px(52.0))
                                 .text_xs()
                                 .text_color(rgb(0x000e_7490))
-                                .child(pin.kind.as_str().to_owned()),
+                                .cursor(gpui::CursorStyle::IBeam)
+                                .child(gpui_base::SelectableText::new(
+                                    "kind",
+                                    pin.kind.as_str().to_owned(),
+                                )),
                         )
                         .child(
                             div()
@@ -11004,7 +11119,11 @@ fn main() {
                                 .text_xs()
                                 .text_color(rgb(TEXT_SECONDARY))
                                 .whitespace_normal()
-                                .child(pin.description.clone()),
+                                .cursor(gpui::CursorStyle::IBeam)
+                                .child(gpui_base::SelectableText::new(
+                                    "description",
+                                    pin.description.clone(),
+                                )),
                         )
                         .child(Self::datasheet_source_link(
                             entity,
@@ -11031,8 +11150,8 @@ fn main() {
             section: &'static str,
             accent: u32,
             accent_text: u32,
-        ) -> Div {
-            let mut table = div().v_flex().gap_1().child(
+        ) -> gpui::Stateful<Div> {
+            let mut table = div().id(section).v_flex().gap_1().child(
                 div()
                     .flex()
                     .items_center()
@@ -11046,7 +11165,11 @@ fn main() {
                             .flex_none()
                             .bg(rgb(accent))
                             .text_color(rgb(accent_text))
-                            .child(title.to_owned()),
+                            .cursor(gpui::CursorStyle::IBeam)
+                            .child(gpui_base::SelectableText::new(
+                                "section-title",
+                                title.to_owned(),
+                            )),
                     )
                     .child(div().ml_auto().text_xs().text_color(rgb(TEXT_MUTED)).child(
                         language.choose_owned(
@@ -11070,7 +11193,11 @@ fn main() {
                     .text_xs()
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(rgb(TEXT_MUTED))
-                    .child(label.to_owned())
+                    .cursor(gpui::CursorStyle::IBeam)
+                    .child(gpui_base::SelectableText::new(
+                        gpui::SharedString::from(format!("parameter-header-{label}")),
+                        label.to_owned(),
+                    ))
             };
             table = table.child(
                 div()
@@ -11088,13 +11215,17 @@ fn main() {
                     .child(header_row(language.choose("单位", "Unit"), 34.0)),
             );
             for (index, parameter) in parameters.iter().enumerate().take(visible_rows) {
-                let cell = |value: &Option<String>, emphasized: bool| {
+                let cell = |id: &'static str, value: &Option<String>, emphasized: bool| {
                     div()
                         .flex_none()
                         .w(px(if emphasized { 46.0 } else { 0.0 }))
                         .text_xs()
                         .text_color(rgb(TEXT_PRIMARY))
-                        .child(value.clone().unwrap_or_else(|| "—".to_owned()))
+                        .cursor(gpui::CursorStyle::IBeam)
+                        .child(gpui_base::SelectableText::new(
+                            id,
+                            value.clone().unwrap_or_else(|| "—".to_owned()),
+                        ))
                 };
                 table = table.child(
                     div()
@@ -11114,7 +11245,11 @@ fn main() {
                                 .text_xs()
                                 .text_color(rgb(TEXT_PRIMARY))
                                 .whitespace_normal()
-                                .child(parameter.parameter.clone()),
+                                .cursor(gpui::CursorStyle::IBeam)
+                                .child(gpui_base::SelectableText::new(
+                                    "parameter",
+                                    parameter.parameter.clone(),
+                                )),
                         )
                         .child(
                             div()
@@ -11124,11 +11259,15 @@ fn main() {
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(rgb(0x000e_7490))
                                 .whitespace_normal()
-                                .child(parameter.symbol.clone().unwrap_or_else(|| "—".to_owned())),
+                                .cursor(gpui::CursorStyle::IBeam)
+                                .child(gpui_base::SelectableText::new(
+                                    "symbol",
+                                    parameter.symbol.clone().unwrap_or_else(|| "—".to_owned()),
+                                )),
                         )
-                        .child(cell(&parameter.min, true))
-                        .child(cell(&parameter.typ, true))
-                        .child(cell(&parameter.max, true))
+                        .child(cell("min", &parameter.min, true))
+                        .child(cell("typ", &parameter.typ, true))
+                        .child(cell("max", &parameter.max, true))
                         .child(
                             div()
                                 .flex_none()
@@ -11136,7 +11275,11 @@ fn main() {
                                 .text_xs()
                                 .text_color(rgb(TEXT_MUTED))
                                 .whitespace_normal()
-                                .child(parameter.unit.clone().unwrap_or_else(|| "—".to_owned())),
+                                .cursor(gpui::CursorStyle::IBeam)
+                                .child(gpui_base::SelectableText::new(
+                                    "unit",
+                                    parameter.unit.clone().unwrap_or_else(|| "—".to_owned()),
+                                )),
                         )
                         .when_some(parameter.conditions.clone(), |row, conditions| {
                             row.child(
@@ -11146,7 +11289,11 @@ fn main() {
                                     .text_xs()
                                     .text_color(rgb(TEXT_MUTED))
                                     .whitespace_normal()
-                                    .child(format!("({conditions})")),
+                                    .cursor(gpui::CursorStyle::IBeam)
+                                    .child(gpui_base::SelectableText::new(
+                                        "conditions",
+                                        format!("({conditions})"),
+                                    )),
                             )
                         })
                         .child(Self::datasheet_source_link(
@@ -11201,6 +11348,7 @@ fn main() {
             entity: &Entity<Self>,
             grabbing: bool,
         ) -> Vec<(Option<u32>, AnyElement)> {
+            crate::pdf_text_layer::begin_frame();
             // Page bitmaps follow the divider: pane width minus the body padding, the page
             // card's own padding, and its border.
             let bitmap_width = (pane_width - 34.0).max(240.0) * zoom;
@@ -11212,11 +11360,11 @@ fn main() {
                     .text_color(rgb(TEXT_MUTED))
                     .child(language.choose_owned(
                         format!(
-                            "共 {page_count} 页 · {:.0}% · Ctrl＋滚轮缩放，左键拖动",
+                            "共 {page_count} 页 · {:.0}% · Ctrl＋滚轮缩放，空白处拖动，文字处选择并 Ctrl+C 复制",
                             zoom * 100.0
                         ),
                         format!(
-                            "{page_count} pages · {:.0}% · Ctrl + wheel to zoom; drag to pan",
+                            "{page_count} pages · {:.0}% · Ctrl + wheel to zoom; drag blank paper to pan; select text and Ctrl+C to copy",
                             zoom * 100.0
                         ),
                     ))
@@ -11248,7 +11396,17 @@ fn main() {
                                         .left(px(region.left * bitmap_width)).top(px(region.top * display_height))
                                         .w(px(region.width * bitmap_width)).h(px(region.height * display_height))
                                         .bg(rgba(0xffd8_3d66)).border_1().border_color(rgba(0xe0a0_0090))
-                                })),
+                                }))
+                            .when_some(raster.text_pages.get(&number), |page, text| {
+                                // Namespace retained selection state by the managed copy so
+                                // another document never inherits the old selection.
+                                page.child(div().absolute().top(px(0.)).left(px(0.)).child(
+                                    crate::pdf_text_layer::PdfTextLayer::new(
+                                        gpui::SharedString::from(format!("pdf-text-{}-{number}", raster.content_hash)),
+                                        text.clone(), bitmap_width, display_height, grabbing,
+                                    ),
+                                ))
+                            }),
                     ),
                     None => frame.child(
                         div()
@@ -11264,6 +11422,16 @@ fn main() {
                                 language.choose("该页无法渲染", "This page could not be rendered")
                             } else {
                                 language.choose("正在渲染…", "Rendering…")
+                            })
+                            .relative()
+                            .when_some(raster.text_pages.get(&number), |page, text| {
+                                // Retain selection participants when their bitmap is evicted.
+                                page.child(div().absolute().top(px(0.)).left(px(0.)).child(
+                                    crate::pdf_text_layer::PdfTextLayer::new(
+                                        gpui::SharedString::from(format!("pdf-text-{}-{number}", raster.content_hash)),
+                                        text.clone(), bitmap_width, display_height, grabbing,
+                                    ),
+                                ))
                             }),
                     ),
                 };
@@ -15579,6 +15747,9 @@ fn main() {
                 .flex()
                 .bg(rgb(SURFACE_BG))
                 .text_color(rgb(TEXT_PRIMARY))
+                .child(crate::pdf_text_layer::selection_gesture_guard(
+                    self.selection_pressed.clone(),
+                ))
                 .child(
                     // Sidebar
                     div()

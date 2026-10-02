@@ -632,6 +632,81 @@ pub fn locate_datasheet_evidence(
         .and_then(|index| u32::try_from(index + 1).ok()))
 }
 
+/// Page-level source lookup prepared once from the full text already extracted for search.
+/// It keeps category preference (including duplicate quotes) and exact normalized matching
+/// without parsing or scoring the PDF again for every source-link click.
+#[derive(Debug)]
+pub struct DatasheetEvidenceIndex {
+    content_hash: String,
+    normalized_pages: Vec<String>,
+    preferred: [Vec<usize>; 4],
+}
+
+impl DatasheetEvidenceIndex {
+    /// Prepares an index from full, untruncated pages of a hash-verified managed copy.
+    /// `content_hash` must belong to those exact PDF bytes, not to the extracted text.
+    #[must_use]
+    pub fn from_pages(content_hash: &str, pages: &[String]) -> Self {
+        let preferred = std::array::from_fn(|category| {
+            let mut indices = select_category_pages(pages, category).page_indices;
+            indices.sort_by_key(|&index| std::cmp::Reverse(datasheet_page_score(&pages[index])));
+            indices
+        });
+        Self {
+            content_hash: content_hash.to_owned(),
+            normalized_pages: pages.iter().map(|page| normalize_evidence(page)).collect(),
+            preferred,
+        }
+    }
+
+    /// Builds the fallback index when background search indexing has not finished yet.
+    ///
+    /// # Errors
+    /// Returns an error when the verified PDF text cannot be extracted.
+    pub fn from_request(request: &DocumentOpenerRequest) -> Result<Self, String> {
+        let pages = pdf_extract::extract_text_from_mem_by_pages(request.managed_copy.data())
+            .map_err(|error| format!("PDF text extraction failed: {error}"))?;
+        Ok(Self::from_pages(&request.content_hash, &pages))
+    }
+
+    /// Hash of the original PDF bytes used to build this index.
+    #[must_use]
+    pub fn content_hash(&self) -> &str {
+        &self.content_hash
+    }
+
+    /// Locates evidence using a newly authorized, verified request of the same content.
+    ///
+    /// # Errors
+    /// Rejects an index whose hash differs from the currently verified copy.
+    pub fn locate(
+        &self,
+        request: &DocumentOpenerRequest,
+        section: &str,
+        evidence: &str,
+    ) -> Result<Option<u32>, String> {
+        if self.content_hash != request.content_hash {
+            return Err("PDF source index belongs to different document content".to_owned());
+        }
+        let needle = normalize_evidence(evidence);
+        if needle.is_empty() {
+            return Ok(None);
+        }
+        let category =
+            ["pins", "absoluteMaximumRatings", "electricalCharacteristics", "operatingConditions"]
+                .iter()
+                .position(|field| *field == section);
+        let preferred =
+            category.map(|category| self.preferred[category].as_slice()).unwrap_or_default();
+        Ok(preferred
+            .iter()
+            .copied()
+            .chain(0..self.normalized_pages.len())
+            .find(|&index| self.normalized_pages[index].contains(&needle))
+            .and_then(|index| u32::try_from(index + 1).ok()))
+    }
+}
+
 #[must_use]
 pub fn extract_datasheet(request: &DocumentOpenerRequest) -> DatasheetExtraction {
     #[cfg(feature = "raster-pdf")]
@@ -1852,6 +1927,44 @@ mod tests {
         );
         assert_eq!(locate_datasheet_evidence(&request, "pins", "invented line").unwrap(), None);
         assert_eq!(locate_datasheet_evidence(&request, "pins", " ").unwrap(), None);
+    }
+
+    #[test]
+    fn prepared_source_index_keeps_category_preference_and_full_page_fallback() {
+        let pages = vec![
+            "Overview: Supply current 4 mA".to_owned(),
+            "Features".to_owned(),
+            "Pin Description\n1 VIN Power supply input".to_owned(),
+            "Absolute Maximum Ratings\nInput voltage 6 V".to_owned(),
+            "Electrical Characteristics\nSupply current 4 mA".to_owned(),
+            "Recommended Operating Conditions\nTemperature -40 85 C".to_owned(),
+            // Evidence beyond a selected excerpt must remain locatable too.
+            format!("{}\nLate quote with 3 μA", "General information.\n".repeat(10_000)),
+        ];
+        let request = crate::testing::request_for("cached.pdf", b"verified snapshot");
+        let index = DatasheetEvidenceIndex::from_pages(&request.content_hash, &pages);
+        for (section, evidence, page) in [
+            ("pins", "1 VIN  Power\nsupply input", 3),
+            ("absoluteMaximumRatings", "Input voltage 6 V", 4),
+            ("electricalCharacteristics", "Supply current 4 mA", 5),
+            ("operatingConditions", "Temperature −40 85 C", 6),
+            ("pins", "Late quote with 3 µA", 7),
+            ("unknown", "Supply current 4 mA", 1),
+        ] {
+            assert_eq!(index.locate(&request, section, evidence).unwrap(), Some(page));
+        }
+        assert_eq!(index.locate(&request, "pins", "invented").unwrap(), None);
+        assert_eq!(index.locate(&request, "pins", " \n ").unwrap(), None);
+    }
+
+    #[test]
+    fn prepared_source_index_rejects_changed_document_content() {
+        let request = crate::testing::request_for("cached.pdf", b"original verified bytes");
+        let changed = crate::testing::request_for("cached.pdf", b"changed verified bytes");
+        let index =
+            DatasheetEvidenceIndex::from_pages(&request.content_hash, &["1 VIN Input".to_owned()]);
+        assert_eq!(index.locate(&request, "pins", "1 VIN Input").unwrap(), Some(1));
+        assert!(index.locate(&changed, "pins", "1 VIN Input").is_err());
     }
 
     #[test]
