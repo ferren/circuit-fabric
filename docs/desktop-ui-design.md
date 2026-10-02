@@ -206,7 +206,7 @@ Implemented today: the page is a two-pane **multi-EDA service registry** mirrori
 
 ### 5.6 Agents & Tools
 
-Two-pane layout mirroring Projects (grouped list on the left, detail on the right):
+Two-pane layout mirroring Projects (grouped list on the left, detail on the right). Every page scrolls as a whole when content exceeds the window; detail panes show read-only summaries, and editing happens in modal dialogs with the save action inside (cancel keeps the draft):
 
 - **Runtime endpoints**: Codex App Server command / working directory with a supervised start & stop lifecycle (status chip: starting / running · PID / stopped / failed, echoed in the sidebar); the JLC bridge listen address belongs to EDA Services (§5.5); Claude Code and DSH shown as "coming soon" stubs.
 - **LLM providers**: multi-provider card list (default marked ★), add/edit/remove, enable/disable, vision config; a prominent note that "API keys are environment-variable names only — no key value is saved here", plus a live source hint under each key field (✔ unlocked vault / ✔ process environment / ✘ not found).

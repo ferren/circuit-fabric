@@ -897,6 +897,9 @@ fn main() {
         new_project_description: Entity<InputState>,
         new_project_root: Entity<InputState>,
         agents_selection: AgentsSelection,
+        adapter_settings_open: Option<RuntimeAdapter>,
+        provider_editor_open: bool,
+        dialog_error: Option<String>,
         codex_process: Option<CodexAppServerHandle>,
         codex_status: RuntimeLifecycleStatus,
         codex_active_provider: Option<String>,
@@ -1457,6 +1460,9 @@ fn main() {
                 new_project_description,
                 new_project_root,
                 agents_selection: AgentsSelection::Runtime(RuntimeAdapter::CodexAppServer),
+                adapter_settings_open: None,
+                provider_editor_open: false,
+                dialog_error: None,
                 codex_process: None,
                 codex_status: RuntimeLifecycleStatus::Stopped,
                 codex_active_provider: None,
@@ -1715,19 +1721,23 @@ fn main() {
             Ok(())
         }
 
-        fn save_providers(&mut self, cx: &mut Context<Self>) {
+        /// Persists the provider list, reporting the outcome through `status` and returning the
+        /// failure so dialogs can show it inline.
+        fn save_providers_checked(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
             let update = crate::settings_persistence::SettingsUpdate::Providers {
                 providers: self.provider_values(cx),
                 default_provider_id: self.default_provider_id.clone(),
             };
-            self.status = match self.save_update(update) {
-                Ok(()) => "已保存 Provider 列表及默认项；下次任务生效，运行中的服务须重启。".into(),
-                Err(error) => format!("Provider 未保存：{error}"),
-            };
-            cx.notify();
+            self.save_update(update).map_err(|error| format!("Provider 未保存：{error}"))
         }
 
-        fn save_runtime(&mut self, adapter: RuntimeAdapter, cx: &mut Context<Self>) {
+        /// Persists one adapter's settings, reporting the outcome through `status` and returning
+        /// the failure so dialogs can show it inline.
+        fn save_runtime_checked(
+            &mut self,
+            adapter: RuntimeAdapter,
+            cx: &mut Context<Self>,
+        ) -> Result<(), String> {
             use crate::settings_persistence::SettingsUpdate;
             let (command, provider) = self.runtime_fields(adapter);
             let command = command.read(cx).value().trim().to_owned();
@@ -1741,16 +1751,12 @@ fn main() {
                 RuntimeAdapter::ClaudeCode => SettingsUpdate::Claude { command, provider_id },
                 RuntimeAdapter::Dsh => SettingsUpdate::Dsh { command, provider_id },
             };
-            self.status = match self.save_update(update) {
-                Ok(()) => {
-                    format!("已保存 {} 配置；下次任务生效，运行中的服务须重启。", adapter.label())
-                }
-                Err(error) => format!(
+            self.save_update(update).map_err(|error| {
+                format!(
                     "{} 配置未保存：{error}。新增 Provider 请先在 Provider 详情中保存。",
                     adapter.label()
-                ),
-            };
-            cx.notify();
+                )
+            })
         }
 
         fn runtime_fields(
@@ -1962,6 +1968,473 @@ fn main() {
                         ),
                     )
                 })
+        }
+
+        /// One read-only key/value row in a settings summary.
+        fn settings_summary_row(label: &str, value: String) -> Div {
+            div()
+                .flex()
+                .items_start()
+                .gap_2()
+                .child(
+                    div()
+                        .w(px(96.))
+                        .flex_none()
+                        .text_xs()
+                        .text_color(rgb(TEXT_MUTED))
+                        .child(label.to_owned()),
+                )
+                .child(div().flex_1().min_w(px(0.)).text_sm().whitespace_normal().child(value))
+        }
+
+        /// Modal editor for one runtime adapter's settings. Saving happens inside the dialog and
+        /// closes it on success; cancelling keeps the draft, because the fields are the same
+        /// state the page summary reads.
+        fn render_adapter_settings_dialog(
+            &mut self,
+            adapter: RuntimeAdapter,
+            cx: &mut Context<Self>,
+        ) -> impl IntoElement {
+            let entity = cx.entity().clone();
+            let language = self.language;
+            let command = self.runtime_fields(adapter).0.clone();
+            let is_codex = adapter == RuntimeAdapter::CodexAppServer;
+            let dialog_error = self.dialog_error.clone();
+            let closer = entity.clone();
+            let closer_top = entity.clone();
+            let saver_cancel = entity.clone();
+            let saver = entity;
+
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .p_6()
+                .child(
+                    div()
+                        .id("adapter-settings-backdrop")
+                        .absolute()
+                        .inset_0()
+                        .bg(rgba(0x0000_0f17_2ab3))
+                        .occlude()
+                        .on_click(move |_, _, cx| {
+                            closer.update(cx, |view, cx| {
+                                view.adapter_settings_open = None;
+                                view.dialog_error = None;
+                                cx.notify();
+                            });
+                        }),
+                )
+                .child(
+                    div()
+                        .relative()
+                        .occlude()
+                        .w(px(640.))
+                        .v_flex()
+                        .gap_4()
+                        .p_5()
+                        .rounded_xl()
+                        .border_1()
+                        .border_color(rgb(ACCENT_SOFT))
+                        .bg(rgb(SURFACE_BG))
+                        .shadow_lg()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div().text_lg().font_weight(FontWeight::SEMIBOLD).child(
+                                        language.choose_owned(
+                                            format!("编辑 {} 设置", adapter.label()),
+                                            format!("Edit {} settings", adapter.label()),
+                                        ),
+                                    ),
+                                )
+                                .child(
+                                    Button::new("adapter-settings-cancel-top")
+                                        .ghost()
+                                        .label(language.choose("取消", "Cancel"))
+                                        .on_click(move |_, _, cx| {
+                                            closer_top.update(cx, |view, cx| {
+                                                view.adapter_settings_open = None;
+                                                view.dialog_error = None;
+                                                cx.notify();
+                                            });
+                                        }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("adapter-settings-body")
+                                .v_flex()
+                                .gap_3()
+                                .max_h(px(440.))
+                                .overflow_y_scroll()
+                                .child(Self::labeled_field(
+                                    language.choose("Codex 命令", "Codex command"),
+                                    "codex-command",
+                                    None,
+                                    &command,
+                                ))
+                                .when(is_codex, |body| {
+                                    body.child(Self::labeled_field(
+                                        language.choose("工作目录", "Working directory"),
+                                        "working-directory",
+                                        None,
+                                        &self.working_directory,
+                                    ))
+                                })
+                                .child(self.render_provider_binding(adapter, cx))
+                                .child(
+                                    div().text_xs().text_color(rgb(TEXT_MUTED)).child(
+                                        language.choose(
+                                            "保存范围：此运行时的命令、工作目录与 Provider 关联；下次任务生效。运行中的 Codex 进程需重启后生效。",
+                                            "Save scope: this runtime's command, working directory, and provider binding; applies to the next task. A running Codex process needs a restart.",
+                                        ),
+                                    ),
+                                ),
+                        )
+                        .when_some(dialog_error, |this, error| {
+                            this.child(
+                                div()
+                                    .text_xs()
+                                    .whitespace_normal()
+                                    .text_color(rgb(0x00dc_2626))
+                                    .child(error),
+                            )
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap_3()
+                                .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(
+                                    language.choose(
+                                        "取消会保留当前草稿，不写入设置。",
+                                        "Cancelling keeps the current draft without writing settings.",
+                                    ),
+                                ))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .gap_2()
+                                        .child(
+                                            Button::new("adapter-settings-cancel")
+                                                .label(language.choose("取消", "Cancel"))
+                                                .on_click(move |_, _, cx| {
+                                                    saver_cancel.update(cx, |view, cx| {
+                                                        view.adapter_settings_open = None;
+                                                        view.dialog_error = None;
+                                                        cx.notify();
+                                                    });
+                                                }),
+                                        )
+                                        .child(
+                                            Button::new("adapter-settings-save")
+                                                .primary()
+                                                .label(language.choose("保存并关闭", "Save and close"))
+                                                .on_click(move |_, _, cx| {
+                                                    saver.update(cx, |view, cx| {
+                                                        match view.save_runtime_checked(adapter, cx) {
+                                                            Ok(()) => {
+                                                                view.adapter_settings_open = None;
+                                                                view.dialog_error = None;
+                                                                view.status = format!(
+                                                                    "已保存 {} 配置；下次任务生效，运行中的服务须重启。",
+                                                                    adapter.label()
+                                                                );
+                                                            }
+                                                            Err(error) => {
+                                                                view.dialog_error = Some(error);
+                                                            }
+                                                        }
+                                                        cx.notify();
+                                                    });
+                                                }),
+                                        ),
+                                ),
+                        ),
+                )
+        }
+
+        /// Modal editor for the selected provider. Saving the provider list happens inside the
+        /// dialog and closes it on success; quick list actions (default, enable, remove) stay on
+        /// the page and remain drafts until this save runs.
+        fn render_provider_dialog(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+            let entity = cx.entity().clone();
+            let language = self.language;
+            let selected = self.selected_provider.min(self.providers.len() - 1);
+            let provider = &self.providers[selected];
+            let dialog_error = self.dialog_error.clone();
+            let closer = entity.clone();
+            let closer_top = entity.clone();
+            let saver = entity.clone();
+            let saver_cancel = entity.clone();
+            let toggle_vision = entity.clone();
+            let api_key_hint = self.secret_source_hint(
+                &provider.api_key_environment_variable.read(cx).value(),
+                &entity,
+            );
+            let vision_key_hint = self.secret_source_hint(
+                &provider.vision_api_key_environment_variable.read(cx).value(),
+                &entity,
+            );
+
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .p_6()
+                .child(
+                    div()
+                        .id("provider-editor-backdrop")
+                        .absolute()
+                        .inset_0()
+                        .bg(rgba(0x0000_0f17_2ab3))
+                        .occlude()
+                        .on_click(move |_, _, cx| {
+                            closer.update(cx, |view, cx| {
+                                view.provider_editor_open = false;
+                                view.dialog_error = None;
+                                cx.notify();
+                            });
+                        }),
+                )
+                .child(
+                    div()
+                        .relative()
+                        .occlude()
+                        .w(px(680.))
+                        .v_flex()
+                        .gap_4()
+                        .p_5()
+                        .rounded_xl()
+                        .border_1()
+                        .border_color(rgb(ACCENT_SOFT))
+                        .bg(rgb(SURFACE_BG))
+                        .shadow_lg()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div().text_lg().font_weight(FontWeight::SEMIBOLD).child(
+                                        language.choose("编辑 Provider", "Edit provider"),
+                                    ),
+                                )
+                                .child(
+                                    Button::new("provider-editor-cancel-top")
+                                        .ghost()
+                                        .label(language.choose("取消", "Cancel"))
+                                        .on_click(move |_, _, cx| {
+                                            closer_top.update(cx, |view, cx| {
+                                                view.provider_editor_open = false;
+                                                view.dialog_error = None;
+                                                cx.notify();
+                                            });
+                                        }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("provider-editor-body")
+                                .v_flex()
+                                .gap_3()
+                                .max_h(px(440.))
+                                .overflow_y_scroll()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_wrap()
+                                        .gap_3()
+                                        .child(Self::labeled_field(
+                                            "Provider ID",
+                                            "provider-id",
+                                            None,
+                                            &provider.id,
+                                        ))
+                                        .child(Self::labeled_field(
+                                            language.choose("显示名称", "Display name"),
+                                            "provider-name",
+                                            None,
+                                            &provider.name,
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_wrap()
+                                        .gap_3()
+                                        .child(Self::labeled_field(
+                                            "LLM Base URL",
+                                            "provider-base-url",
+                                            None,
+                                            &provider.base_url,
+                                        ))
+                                        .child(Self::labeled_field(
+                                            language.choose("LLM 模型", "LLM model"),
+                                            "provider-model",
+                                            None,
+                                            &provider.model,
+                                        )),
+                                )
+                                .child(Self::labeled_field(
+                                    language.choose(
+                                        "LLM API Key 环境变量名",
+                                        "LLM API key environment variable",
+                                    ),
+                                    "provider-api-key-env",
+                                    Some(language.choose(
+                                        "仅环境变量名，例如 OPENAI_API_KEY；密钥值不会出现在这里。",
+                                        "Environment-variable name only, e.g. OPENAI_API_KEY; the key value never appears here.",
+                                    )),
+                                    &provider.api_key_environment_variable,
+                                ))
+                                .when_some(api_key_hint, ParentElement::child)
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .child(
+                                            div()
+                                                .text_base()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .child(language.choose(
+                                                    "Vision 配置",
+                                                    "Vision configuration",
+                                                )),
+                                        )
+                                        .child(
+                                            Button::new("toggle-vision")
+                                                .label(if provider.supports_vision {
+                                                    language.choose(
+                                                        "Vision：已启用",
+                                                        "Vision: enabled",
+                                                    )
+                                                } else {
+                                                    language.choose(
+                                                        "Vision：已停用",
+                                                        "Vision: disabled",
+                                                    )
+                                                })
+                                                .on_click(move |_, _, cx| {
+                                                    toggle_vision.update(
+                                                        cx,
+                                                        ControlPlaneView::toggle_vision,
+                                                    );
+                                                }),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_wrap()
+                                        .gap_3()
+                                        .child(Self::labeled_field(
+                                            "Vision Base URL",
+                                            "vision-base-url",
+                                            None,
+                                            &provider.vision_base_url,
+                                        ))
+                                        .child(Self::labeled_field(
+                                            language.choose("Vision 模型", "Vision model"),
+                                            "vision-model",
+                                            None,
+                                            &provider.vision_model,
+                                        )),
+                                )
+                                .child(Self::labeled_field(
+                                    language.choose(
+                                        "Vision API Key 环境变量名",
+                                        "Vision API key environment variable",
+                                    ),
+                                    "vision-api-key-env",
+                                    Some(language.choose(
+                                        "同样只保存环境变量名。",
+                                        "Also an environment-variable name only.",
+                                    )),
+                                    &provider.vision_api_key_environment_variable,
+                                ))
+                                .when_some(vision_key_hint, ParentElement::child)
+                                .child(
+                                    div().text_xs().text_color(rgb(TEXT_MUTED)).child(
+                                        language.choose(
+                                            "保存范围：整个 Provider 列表的新增、编辑、删除、启停、Vision 配置和默认项；下次任务生效。",
+                                            "Save scope: additions, edits, removals, enabled/Vision states and the default for the entire provider list; applies to the next task.",
+                                        ),
+                                    ),
+                                ),
+                        )
+                        .when_some(dialog_error, |this, error| {
+                            this.child(
+                                div()
+                                    .text_xs()
+                                    .whitespace_normal()
+                                    .text_color(rgb(0x00dc_2626))
+                                    .child(error),
+                            )
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap_3()
+                                .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(
+                                    language.choose(
+                                        "取消会保留当前草稿，不写入设置。",
+                                        "Cancelling keeps the current draft without writing settings.",
+                                    ),
+                                ))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .gap_2()
+                                        .child(
+                                            Button::new("provider-editor-cancel")
+                                                .label(language.choose("取消", "Cancel"))
+                                                .on_click(move |_, _, cx| {
+                                                    saver_cancel.update(cx, |view, cx| {
+                                                        view.provider_editor_open = false;
+                                                        view.dialog_error = None;
+                                                        cx.notify();
+                                                    });
+                                                }),
+                                        )
+                                        .child(
+                                            Button::new("provider-editor-save")
+                                                .primary()
+                                                .label(language.choose(
+                                                    "保存 Provider 列表",
+                                                    "Save provider list",
+                                                ))
+                                                .on_click(move |_, _, cx| {
+                                                    saver.update(cx, |view, cx| {
+                                                        match view.save_providers_checked(cx) {
+                                                            Ok(()) => {
+                                                                view.provider_editor_open = false;
+                                                                view.dialog_error = None;
+                                                                view.status = "已保存 Provider 列表及默认项；下次任务生效，运行中的服务须重启。".into();
+                                                            }
+                                                            Err(error) => {
+                                                                view.dialog_error = Some(error);
+                                                            }
+                                                        }
+                                                        cx.notify();
+                                                    });
+                                                }),
+                                        ),
+                                ),
+                        ),
+                )
         }
 
         fn save_bridge_settings(&mut self, cx: &mut Context<Self>) {
@@ -4427,6 +4900,12 @@ fn main() {
         ) -> impl IntoElement {
             let entity = cx.entity().clone();
             let language = self.language;
+            let adapter_settings_dialog = self
+                .adapter_settings_open
+                .map(|adapter| self.render_adapter_settings_dialog(adapter, cx).into_any_element());
+            let provider_dialog = self
+                .provider_editor_open
+                .then(|| self.render_provider_dialog(cx).into_any_element());
 
             let mut runtime_cards = div().v_flex().gap_2();
             for adapter in
@@ -4728,7 +5207,9 @@ fn main() {
 
             let add_provider = entity.clone();
             div()
+                .id("agents-tools-page")
                 .size_full()
+                .overflow_y_scroll()
                 .relative()
                 .v_flex()
                 .gap_4()
@@ -4800,6 +5281,8 @@ fn main() {
                         .child(detail),
                 )
                 .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(self.status.clone()))
+                .when_some(adapter_settings_dialog, ParentElement::child)
+                .when_some(provider_dialog, ParentElement::child)
         }
 
         /// The EDA services page is the multi-EDA service registry, laid out like
@@ -4905,7 +5388,9 @@ fn main() {
             };
 
             div()
+                .id("eda-services-page")
                 .size_full()
+                .overflow_y_scroll()
                 .min_w(px(720.))
                 .relative()
                 .v_flex()
@@ -5304,6 +5789,12 @@ fn main() {
                 })
                 .unwrap_or_default();
             let codex_dirty = self.runtime_dirty(RuntimeAdapter::CodexAppServer, cx);
+            let codex_binding = self.codex_provider.read(cx).value().trim().to_owned();
+            let codex_binding_display = if codex_binding.is_empty() {
+                language.choose("默认 Provider", "Default provider").to_owned()
+            } else {
+                codex_binding
+            };
             div()
                 .flex_1()
                 .min_w(px(0.))
@@ -5421,41 +5912,37 @@ fn main() {
                             "Settings · command, directory, provider binding",
                         ),
                     )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_wrap()
-                            .gap_3()
-                            .child(Self::labeled_field(
-                                language.choose("Codex 命令", "Codex command"),
-                                "codex-command",
-                                None,
-                                &self.command,
-                            ))
-                            .child(Self::labeled_field(
-                                language.choose("工作目录", "Working directory"),
-                                "working-directory",
-                                None,
-                                &self.working_directory,
-                            )),
-                    )
-                    .child(self.render_provider_binding(RuntimeAdapter::CodexAppServer, cx))
+                    .child(Self::settings_summary_row(
+                        language.choose("命令", "Command"),
+                        self.command.read(cx).value().to_string(),
+                    ))
+                    .child(Self::settings_summary_row(
+                        language.choose("工作目录", "Working dir"),
+                        self.working_directory.read(cx).value().to_string(),
+                    ))
+                    .child(Self::settings_summary_row(
+                        language.choose("Provider", "Provider"),
+                        codex_binding_display,
+                    ))
                     .child(
                         div().text_xs().text_color(rgb(TEXT_MUTED)).child(
                             language.choose(
-                                "保存范围：Codex 命令、工作目录与 Provider 关联。Provider 的模型与地址在 Provider 详情中保存；API Key 变量名也在 Provider 中配置，密钥值由密钥保险库或进程环境提供。JLC bridge 地址在「EDA 服务」页配置。",
-                                "Save scope: the Codex command, working directory, and provider binding. Provider models and URLs are saved in provider details; API key variable names are configured there too, with values supplied by the secrets vault or the process environment. The JLC bridge address is configured on the EDA services page.",
+                                "JLC bridge 监听地址属于 EDA 侧服务，在「EDA 服务」页配置。",
+                                "The JLC bridge listen address belongs to the EDA side and is configured on the EDA services page.",
                             ),
                         ),
                     )
                     .child(Self::save_state_note(codex_dirty, language))
                     .child(
-                        Button::new("save-codex-settings")
+                        Button::new("open-codex-settings")
                             .primary()
-                            .label(language.choose("保存 Codex 配置", "Save Codex configuration"))
+                            .label(language.choose("编辑设置…", "Edit settings…"))
                             .on_click(move |_, _, cx| {
                                 binding_saver.update(cx, |view, cx| {
-                                    view.save_runtime(RuntimeAdapter::CodexAppServer, cx);
+                                    view.adapter_settings_open =
+                                        Some(RuntimeAdapter::CodexAppServer);
+                                    view.dialog_error = None;
+                                    cx.notify();
                                 });
                             }),
                     ),
@@ -6045,7 +6532,20 @@ fn main() {
                                 }),
                         ),
                 )
-                .child(div().text_sm().child(self.task_result.clone()))
+                .child(
+                    div()
+                        .id("runtime-task-result")
+                        .v_flex()
+                        .gap_0p5()
+                        .max_h(px(320.))
+                        .overflow_y_scroll()
+                        .p_3()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .bg(rgb(CARD_BG))
+                        .child(div().text_sm().whitespace_normal().child(self.task_result.clone())),
+                )
         }
 
         /// The “run agents inside this project” block of the project's agent tab.
@@ -6109,8 +6609,14 @@ fn main() {
         ) -> impl IntoElement {
             let saver = cx.entity().clone();
             let language = self.language;
-            let command = self.runtime_fields(adapter).0.clone();
             let dirty = self.runtime_dirty(adapter, cx);
+            let command_display = self.runtime_fields(adapter).0.read(cx).value().to_string();
+            let binding = self.runtime_fields(adapter).1.read(cx).value().trim().to_owned();
+            let binding_display = if binding.is_empty() {
+                language.choose("默认 Provider", "Default provider").to_owned()
+            } else {
+                binding
+            };
             let description = match adapter {
                 RuntimeAdapter::ClaudeCode => language.choose(
                     "每次执行创建独立任务进程；完成、失败或取消后清理。使用 Anthropic Messages 协议。",
@@ -6166,32 +6672,24 @@ fn main() {
                             "Settings · command and provider binding",
                         ),
                     )
-                    .child(Self::labeled_field(
-                        language.choose("运行时命令", "Runtime command"),
-                        "adapter-command",
-                        None,
-                        &command,
+                    .child(Self::settings_summary_row(
+                        language.choose("命令", "Command"),
+                        command_display,
                     ))
-                    .child(self.render_provider_binding(adapter, cx))
-                    .child(
-                        div().text_xs().text_color(rgb(TEXT_MUTED)).child(
-                            language.choose(
-                                "保存范围：此运行时的命令与 Provider 关联；下次任务生效。Provider 的模型与地址在 Provider 详情中保存。",
-                                "Save scope: this runtime's command and provider binding; applies to the next task. Provider models and URLs are saved in provider details.",
-                            ),
-                        ),
-                    )
+                    .child(Self::settings_summary_row(
+                        language.choose("Provider", "Provider"),
+                        binding_display,
+                    ))
                     .child(Self::save_state_note(dirty, language))
                     .child(
-                        Button::new("save-adapter")
+                        Button::new("open-adapter-settings")
                             .primary()
-                            .label(language.choose_owned(
-                                format!("保存 {} 配置", adapter.label()),
-                                format!("Save {} configuration", adapter.label()),
-                            ))
+                            .label(language.choose("编辑设置…", "Edit settings…"))
                             .on_click(move |_, _, cx| {
                                 saver.update(cx, |view, cx| {
-                                    view.save_runtime(adapter, cx);
+                                    view.adapter_settings_open = Some(adapter);
+                                    view.dialog_error = None;
+                                    cx.notify();
                                 });
                             }),
                     ),
@@ -6224,16 +6722,11 @@ fn main() {
             let set_default = entity.clone();
             let toggle_provider = entity.clone();
             let remove_provider = entity.clone();
-            let toggle_vision = entity.clone();
             let provider_saver = entity.clone();
             let dirty = self.provider_values(cx) != self.saved_settings.providers
                 || self.default_provider_id != self.saved_settings.default_provider_id;
             let api_key_hint = self.secret_source_hint(
                 &provider.api_key_environment_variable.read(cx).value(),
-                &entity,
-            );
-            let vision_key_hint = self.secret_source_hint(
-                &provider.vision_api_key_environment_variable.read(cx).value(),
                 &entity,
             );
 
@@ -6318,124 +6811,42 @@ fn main() {
                     "Provider configuration saves API key variable names only; values are stored separately in the encrypted vault or supplied by the process environment.",
                     language,
                 ))
-                .child(Self::save_state_note(dirty, language))
-                .child(Self::info_note(
-                    "保存范围：整个 Provider 列表的新增、编辑、删除、启停、Vision 配置和默认项。下次任务生效；运行中的服务需重启。",
-                    "Saves additions, edits, removals, enabled/Vision states and the default for the entire provider list. Applies to the next task; restart running services.",
-                    language,
-                ))
-                .child(Button::new("save-providers").primary()
-                    .label(language.choose("保存 Provider 列表", "Save provider list"))
-                    .on_click(move |_, _, cx| { provider_saver.update(cx, ControlPlaneView::save_providers); }))
                 .child(
                     div()
                         .v_flex()
-                        .gap_3()
-                        .child(
-                            div()
-                                .flex()
-                                .flex_wrap()
-                                .gap_3()
-                                .child(Self::labeled_field(
-                                    "Provider ID",
-                                    "provider-id",
-                                    None,
-                                    &provider.id,
-                                ))
-                                .child(Self::labeled_field(
-                                    language.choose("显示名称", "Display name"),
-                                    "provider-name",
-                                    None,
-                                    &provider.name,
-                                )),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .flex_wrap()
-                                .gap_3()
-                                .child(Self::labeled_field(
-                                    "LLM Base URL",
-                                    "provider-base-url",
-                                    None,
-                                    &provider.base_url,
-                                ))
-                                .child(Self::labeled_field(
-                                    language.choose("LLM 模型", "LLM model"),
-                                    "provider-model",
-                                    None,
-                                    &provider.model,
-                                )),
-                        )
-                        .child(Self::labeled_field(
-                            language.choose("LLM API Key 环境变量名", "LLM API key environment variable"),
-                            "provider-api-key-env",
-                            Some(language.choose(
-                                "仅环境变量名，例如 OPENAI_API_KEY；密钥值不会出现在这里。",
-                                "Environment-variable name only, e.g. OPENAI_API_KEY; the key value never appears here.",
-                            )),
-                            &provider.api_key_environment_variable,
+                        .gap_2()
+                        .p_4()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .bg(rgb(SURFACE_BG))
+                        .child(Self::settings_summary_row(
+                            "Base URL",
+                            provider.base_url.read(cx).value().to_string(),
                         ))
-                        .when_some(api_key_hint, ParentElement::child),
-                )
-                .child(
-                    div()
-                        .v_flex()
-                        .gap_3()
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .child(
-                                    div()
-                                        .text_base()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .child(language.choose("Vision 配置", "Vision configuration")),
+                        .child(Self::settings_summary_row(
+                            language.choose("模型", "Model"),
+                            provider.model.read(cx).value().to_string(),
+                        ))
+                        .child(Self::settings_summary_row(
+                            language.choose("API Key", "API key"),
+                            provider.api_key_environment_variable.read(cx).value().to_string(),
+                        ))
+                        .when_some(api_key_hint, ParentElement::child)
+                        .child(Self::settings_summary_row(
+                            "Vision",
+                            if provider.supports_vision {
+                                format!(
+                                    "{}（{}）",
+                                    language.choose("已启用", "Enabled"),
+                                    provider.vision_model.read(cx).value()
                                 )
-                                .child(
-                                    Button::new("toggle-vision")
-                                        .label(if provider.supports_vision {
-                                            language.choose("Vision：已启用", "Vision: enabled")
-                                        } else {
-                                            language.choose("Vision：已停用", "Vision: disabled")
-                                        })
-                                        .on_click(move |_, _, cx| {
-                                            toggle_vision.update(cx, ControlPlaneView::toggle_vision);
-                                        }),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .gap_3()
-                                .child(Self::labeled_field(
-                                    "Vision Base URL",
-                                    "vision-base-url",
-                                    None,
-                                    &provider.vision_base_url,
-                                ))
-                                .child(Self::labeled_field(
-                                    language.choose("Vision 模型", "Vision model"),
-                                    "vision-model",
-                                    None,
-                                    &provider.vision_model,
-                                )),
-                        )
-                        .child(Self::labeled_field(
-                            language.choose(
-                                "Vision API Key 环境变量名",
-                                "Vision API key environment variable",
-                            ),
-                            "vision-api-key-env",
-                            Some(language.choose(
-                                "同样只保存环境变量名。",
-                                "Also an environment-variable name only.",
-                            )),
-                            &provider.vision_api_key_environment_variable,
-                        ))
-                        .when_some(vision_key_hint, ParentElement::child),
+                            } else {
+                                language.choose("已停用", "Disabled").to_owned()
+                            },
+                        )),
                 )
+                .child(Self::save_state_note(dirty, language))
                 .child(
                     div()
                         .flex()
@@ -6475,10 +6886,22 @@ fn main() {
                 .child(
                     div().text_xs().text_color(rgb(TEXT_MUTED)).child(
                         language.choose(
-                            "上述默认项、启停、删除及 Vision 切换均为草稿，点击「保存 Provider 列表」后生效。默认项用于未指定 Provider 的运行时。",
-                            "Default, enabled, removal and Vision changes are drafts until Save provider list. The default applies to runtimes without an explicit provider binding.",
+                            "上述默认项、启停与删除均为草稿，连同表单修改一起在「编辑 Provider…」弹窗中保存后生效。默认项用于未指定 Provider 的运行时。",
+                            "Default, enabled, and removal changes are drafts; they take effect together with the form edits saved in the Edit provider dialog. The default applies to runtimes without an explicit provider binding.",
                         ),
                     ),
+                )
+                .child(
+                    Button::new("open-provider-editor")
+                        .primary()
+                        .label(language.choose("编辑 Provider…", "Edit provider…"))
+                        .on_click(move |_, _, cx| {
+                            provider_saver.update(cx, |view, cx| {
+                                view.provider_editor_open = true;
+                                view.dialog_error = None;
+                                cx.notify();
+                            });
+                        }),
                 )
         }
 
@@ -8722,7 +9145,9 @@ fn main() {
             let all_filter = entity.clone();
             let setup_filter = entity.clone();
             div()
+                .id("projects-page")
                 .size_full()
+                .overflow_y_scroll()
                 .relative()
                 .v_flex()
                 .gap_4()
@@ -12434,7 +12859,9 @@ fn main() {
                         language.choose("本地优先、密钥隔离", "local-first, secret-isolated")
                     )));
             div()
+                .id("global-settings-page")
                 .size_full()
+                .overflow_y_scroll()
                 .p_6()
                 .v_flex()
                 .gap_4()
@@ -12631,7 +13058,9 @@ fn main() {
             }
 
             div()
+                .id("usage-audit-page")
                 .size_full()
+                .overflow_y_scroll()
                 .p_6()
                 .v_flex()
                 .gap_4()
@@ -14395,7 +14824,9 @@ fn main() {
             };
 
             div()
+                .id("overview-page")
                 .size_full()
+                .overflow_y_scroll()
                 .v_flex()
                 .gap_5()
                 .p_6()
@@ -15096,7 +15527,9 @@ fn main() {
             };
 
             div()
+                .id("secrets-vault-page")
                 .size_full()
+                .overflow_y_scroll()
                 .min_w(px(720.))
                 .relative()
                 .v_flex()
