@@ -1987,6 +1987,13 @@ fn main() {
                 .child(div().flex_1().min_w(px(0.)).text_sm().whitespace_normal().child(value))
         }
 
+        /// The right-hand pane of a two-pane page: bounded to the available height and
+        /// self-scrolling, so overflowing content scrolls inside the card's own frame instead
+        /// of drawing past it — the pattern the Jev judgment page already established.
+        fn detail_pane(id: &'static str) -> gpui::Stateful<Div> {
+            div().id(id).flex_1().min_w(px(0.)).min_h(px(0.)).overflow_y_scroll().v_flex()
+        }
+
         /// Modal editor for one runtime adapter's settings. Saving happens inside the dialog and
         /// closes it on success; cancelling keeps the draft, because the fields are the same
         /// state the page summary reads.
@@ -5251,6 +5258,9 @@ fn main() {
                         .gap_4()
                         .child(
                             div()
+                                .id("agents-list-scroll")
+                                .min_h(px(0.))
+                                .overflow_y_scroll()
                                 .w(px(320.))
                                 .flex_none()
                                 .v_flex()
@@ -5423,6 +5433,9 @@ fn main() {
                         .gap_4()
                         .child(
                             div()
+                                .id("eda-list-scroll")
+                                .min_h(px(0.))
+                                .overflow_y_scroll()
                                 .w(px(320.))
                                 .flex_none()
                                 .v_flex()
@@ -5531,10 +5544,7 @@ fn main() {
                 _ => None,
             };
 
-            div()
-                .flex_1()
-                .min_w(px(0.))
-                .v_flex()
+            Self::detail_pane("eda-bridge-detail")
                 .gap_3()
                 .p_5()
                 .rounded_xl()
@@ -5795,10 +5805,7 @@ fn main() {
             } else {
                 codex_binding
             };
-            div()
-                .flex_1()
-                .min_w(px(0.))
-                .v_flex()
+            Self::detail_pane("codex-detail")
                 .gap_4()
                 .p_5()
                 .rounded_xl()
@@ -6627,10 +6634,7 @@ fn main() {
                     "Each run creates an isolated task process, cleaned up on completion, failure, or cancellation.",
                 ),
             };
-            div()
-                .flex_1()
-                .min_w(px(0.))
-                .v_flex()
+            Self::detail_pane("adapter-detail")
                 .gap_4()
                 .p_5()
                 .rounded_xl()
@@ -6761,10 +6765,7 @@ fn main() {
                 .text_color(rgb(0x000e_7490))
                 .child("Vision");
 
-            div()
-                .flex_1()
-                .min_w(px(0.))
-                .v_flex()
+            Self::detail_pane("provider-detail")
                 .gap_4()
                 .p_5()
                 .rounded_xl()
@@ -8597,10 +8598,7 @@ fn main() {
                     .into_any_element()
             };
 
-            div()
-                .flex_1()
-                .min_w(px(0.))
-                .v_flex()
+            Self::detail_pane("skills-detail")
                 .gap_4()
                 .p_5()
                 .rounded_xl()
@@ -9210,6 +9208,9 @@ fn main() {
                         .gap_4()
                         .child(
                             div()
+                                .id("projects-list-scroll")
+                                .min_h(px(0.))
+                                .overflow_y_scroll()
                                 .w(px(330.))
                                 .flex_none()
                                 .v_flex()
@@ -9410,10 +9411,7 @@ fn main() {
                 .into_any_element(),
             };
 
-            div()
-                .flex_1()
-                .min_w(px(0.))
-                .v_flex()
+            Self::detail_pane("project-detail")
                 .gap_4()
                 .p_5()
                 .rounded_xl()
@@ -15136,10 +15134,7 @@ fn main() {
 
             let detail = if !file_exists {
                 let creator = entity.clone();
-                div()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .v_flex()
+                Self::detail_pane("vault-detail-1")
                     .gap_4()
                     .p_5()
                     .rounded_xl()
@@ -15229,10 +15224,7 @@ fn main() {
                     .into_any_element()
             } else if !unlocked {
                 let dialog_entity = entity.clone();
-                div()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .v_flex()
+                Self::detail_pane("vault-detail-2")
                     .gap_4()
                     .p_5()
                     .rounded_xl()
@@ -15374,10 +15366,7 @@ fn main() {
                     );
                 }
 
-                div()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .v_flex()
+                Self::detail_pane("vault-detail-3")
                     .gap_4()
                     .p_5()
                     .rounded_xl()
@@ -15562,6 +15551,9 @@ fn main() {
                         .gap_4()
                         .child(
                             div()
+                                .id("vault-list-scroll")
+                                .min_h(px(0.))
+                                .overflow_y_scroll()
                                 .w(px(320.))
                                 .flex_none()
                                 .v_flex()
