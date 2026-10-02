@@ -9452,15 +9452,7 @@ fn main() {
                         ),
                 )
                 .child(tabs)
-                .child(
-                    div()
-                        .flex_1()
-                        .min_h(px(0.))
-                        .p_4()
-                        .rounded_lg()
-                        .bg(rgb(SURFACE_BG))
-                        .child(content),
-                )
+                .child(div().p_4().rounded_lg().bg(rgb(SURFACE_BG)).child(content))
         }
 
         fn project_metric(value: String, label: &'static str) -> impl IntoElement {
