@@ -4,12 +4,12 @@ use circuitfabric_codex_runtime::{
     LlmProviderSettings, RuntimeError, RuntimeSettings, ToolAuthorizationSettings,
     tools::ToolCatalog,
 };
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(Clone, Debug)]
 pub enum SettingsUpdate {
     Providers { providers: Vec<LlmProviderSettings>, default_provider_id: String },
-    Codex { command: String, working_directory: PathBuf, provider_id: String },
+    Codex { command: String, provider_id: String },
     Claude { command: String, provider_id: String },
     Dsh { command: String, provider_id: String },
     Bridge { listen_address: String },
@@ -24,9 +24,8 @@ impl SettingsUpdate {
                 saved.providers = providers;
                 saved.default_provider_id = default_provider_id;
             }
-            Self::Codex { command, working_directory, provider_id } => {
+            Self::Codex { command, provider_id } => {
                 saved.codex.command = command;
-                saved.codex.working_directory = working_directory;
                 saved.adapters.codex_provider_id = provider_id;
             }
             Self::Claude { command, provider_id } => {
@@ -59,6 +58,7 @@ mod tests {
     use super::*;
     use std::{
         fs,
+        path::PathBuf,
         sync::atomic::{AtomicU64, Ordering},
     };
 
@@ -129,14 +129,12 @@ mod tests {
             enabled: true,
         });
         expected.codex.command = "saved-codex".into();
-        expected.codex.working_directory = "C:/project".into();
         expected.adapters.codex_provider_id = expected.default_provider_id.clone();
         assert_eq!(
             save_update(
                 &path,
                 SettingsUpdate::Codex {
                     command: "saved-codex".into(),
-                    working_directory: "C:/project".into(),
                     provider_id: expected.default_provider_id.clone(),
                 }
             )

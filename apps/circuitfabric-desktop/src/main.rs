@@ -12,6 +12,9 @@ use circuitfabric_contracts::ProjectId;
 mod settings_persistence;
 
 #[cfg_attr(not(feature = "native-ui"), allow(dead_code))]
+mod project_runtime;
+
+#[cfg_attr(not(feature = "native-ui"), allow(dead_code))]
 mod usage_audit;
 
 #[cfg_attr(not(feature = "native-ui"), allow(dead_code))]
@@ -811,7 +814,6 @@ fn main() {
     struct ControlPlaneView {
         sidebar_mark: Arc<Image>,
         command: Entity<InputState>,
-        working_directory: Entity<InputState>,
         bridge_address: Entity<InputState>,
         providers: Vec<ProviderFields>,
         default_provider_id: String,
@@ -903,6 +905,7 @@ fn main() {
         codex_process: Option<CodexAppServerHandle>,
         codex_status: RuntimeLifecycleStatus,
         codex_active_provider: Option<String>,
+        codex_project_context: Option<(ProjectId, PathBuf)>,
         bridge_process: Option<BridgeProcessHandle>,
         bridge_status: RuntimeLifecycleStatus,
         bridge_active_address: Option<String>,
@@ -1376,12 +1379,6 @@ fn main() {
                 sidebar_mark: Arc::new(Image::from_bytes(ImageFormat::Png, SIDEBAR_MARK.to_vec())),
                 saved_settings: settings.clone(),
                 command: Self::input(window, settings.codex.command, "codex", cx),
-                working_directory: Self::input(
-                    window,
-                    settings.codex.working_directory.display().to_string(),
-                    "working directory",
-                    cx,
-                ),
                 bridge_address: Self::input(
                     window,
                     settings.bridge.listen_address,
@@ -1466,6 +1463,7 @@ fn main() {
                 codex_process: None,
                 codex_status: RuntimeLifecycleStatus::Stopped,
                 codex_active_provider: None,
+                codex_project_context: None,
                 bridge_process: None,
                 bridge_status: RuntimeLifecycleStatus::Stopped,
                 bridge_active_address: None,
@@ -1743,11 +1741,7 @@ fn main() {
             let command = command.read(cx).value().trim().to_owned();
             let provider_id = provider.read(cx).value().trim().to_owned();
             let update = match adapter {
-                RuntimeAdapter::CodexAppServer => SettingsUpdate::Codex {
-                    command,
-                    working_directory: self.working_directory.read(cx).value().trim().into(),
-                    provider_id,
-                },
+                RuntimeAdapter::CodexAppServer => SettingsUpdate::Codex { command, provider_id },
                 RuntimeAdapter::ClaudeCode => SettingsUpdate::Claude { command, provider_id },
                 RuntimeAdapter::Dsh => SettingsUpdate::Dsh { command, provider_id },
             };
@@ -1786,9 +1780,6 @@ fn main() {
             };
             command.read(cx).value().trim() != saved_command
                 || provider.read(cx).value().trim() != saved_provider
-                || (adapter == RuntimeAdapter::CodexAppServer
-                    && PathBuf::from(self.working_directory.read(cx).value().trim())
-                        != saved.codex.working_directory)
         }
 
         fn save_state_note(dirty: bool, language: UiLanguage) -> Div {
@@ -2005,7 +1996,6 @@ fn main() {
             let entity = cx.entity().clone();
             let language = self.language;
             let command = self.runtime_fields(adapter).0.clone();
-            let is_codex = adapter == RuntimeAdapter::CodexAppServer;
             let dialog_error = self.dialog_error.clone();
             let closer = entity.clone();
             let closer_top = entity.clone();
@@ -2086,20 +2076,12 @@ fn main() {
                                     None,
                                     &command,
                                 ))
-                                .when(is_codex, |body| {
-                                    body.child(Self::labeled_field(
-                                        language.choose("工作目录", "Working directory"),
-                                        "working-directory",
-                                        None,
-                                        &self.working_directory,
-                                    ))
-                                })
                                 .child(self.render_provider_binding(adapter, cx))
                                 .child(
                                     div().text_xs().text_color(rgb(TEXT_MUTED)).child(
                                         language.choose(
-                                            "保存范围：此运行时的命令、工作目录与 Provider 关联；下次任务生效。运行中的 Codex 进程需重启后生效。",
-                                            "Save scope: this runtime's command, working directory, and provider binding; applies to the next task. A running Codex process needs a restart.",
+                                            "保存范围：此运行时的命令与 Provider 关联；工作目录自动使用当前项目根目录。下次任务生效，运行中的 Codex 进程需重启。",
+                                            "Saves this runtime's command and provider binding. The working directory is the current project root. Applies to the next task; restart a running Codex process.",
                                         ),
                                     ),
                                 ),
@@ -2474,6 +2456,12 @@ fn main() {
             }
         }
 
+        fn current_project_context(&self) -> Option<(ProjectId, PathBuf)> {
+            let id = self.selected_project.as_ref()?;
+            let storage = self.project_storages.get(id)?;
+            Some((id.clone(), storage.root().to_path_buf()))
+        }
+
         /// Starts the supervised Codex App Server child process.
         ///
         /// Uses the saved snapshot and checks for an immediate process exit.
@@ -2488,6 +2476,18 @@ fn main() {
             let Some(settings) = self.settings_for_execution(cx) else {
                 return;
             };
+            let project_context = self.current_project_context();
+            let launch_settings = match crate::project_runtime::codex_for_project(
+                &settings,
+                project_context.as_ref().map(|(_, root)| root.as_path()),
+            ) {
+                Ok(settings) => settings,
+                Err(reason) => {
+                    self.status = reason;
+                    cx.notify();
+                    return;
+                }
+            };
             let Some(provider) = circuitfabric_codex_runtime::execution::selected_provider(
                 &settings,
                 circuitfabric_codex_runtime::execution::AgentKind::Codex,
@@ -2498,6 +2498,7 @@ fn main() {
                 return;
             };
             self.codex_status = RuntimeLifecycleStatus::Starting;
+            self.codex_project_context = project_context.clone();
             self.codex_active_provider =
                 Some(format!("{} / {} / {}", provider.id, provider.model, provider.base_url));
             self.status = format!("Codex App Server: {} / {}", provider.id, provider.model);
@@ -2506,7 +2507,7 @@ fn main() {
                 .flatten();
             let launch = cx.background_spawn(async move {
                 CodexAppServerHandle::launch_with_secrets(
-                    &settings.codex,
+                    &launch_settings,
                     &provider,
                     secrets.as_ref(),
                 )
@@ -2516,6 +2517,31 @@ fn main() {
                 let result = launch.await;
                 cx.update(|_, cx| {
                     view.update(cx, |view, cx| {
+                        if view.codex_project_context != project_context
+                            || view.current_project_context() != project_context
+                        {
+                            let stopped = match result {
+                                Ok(mut handle) => handle.stop().map_err(|error| error.to_string()),
+                                Err(_) => Ok(()),
+                            };
+                            view.codex_project_context = None;
+                            view.codex_active_provider = None;
+                            view.codex_status = match stopped {
+                                Ok(()) => {
+                                    view.status =
+                                        "已取消 Codex 启动并清理进程；请在当前项目重新启动。"
+                                            .into();
+                                    RuntimeLifecycleStatus::Stopped
+                                }
+                                Err(reason) => {
+                                    view.status =
+                                        format!("取消 Codex 启动时清理进程失败：{reason}");
+                                    RuntimeLifecycleStatus::Failed { reason }
+                                }
+                            };
+                            cx.notify();
+                            return;
+                        }
                         match result {
                             Ok(handle) => {
                                 let pid = handle.pid();
@@ -2523,6 +2549,7 @@ fn main() {
                                 view.codex_status = RuntimeLifecycleStatus::Running { pid };
                             }
                             Err(reason) => {
+                                view.codex_project_context = None;
                                 view.codex_active_provider = None;
                                 view.codex_status =
                                     RuntimeLifecycleStatus::Failed { reason: reason.clone() };
@@ -2544,7 +2571,8 @@ fn main() {
                 cancel.cancel();
             }
             if matches!(self.codex_status, RuntimeLifecycleStatus::Starting) {
-                "未停止：Codex App Server 正在启动，请稍候。".clone_into(&mut self.status);
+                self.codex_project_context = None;
+                "已请求取消 Codex 启动，启动结束后自动清理进程。".clone_into(&mut self.status);
                 cx.notify();
                 return;
             }
@@ -2554,6 +2582,7 @@ fn main() {
                 return;
             };
             let pid = process.pid();
+            self.codex_project_context = None;
             match process.stop() {
                 Ok(()) => {
                     self.codex_status = RuntimeLifecycleStatus::Stopped;
@@ -2574,10 +2603,33 @@ fn main() {
         /// Reconciles the lifecycle chip with the real process state: a process that died on its
         /// own is reported as stopped or failed instead of staying green.
         fn refresh_codex_lifecycle(&mut self) {
+            if self.codex_project_context.is_some()
+                && self.codex_project_context != self.current_project_context()
+            {
+                self.codex_project_context = None;
+                if let Some(mut process) = self.codex_process.take() {
+                    self.codex_active_provider = None;
+                    self.codex_status = match process.stop() {
+                        Ok(()) => {
+                            self.status =
+                                "项目已切换，旧项目的 Codex 进程已清理；请在当前项目重新启动。"
+                                    .into();
+                            RuntimeLifecycleStatus::Stopped
+                        }
+                        Err(error) => {
+                            let reason = error.to_string();
+                            self.status =
+                                format!("项目已切换，但旧项目的 Codex 进程清理失败：{reason}");
+                            RuntimeLifecycleStatus::Failed { reason }
+                        }
+                    };
+                }
+            }
             let exit = self.codex_process.as_mut().and_then(CodexAppServerHandle::try_exit);
             if let Some(exit) = exit {
                 self.codex_process = None;
                 self.codex_active_provider = None;
+                self.codex_project_context = None;
                 if exit.success() {
                     self.codex_status = RuntimeLifecycleStatus::Stopped;
                 } else {
@@ -5869,7 +5921,7 @@ fn main() {
                             .child(
                                 Button::new("start-codex-runtime")
                                     .primary()
-                                    .disabled(is_running || is_starting)
+                                    .disabled(is_running || is_starting || self.current_project_context().is_none())
                                     .label(language.choose("启动", "Start"))
                                     .on_click(move |_, window, cx| {
                                         starter.update(cx, |view, cx| {
@@ -5879,7 +5931,7 @@ fn main() {
                             )
                             .child(
                                 Button::new("stop-codex-runtime")
-                                    .disabled(!is_running && self.task_cancel.is_none())
+                                    .disabled(!is_running && !is_starting && self.task_cancel.is_none())
                                     .label(language.choose("停止", "Stop"))
                                     .on_click(move |_, _, cx| {
                                         stopper.update(
@@ -5905,27 +5957,30 @@ fn main() {
                     .child(
                         div().text_xs().text_color(rgb(TEXT_MUTED)).child(
                             language.choose(
-                                "启动与停止读取下方「设置」中已保存的配置；停止只终止进程，不修改设置；退出应用时清理子进程。",
-                                "Start and stop read the configuration saved in Settings below; stop terminates the process without changing settings; child processes are cleaned up when the app exits.",
+                                "启动使用当前项目根目录；请先在「项目」页打开项目。切换项目时清理旧进程，在新项目重新启动。退出应用时清理子进程。",
+                                "Start uses the current project root; open a project first. Switching projects cleans up the old process; start again for the new project. Child processes are cleaned up on app exit.",
                             ),
                         ),
-                    ),
+                    )
+                    .child(Self::settings_summary_row(
+                        language.choose("项目根目录（自动）", "Project root (automatic)"),
+                        self.current_project_context().map_or_else(
+                            || language.choose("未选择项目，请先打开项目", "No project selected; open a project first").to_owned(),
+                            |(_, root)| root.display().to_string(),
+                        ),
+                    )),
                 )
                 .child(
                     Self::adapter_section_card(
                         "2",
                         language.choose(
-                            "设置 · 命令、目录与 Provider 关联",
-                            "Settings · command, directory, provider binding",
+                            "设置 · 命令与 Provider 关联",
+                            "Settings · command and provider binding",
                         ),
                     )
                     .child(Self::settings_summary_row(
                         language.choose("命令", "Command"),
                         self.command.read(cx).value().to_string(),
-                    ))
-                    .child(Self::settings_summary_row(
-                        language.choose("工作目录", "Working dir"),
-                        self.working_directory.read(cx).value().to_string(),
                     ))
                     .child(Self::settings_summary_row(
                         language.choose("Provider", "Provider"),
@@ -6326,6 +6381,11 @@ fn main() {
                 AgentKind, Cancellation, run_task_with_secrets,
             };
             if self.task_cancel.is_some() {
+                return;
+            }
+            if self.selected_project.is_some() && self.current_project_context().is_none() {
+                self.status = "未执行：当前项目根目录未加载，请重新打开项目。".into();
+                cx.notify();
                 return;
             }
             let Some(settings) = self.settings_for_execution(cx) else {

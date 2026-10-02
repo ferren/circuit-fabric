@@ -48,7 +48,7 @@ Each task creates an isolated process/session from saved configuration. Results 
 | 操作 | 保存内容 | 生效时间 |
 | --- | --- | --- |
 | 保存 Provider 列表 | 所有 Provider 的新增、编辑、删除、启停、Vision 配置及默认项 | 下次任务；运行中的服务重启后 |
-| 保存 Codex 配置 | Codex 命令、工作目录和 Provider 关联 | 下次任务；连接检查进程重启后 |
+| 保存 Codex 配置 | Codex 命令和 Provider 关联 | 下次任务；连接检查进程重启后 |
 | 保存 Claude Code / DSH 配置 | 对应运行时的命令和 Provider 关联 | 下次任务 |
 | EDA 服务：保存 Bridge 地址 | 此服务的监听地址 | 下次启动；运行中需重启 |
 | 技能 / MCP：导入、保存定义、启停、删除 | 技能与 MCP 定义 | 即时保存；取消当前任务，新任务使用新配置 |
@@ -105,8 +105,12 @@ Provider, runtime and catalog definitions are global. Projects persist their own
 
 Desktop revocation, catalog changes and project switches cancel the active task. Bridge tasks monitor configuration files and cancel when they change. New tasks recalculate authorization. Configuration writes validate first, then replace the destination through a temporary file. Failed catalog/grant writes restore prior in-memory configuration and report failure.
 
-Task processes use isolated temporary working/configuration directories and explicit project instructions; Codex does not read parent-directory project instructions. Engineering access is through authorized MCP servers. The configured working directory is currently used by the Codex connection-check process; task processes use isolated directories. Windows Job Objects with KILL_ON_JOB_CLOSE own child process trees, including application-exit cleanup. Temporary configurations are removed at task completion; live processes and sessions are not persisted.
+桌面 Codex 的工作目录由当前项目根目录自动确定，在运行区域只读展示，不属于全局运行时设置。先打开项目才能启动 Codex 连接检查进程；切换项目会停止旧项目进程，启动中的旧项目进程在启动结束后清理，需在新项目重新启动。旧配置文件中的 `codex.working_directory` 字段保留以兼容已有配置，但桌面启动会覆盖该字段的值，保存命令或 Provider 不会写入项目路径。工作目录表示进程的起始目录，访问权限仍由运行时沙箱及授权规则决定。
+
+Task processes use the selected project root as their working directory and an isolated temporary configuration/home directory. Without a project, the task test panel uses an isolated temporary working directory. Codex receives explicit project instructions rather than inheriting parent-directory project instructions. Engineering access is through authorized MCP servers. Windows Job Objects with KILL_ON_JOB_CLOSE own child process trees, including application-exit cleanup. Temporary configurations are removed at task completion; project directories are never removed. Live processes and sessions are not persisted.
 
 ## Verification boundary
+
+2026-10-02：项目工作目录修改在独立工作副本验证：`cargo test -p circuitfabric-desktop --bin circuitfabric-desktop`（24 项通过），`cargo build -p circuitfabric-desktop --features native-ui` 通过。新增测试覆盖切换项目时选择对应根目录、兼容旧目录且不修改保存配置、未选择项目及无效目录报错；保存测试确认命令与 Provider 的修改保留原有目录字段。尚未执行原生界面点击或真实外部 Codex 调用，启动中切换项目的清理路径已实现但尚无人工验收记录。
 
 See [runtime integration validation](runtime-integration-validation.md). Real remote inference, complete native UI acceptance, referenced skill assets, project-level definition overrides and per-tool permissions remain unverified or incomplete. Passing local protocol tests does not complete all acceptance criteria for issue 398.
