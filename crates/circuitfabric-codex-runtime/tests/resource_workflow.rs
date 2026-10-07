@@ -1,5 +1,5 @@
 //! Real local files and stdio processes; no model/remote service is substituted
-//! for the runtime acceptance test in native_smoke.py.
+//! for the runtime acceptance test in `native_smoke.py`.
 use circuitfabric_codex_runtime::{
     RuntimeSettings, ToolAuthorizationSettings,
     execution::Cancellation,
@@ -188,13 +188,13 @@ fn invalid_import_duplicate_ids_credentials_and_bundled_deletion_are_persistent(
 fn a_real_server_returning_no_call_result_is_a_failure() {
     let fixture = Fixture::new();
     let script = fixture.0.join("malformed.py");
-    fs::write(&script, r#"import json,sys
+    fs::write(&script, r"import json,sys
 for line in sys.stdin:
     request=json.loads(line)
     if 'id' not in request: continue
     result={'protocolVersion':'2024-11-05','capabilities':{},'serverInfo':{'name':'malformed','version':'1'}} if request['method']=='initialize' else None
     print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}),flush=True)
-"#).unwrap();
+").unwrap();
     let catalog = ToolCatalog {
         mcp_servers: vec![McpServerDefinition {
             id: "first".into(),

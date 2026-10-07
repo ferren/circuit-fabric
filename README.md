@@ -34,6 +34,7 @@ EDA, netlist, BOM, simulation, and verification plugins
 - `apps/`: product shells, starting with the GPUI desktop control plane.
 - `assets/branding/`: project-owned application artwork, including the multi-size Windows icon resource.
 - [Architecture](docs/architecture.md) / [架构](docs/architecture.zh-CN.md): target architecture, ownership, constraints, and plugin boundaries.
+- [Desktop layering](docs/desktop-architecture.zh-CN.md): implemented desktop boundaries, shared UI layout, read models, and extension rules (Chinese).
 - [Implementation plan](docs/implementation-plan.md) / [实施计划](docs/implementation-plan.zh-CN.md): phased delivery plan and acceptance criteria.
 - [Provider settings](docs/provider-settings.md): multi-provider configuration and credential boundary.
 - [TODO](TODO.md): implementation backlog in execution order.

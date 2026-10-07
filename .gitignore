@@ -22,3 +22,8 @@ Thumbs.db
 .codegraph/
 .multica/
 .review/
+/AGENTS.md
+
+# Python validation caches
+__pycache__/
+*.py[cod]

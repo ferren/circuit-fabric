@@ -59,6 +59,36 @@ pub enum AgentKind {
     Dsh,
 }
 
+/// Reported runtime counters. Absence is represented by `None`, never an estimated zero.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TaskTokenUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+impl TaskTokenUsage {
+    pub(crate) fn from_codex_notification(value: &serde_json::Value) -> Option<Self> {
+        // Each task starts a fresh thread; total is cumulative. Repeated notifications
+        // replace the previous snapshot instead of being added (which double-counts).
+        let total = value.pointer("/params/tokenUsage/total")?;
+        Some(Self {
+            input_tokens: total["inputTokens"].as_u64()?,
+            output_tokens: total["outputTokens"].as_u64()?,
+        })
+    }
+
+    fn from_claude_result(value: &serde_json::Value) -> Option<Self> {
+        let usage = value.get("usage")?;
+        Some(Self {
+            input_tokens: usage["input_tokens"]
+                .as_u64()?
+                .saturating_add(usage["cache_read_input_tokens"].as_u64().unwrap_or(0))
+                .saturating_add(usage["cache_creation_input_tokens"].as_u64().unwrap_or(0)),
+            output_tokens: usage["output_tokens"].as_u64()?,
+        })
+    }
+}
+
 /// Resolve an explicit runtime binding, falling back to the global default.
 #[must_use]
 pub fn selected_provider(
@@ -181,12 +211,53 @@ pub fn run_task_streaming(
     cancel: &Cancellation,
     on_delta: &mut dyn FnMut(crate::TurnDelta, &str),
 ) -> Result<String, RuntimeError> {
+    run_task_observed(
+        settings,
+        kind,
+        grants,
+        prompt,
+        image,
+        working_directory,
+        secrets,
+        cancel,
+        on_delta,
+        &mut |_| {},
+    )
+}
+
+/// Streams a task and reports authoritative usage snapshots when the adapter supplies them.
+/// # Errors
+/// Same errors as `run_task_streaming`; already reported usage remains observable on failure.
+#[allow(clippy::too_many_arguments)]
+pub fn run_task_observed(
+    settings: &RuntimeSettings,
+    kind: AgentKind,
+    grants: &ToolAuthorizationSettings,
+    prompt: &str,
+    image: Option<&std::path::Path>,
+    working_directory: Option<&std::path::Path>,
+    secrets: Option<&crate::secrets::SecretValues>,
+    cancel: &Cancellation,
+    on_delta: &mut dyn FnMut(crate::TurnDelta, &str),
+    on_usage: &mut dyn FnMut(TaskTokenUsage),
+) -> Result<String, RuntimeError> {
     if let Some(directory) = working_directory
         && !directory.is_dir()
     {
         return Err(invalid("工作目录不存在或不是文件夹"));
     }
-    run_task_in(settings, kind, grants, prompt, image, working_directory, secrets, cancel, on_delta)
+    run_task_in(
+        settings,
+        kind,
+        grants,
+        prompt,
+        image,
+        working_directory,
+        secrets,
+        cancel,
+        on_delta,
+        on_usage,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -200,6 +271,7 @@ fn run_task_in(
     secrets: Option<&crate::secrets::SecretValues>,
     cancel: &Cancellation,
     on_delta: &mut dyn FnMut(crate::TurnDelta, &str),
+    on_usage: &mut dyn FnMut(TaskTokenUsage),
 ) -> Result<String, RuntimeError> {
     settings.validate()?;
     settings.catalog.validate_secret_references(secrets)?;
@@ -270,6 +342,7 @@ fn run_task_in(
             secrets,
             cancel,
             &mut |kind, delta| on_delta(kind, &redact(delta, &key, &servers, secrets)),
+            on_usage,
         )
         .map(|output| redact(&output, &key, &servers, secrets));
     }
@@ -278,7 +351,7 @@ fn run_task_in(
     } else {
         dsh_command(settings, &provider, &servers, &environment.home, &input, secrets)?
     };
-    execute_cli(command, &environment, input, kind, cancel, &key, &servers, secrets)
+    execute_cli(command, &environment, input, kind, cancel, &key, &servers, secrets, on_usage)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -292,6 +365,7 @@ fn run_codex(
     secrets: Option<&crate::secrets::SecretValues>,
     cancel: &Cancellation,
     on_delta: &mut dyn FnMut(crate::TurnDelta, &str),
+    on_usage: &mut dyn FnMut(TaskTokenUsage),
 ) -> Result<String, RuntimeError> {
     let mut command = crate::app_server_command(&settings.codex, provider);
     restrict_environment(&mut command, &provider.api_key_environment_variable, servers, secrets);
@@ -350,12 +424,17 @@ fn run_codex(
     client.initialize()?;
     let thread = client.start_thread(Some(&provider.model))?;
     let mut output = String::new();
-    client.run_turn_streaming(&thread, input, |kind, delta| {
-        if kind == crate::TurnDelta::Answer {
-            output.push_str(delta);
-        }
-        on_delta(kind, delta);
-    })?;
+    client.run_turn_observed(
+        &thread,
+        input,
+        |kind, delta| {
+            if kind == crate::TurnDelta::Answer {
+                output.push_str(delta);
+            }
+            on_delta(kind, delta);
+        },
+        on_usage,
+    )?;
     Ok(output)
 }
 
@@ -500,6 +579,7 @@ fn execute_cli(
     key: &str,
     servers: &[&crate::tools::McpServerDefinition],
     secrets: Option<&crate::secrets::SecretValues>,
+    on_usage: &mut dyn FnMut(TaskTokenUsage),
 ) -> Result<String, RuntimeError> {
     command
         .current_dir(&environment.current)
@@ -547,6 +627,12 @@ fn execute_cli(
     let _ = writer.join();
     let output = reader.join().map_err(|_| invalid("读取任务结果失败"))??;
     let error_output = error_reader.join().map_err(|_| invalid("读取运行时错误失败"))??;
+    if kind == AgentKind::Claude
+        && let Ok(response) = serde_json::from_str::<serde_json::Value>(&output)
+        && let Some(usage) = TaskTokenUsage::from_claude_result(&response)
+    {
+        on_usage(usage);
+    }
     if let Err(error) = outcome {
         let mut detail = error_output.replace(key, "[REDACTED]");
         for server in servers {
@@ -722,6 +808,37 @@ impl ProcessOwnership {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn runtime_usage_uses_cumulative_snapshots_and_distinguishes_zero_from_missing() {
+        use super::TaskTokenUsage;
+        use serde_json::json;
+        let snapshot = |input, output| json!({"params":{"tokenUsage":{"total":{"inputTokens":input,"outputTokens":output},"last":{"inputTokens":1,"outputTokens":1}}}});
+        let reports = [snapshot(10, 2), snapshot(20, 4), snapshot(20, 4)];
+        let mut latest = None;
+        for report in reports {
+            latest = TaskTokenUsage::from_codex_notification(&report);
+        }
+        assert_eq!(latest, Some(TaskTokenUsage { input_tokens: 20, output_tokens: 4 }));
+        assert_eq!(
+            TaskTokenUsage::from_codex_notification(&snapshot(0, 0)),
+            Some(TaskTokenUsage::default())
+        );
+        assert_eq!(TaskTokenUsage::from_codex_notification(&json!({})), None);
+        assert_eq!(TaskTokenUsage::from_codex_notification(&snapshot(-1, 2)), None);
+        assert_eq!(
+            TaskTokenUsage::from_claude_result(
+                &json!({"usage":{"input_tokens":10,"output_tokens":4,"cache_read_input_tokens":20,"cache_creation_input_tokens":30}})
+            ),
+            Some(TaskTokenUsage { input_tokens: 60, output_tokens: 4 })
+        );
+        assert_eq!(
+            TaskTokenUsage::from_claude_result(
+                &json!({"usage":{"input_tokens":0,"output_tokens":0}})
+            ),
+            Some(TaskTokenUsage::default())
+        );
+        assert_eq!(TaskTokenUsage::from_claude_result(&json!({"usage":{"input_tokens":10}})), None);
+    }
     use super::*;
 
     #[test]

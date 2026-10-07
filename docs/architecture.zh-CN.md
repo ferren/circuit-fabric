@@ -2,6 +2,8 @@
 
 [English](architecture.md)
 
+桌面端已实现的代码分层、共享 UI 布局和数据流，见[桌面分层设计](desktop-architecture.zh-CN.md)。该文档区分当前实现与后续演进方向。
+
 ## 1. 定位
 
 CircuitFabric 是 AI 辅助电路设计的语义与物化底座。它刻意不是 LLM 包装器，也不是某个 EDA 的专属扩展。外部智能体在经过筛选的上下文和受控工具上进行推理；CircuitFabric 拥有电路事实、证据、变更控制、物化和验证。

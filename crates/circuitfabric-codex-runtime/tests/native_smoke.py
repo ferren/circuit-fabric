@@ -1,6 +1,7 @@
 """Exercise installed runtime binaries against a local deterministic model service.
 
 No remote model or real credential is used. Run after building runtime_probe.
+Pass --usage-only to verify counters independently of MCP capability checks.
 """
 import http.server
 import json
@@ -19,6 +20,7 @@ tool_names = []
 skill_seen = []
 tool_results = []
 image_seen = []
+usage_only = '--usage-only' in sys.argv
 
 
 class Model(http.server.BaseHTTPRequestHandler):
@@ -54,7 +56,7 @@ class Model(http.server.BaseHTTPRequestHandler):
             self.wfile.write(f'event: {kind}\ndata: {json.dumps(value)}\n\n'.encode())
 
         if '/responses' in self.path:
-            if not any(x.get('type') == 'function_call_output' for x in body.get('input', []) if isinstance(x, dict)):
+            if not usage_only and not any(x.get('type') == 'function_call_output' for x in body.get('input', []) if isinstance(x, dict)):
                 calls = [{'id': f'fc_{name}', 'type': 'function_call', 'call_id': f'call_{name}', 'name': 'echo', 'namespace': f'mcp__{name}', 'arguments': json.dumps({'text': f'CF_TOOL_{name}'})} for name in ['first', 'second']]
                 for i, call in enumerate(calls):
                     event('response.output_item.added', {'type': 'response.output_item.added', 'output_index': i, 'item': {**call, 'arguments': ''}})
@@ -74,7 +76,7 @@ class Model(http.server.BaseHTTPRequestHandler):
             event('response.completed', {'type': 'response.completed', 'response': response})
         elif '/messages' in self.path:
             event('message_start', {'type': 'message_start', 'message': {'id': 'msg_test', 'type': 'message', 'role': 'assistant', 'model': body.get('model'), 'content': [], 'stop_reason': None, 'usage': {'input_tokens': 10, 'output_tokens': 0}}})
-            if not any('tool_result' in json.dumps(x) for x in body.get('messages', [])):
+            if not usage_only and not any('tool_result' in json.dumps(x) for x in body.get('messages', [])):
                 for i, name in enumerate(['first', 'second']):
                     event('content_block_start', {'type': 'content_block_start', 'index': i, 'content_block': {'type': 'tool_use', 'id': f'tool_{name}', 'name': f'mcp__{name}__echo', 'input': {}}})
                     event('content_block_delta', {'type': 'content_block_delta', 'index': i, 'delta': {'type': 'input_json_delta', 'partial_json': json.dumps({'text': f'CF_TOOL_{name}'})}})
@@ -89,7 +91,7 @@ class Model(http.server.BaseHTTPRequestHandler):
             event('message_delta', {'type': 'message_delta', 'delta': {'stop_reason': 'end_turn', 'stop_sequence': None}, 'usage': {'output_tokens': 2}})
             event('message_stop', {'type': 'message_stop'})
         else:
-            if not any(x.get('role') == 'tool' for x in body.get('messages', [])):
+            if not usage_only and not any(x.get('role') == 'tool' for x in body.get('messages', [])):
                 calls = [{'index': i, 'id': f'call_{name}', 'type': 'function', 'function': {'name': f'mcp__{name}__echo', 'arguments': json.dumps({'text': f'CF_TOOL_{name}'})}} for i, name in enumerate(['first', 'second'])]
                 for delta, reason in [({'role': 'assistant', 'tool_calls': calls}, None), ({}, 'tool_calls')]:
                     value = {'id': 'chat_tools', 'object': 'chat.completion.chunk', 'created': 1, 'model': body.get('model'), 'choices': [{'index': 0, 'delta': delta, 'finish_reason': reason}]}
@@ -122,11 +124,13 @@ if __name__ == '__main__':
                 skills.append({'id': name, 'path': str(skill), 'enabled': True})
             settings['catalog'] = {'skills': skills, 'mcp_servers': [{'id': name, 'command': sys.executable, 'args': [str(Path(__file__).with_name('mcp_fixture.py').resolve()), str(Path(directory) / f'{name}.calls')], 'environment_variables': [], 'enabled': True} for name in ['first', 'second']]}
             settings['tools'] = {'authorized_skill_ids': ['a', 'b'], 'authorized_mcp_server_ids': ['first', 'second']}
+            if usage_only:
+                settings['tools']['authorized_mcp_server_ids'] = []
             path = Path(directory) / 'runtime.json'
             path.write_text(json.dumps(settings), encoding='utf-8')
-            environment = {**os.environ, 'CF_SMOKE_API_KEY': 'fixture-only', 'TEMP': directory, 'TMP': directory}
+            environment = {**os.environ, 'CF_SMOKE_API_KEY': 'fixture-only', 'CF_SMOKE_REQUIRE_USAGE': '1', 'TEMP': directory, 'TMP': directory}
             failed = False
-            for kind in sys.argv[1:] or ['mcp', 'codex', 'claude', 'dsh']:
+            for kind in [arg for arg in sys.argv[1:] if arg != '--usage-only'] or ['mcp', 'codex', 'claude', 'dsh']:
                 start = len(skill_seen)
                 for name in ['first', 'second']:
                     (Path(directory) / f'{name}.calls').write_text('', encoding='utf-8')
@@ -137,6 +141,10 @@ if __name__ == '__main__':
                     print(result.stdout[-1000:], result.stderr[-10000:], flush=True)
                     failed = True
                 if kind != 'mcp' and ok:
+                    assert 'CF_USAGE_OK' in result.stdout, f'{kind}: reported usage not verified'
+                    if usage_only:
+                        print(f'{kind} usage: {result.stdout.split("CF_USAGE_OK", 1)[1].strip()}', flush=True)
+                        continue
                     visible = json.dumps(tool_names[start:])
                     if 'first' not in visible: print('Tool definitions:', visible[:4000])
                     assert 'first' in visible and 'second' in visible, f'{kind}: MCP tools not exposed'
@@ -148,6 +156,8 @@ if __name__ == '__main__':
                 print('First tool schema names:', [(x.get('type'), x.get('name'), [t.get('name') for t in x.get('tools', [])]) for x in (tool_names[0] or [])])
             if failed:
                 raise SystemExit(1)
+            if usage_only:
+                raise SystemExit(0)
             # Explicit binding overrides the default, including the actual service route.
             alternate = {**provider, 'id': 'alternate', 'base_url': f'http://127.0.0.1:{server.server_port}/alternate/v1', 'model': 'fixture-alternate'}
             settings['providers'].append(alternate)

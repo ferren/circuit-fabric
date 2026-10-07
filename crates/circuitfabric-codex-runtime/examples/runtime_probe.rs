@@ -1,7 +1,7 @@
 //! Foreground integration probe; credentials are supplied only through the environment.
 use circuitfabric_codex_runtime::{
     RuntimeSettings,
-    execution::{AgentKind, Cancellation, run_task_with_image},
+    execution::{AgentKind, Cancellation, run_task_observed},
 };
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().collect::<Vec<_>>();
@@ -47,13 +47,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
     });
     let image = args.get(4).filter(|v| v.as_str() != "cancel").map(std::path::Path::new);
-    let result = run_task_with_image(&settings, kind, &settings.tools, &args[3], image, &cancel);
+    let mut usage = None;
+    let result = run_task_observed(
+        &settings,
+        kind,
+        &settings.tools,
+        &args[3],
+        image,
+        None,
+        None,
+        &cancel,
+        &mut |_, _| {},
+        &mut |reported| usage = Some(reported),
+    );
     if let Some(timer) = timer {
         timer.join().expect("cancellation timer");
         assert!(result.is_err(), "cancelled task must not complete successfully");
         println!("CF_CANCEL_OK");
     } else {
         println!("{}", result?);
+        if std::env::var_os("CF_SMOKE_REQUIRE_USAGE").is_some() {
+            if kind == AgentKind::Dsh {
+                assert!(usage.is_none(), "Dsh text output must not fabricate usage");
+            } else {
+                let usage = usage.expect("real adapter must report fixture model counters");
+                assert!(
+                    usage.input_tokens > 0 && usage.output_tokens > 0,
+                    "fixture counters: {usage:?}"
+                );
+            }
+            println!("CF_USAGE_OK {usage:?}");
+        }
     }
     Ok(())
 }

@@ -57,7 +57,7 @@ pub enum GlobalLanguage {
 pub enum SecretStorageProvider {
     /// Read credential values only from the process environment.
     Environment,
-    /// Use CircuitFabric's separately encrypted local vault.
+    /// Use `CircuitFabric`'s separately encrypted local vault.
     #[default]
     EncryptedVault,
 }
@@ -694,10 +694,27 @@ impl CodexAppServerClient {
         &mut self,
         thread_id: &str,
         input: &[Value],
-        mut on_delta: F,
+        on_delta: F,
     ) -> Result<(), RuntimeError>
     where
         F: FnMut(TurnDelta, &str),
+    {
+        self.run_turn_observed(thread_id, input, on_delta, |_| {})
+    }
+
+    /// Runs a turn while exposing reported token totals, including those preceding failure.
+    /// # Errors
+    /// Returns the same transport and turn errors as `run_turn_streaming`.
+    pub fn run_turn_observed<F, U>(
+        &mut self,
+        thread_id: &str,
+        input: &[Value],
+        mut on_delta: F,
+        mut on_usage: U,
+    ) -> Result<(), RuntimeError>
+    where
+        F: FnMut(TurnDelta, &str),
+        U: FnMut(execution::TaskTokenUsage),
     {
         let started = self.request(
             "turn/start",
@@ -718,6 +735,14 @@ impl CodexAppServerClient {
             let message = self.read_message("turn/completed", idle_deadline.min(hard_deadline))?;
             idle_deadline = Instant::now() + TURN_IDLE_TIMEOUT;
             let method = message.get("method").and_then(Value::as_str);
+            if method == Some("thread/tokenUsage/updated")
+                && message.pointer("/params/threadId").and_then(Value::as_str) == Some(thread_id)
+                && message.pointer("/params/turnId").and_then(Value::as_str)
+                    == Some(turn_id.as_str())
+                && let Some(usage) = execution::TaskTokenUsage::from_codex_notification(&message)
+            {
+                on_usage(usage);
+            }
             let kind = match method {
                 Some("item/agentMessage/delta") => Some(TurnDelta::Answer),
                 Some("item/reasoning/summaryTextDelta" | "item/reasoning/textDelta") => {

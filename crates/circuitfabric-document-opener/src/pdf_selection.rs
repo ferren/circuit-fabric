@@ -83,7 +83,7 @@ mod tests {
             .filter(|(_, ch)| !ch.is_whitespace())
             .enumerate()
             .map(|(index, (start, ch))| {
-                let x = index as f32 / 10.;
+                let x = f32::from(u16::try_from(index).expect("small test fixture index")) / 10.;
                 PdfTextCharacter {
                     bytes: start..start + ch.len_utf8(),
                     bounds: PdfHighlightRect { left: x, top: 0.1, width: 0.1, height: 0.1 },

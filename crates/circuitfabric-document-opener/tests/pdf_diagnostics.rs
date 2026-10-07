@@ -31,7 +31,7 @@ fn times_roman_pdf() -> Vec<u8> {
     use pdf_extract::{Dictionary, Document, Object, Stream};
 
     let mut pdf = Document::with_version("1.4");
-    let pages_id = pdf.new_object_id();
+    let root_pages = pdf.new_object_id();
     let mut encoding = Dictionary::new();
     encoding.set("BaseEncoding", Object::Name(b"WinAnsiEncoding".to_vec()));
     let mut differences = vec![Object::Integer(0)];
@@ -53,7 +53,7 @@ fn times_roman_pdf() -> Vec<u8> {
     ));
     let mut page = Dictionary::new();
     page.set("Type", Object::Name(b"Page".to_vec()));
-    page.set("Parent", pages_id);
+    page.set("Parent", root_pages);
     page.set("MediaBox", vec![0.into(), 0.into(), 612.into(), 792.into()]);
     page.set("Resources", resources);
     page.set("Contents", content_id);
@@ -62,10 +62,10 @@ fn times_roman_pdf() -> Vec<u8> {
     pages.set("Type", Object::Name(b"Pages".to_vec()));
     pages.set("Kids", vec![Object::Reference(page_id)]);
     pages.set("Count", 1);
-    pdf.objects.insert(pages_id, Object::Dictionary(pages));
+    pdf.objects.insert(root_pages, Object::Dictionary(pages));
     let mut catalog = Dictionary::new();
     catalog.set("Type", Object::Name(b"Catalog".to_vec()));
-    catalog.set("Pages", pages_id);
+    catalog.set("Pages", root_pages);
     let catalog_id = pdf.add_object(catalog);
     pdf.trailer.set("Root", catalog_id);
     let mut bytes = Vec::new();

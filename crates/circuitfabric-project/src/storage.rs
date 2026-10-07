@@ -363,6 +363,11 @@ impl ProjectStorage {
 
     /// Lists persisted `ChangeSets` in stable path order.  The control plane only reads these
     /// records; materializers are responsible for creating their proposed plans.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when paths cannot be resolved, directory entries or records cannot
+    /// be read, or a record has invalid JSON, an unsupported schema version, or an invalid ID.
     pub fn list_change_sets(&self) -> Result<Vec<StoredChangeSet>, ProjectStorageError> {
         let directory = self.resolve_relative_path("logic/changesets")?;
         let entries = fs::read_dir(&directory).map_err(|source| ProjectStorageError::Io {
@@ -401,6 +406,11 @@ impl ProjectStorage {
     }
 
     /// Atomically writes a `ChangeSet` record supplied by a materialization backend.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid ID or schema version, or when the record cannot be
+    /// serialized or atomically written to its project path.
     pub fn save_change_set(&self, record: &StoredChangeSet) -> Result<(), ProjectStorageError> {
         validate_change_set_id(&record.id)?;
         if record.schema_version != CHANGESET_SCHEMA_VERSION {
@@ -412,6 +422,11 @@ impl ProjectStorage {
     /// Appends an immutable approval or rejection audit entry and persists it atomically.
     /// Approval is rejected unless the actual current observation and recorded readback both
     /// match the `ChangeSet` baseline; callers should disable the UI action on the same predicate.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the record is missing, unreadable, or invalid, approval does
+    /// not match the current observation, or the updated record cannot be persisted.
     pub fn record_change_set_decision(
         &self,
         id: &str,

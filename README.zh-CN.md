@@ -34,6 +34,7 @@ EDA、网表、BOM、仿真与验证插件
 - `apps/`：产品壳，首先是 GPUI 桌面控制面。
 - `assets/branding/`：项目自有应用美术资源，包括多尺寸 Windows 图标资源。
 - [Architecture](docs/architecture.md) / [架构](docs/architecture.zh-CN.md)：目标架构、所有权、约束和插件边界。
+- [桌面分层设计](docs/desktop-architecture.zh-CN.md)：已落地的桌面模块边界、公共布局、读模型和扩展规范。
 - [Implementation plan](docs/implementation-plan.md) / [实施计划](docs/implementation-plan.zh-CN.md)：分阶段交付计划和验收标准。
 - [Provider settings](docs/provider-settings.md)：多 Provider 配置与凭据边界。
 - [TODO](TODO.md)：按执行顺序维护的实现待办。

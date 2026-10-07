@@ -31,7 +31,7 @@ fn free_loopback_address() -> String {
 
 fn write_settings(dir: &Path, address: &str) -> PathBuf {
     let mut settings = RuntimeSettings::default();
-    settings.bridge.listen_address = address.to_owned();
+    address.clone_into(&mut settings.bridge.listen_address);
     let path = dir.join("runtime.json");
     settings.save(&path).expect("default settings with a loopback address are valid");
     path
