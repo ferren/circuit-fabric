@@ -610,6 +610,8 @@ mod tests {
     fn replay(body: &str) -> SessionReplay {
         SessionReplay {
             metadata: SessionMetadata {
+                category: circuitfabric_project::SessionCategory::Legacy,
+                subject_id: None,
                 session_id: "session".into(),
                 project_id: "project".into(),
                 runtime_profile_id: "provider".into(),
@@ -887,6 +889,8 @@ mod tests {
     fn audit_filter_never_drops_its_source_context() {
         let replay = SessionReplay {
             metadata: SessionMetadata {
+                category: circuitfabric_project::SessionCategory::Legacy,
+                subject_id: None,
                 session_id: "session-7".into(),
                 project_id: "project-7".into(),
                 runtime_profile_id: "provider-7".into(),

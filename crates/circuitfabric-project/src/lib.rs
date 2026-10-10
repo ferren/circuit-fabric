@@ -38,9 +38,9 @@ pub use documents::{
     classify_document_kind, is_evidence_indexable, is_text_extractable,
 };
 pub use sessions::{
-    SESSION_MARKDOWN_SCHEMA_VERSION, SessionActor, SessionEvent, SessionEventKind, SessionListing,
-    SessionMetadata, SessionReplay, SessionSeed, SessionStatus, SessionSummary, SessionUsage,
-    rfc3339,
+    SESSION_MARKDOWN_SCHEMA_VERSION, SessionActor, SessionCategory, SessionEvent, SessionEventKind,
+    SessionListing, SessionMetadata, SessionReplay, SessionSeed, SessionStatus, SessionSummary,
+    SessionUsage, rfc3339,
 };
 pub use storage::{
     CHANGESET_SCHEMA_VERSION, PROJECT_REGISTRY_SCHEMA_VERSION, PROJECT_STORAGE_SCHEMA_VERSION,
@@ -442,10 +442,7 @@ pub fn extract_pdf_pages(
         return None;
     }
     let bytes = storage.read_verified_document_content(document).ok()?;
-    let pages = std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem_by_pages(&bytes))
-        .ok()?
-        .ok()?;
-    pages.iter().any(|page| !page.trim().is_empty()).then_some(pages)
+    circuitfabric_document_opener::extract_pdf_text_pages(&bytes).ok()
 }
 
 /// One fragment per extraction row that carries its verified source line.

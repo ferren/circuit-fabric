@@ -207,6 +207,8 @@ fn true_daily_time_spacing_excludes_zero_future_and_out_of_range_times() {
             file_name: format!("{index}.md"),
             byte_size: 1,
             metadata: SessionMetadata {
+                category: circuitfabric_project::SessionCategory::Legacy,
+                subject_id: None,
                 session_id: index.to_string(),
                 project_id: "p".into(),
                 runtime_profile_id: "codex".into(),

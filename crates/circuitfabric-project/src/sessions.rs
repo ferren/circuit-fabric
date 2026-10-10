@@ -26,6 +26,31 @@ const SESSIONS_DIRECTORY: &str = "sessions";
 const SUMMARY_HEADING: &str = "## 会话摘要";
 const TURNS_HEADING: &str = "## 轮次与工具调用";
 
+/// Application purpose; runtime history alone does not identify the owning feature.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionCategory {
+    Eda,
+    Datasheet,
+    Runtime,
+    #[default]
+    Legacy,
+}
+
+impl SessionCategory {
+    pub const ALL: [Self; 4] = [Self::Eda, Self::Datasheet, Self::Runtime, Self::Legacy];
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Eda => "eda",
+            Self::Datasheet => "datasheet",
+            Self::Runtime => "runtime",
+            Self::Legacy => "legacy",
+        }
+    }
+}
+
 /// Lifecycle state persisted in the session front matter.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -57,6 +82,8 @@ pub struct SessionUsage {
 /// The YAML front matter of one session record.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionMetadata {
+    pub category: SessionCategory,
+    pub subject_id: Option<String>,
     pub session_id: SessionId,
     pub project_id: ProjectId,
     pub runtime_profile_id: String,
@@ -144,9 +171,32 @@ impl crate::ProjectStorage {
     /// Returns an error for an unsafe session ID, an existing file for this session, or a
     /// write failure.
     pub fn start_session(&self, seed: SessionSeed) -> Result<SessionMetadata, ProjectStorageError> {
+        self.start_categorized_session(seed, SessionCategory::Legacy, None)
+    }
+
+    /// Starts a feature-owned record under `sessions/<category>/`.
+    pub fn start_categorized_session(
+        &self,
+        seed: SessionSeed,
+        category: SessionCategory,
+        subject_id: Option<String>,
+    ) -> Result<SessionMetadata, ProjectStorageError> {
         validate_session_id(&seed.session_id)?;
+        // Session IDs are project-wide, including records written by older clients.
+        if self
+            .list_sessions()?
+            .sessions
+            .iter()
+            .any(|row| row.metadata.session_id == seed.session_id)
+        {
+            return Err(ProjectStorageError::SessionAlreadyExists {
+                path: self.find_session_file(&seed.session_id)?,
+            });
+        }
         let started_at = now_unix_seconds();
         let metadata = SessionMetadata {
+            category,
+            subject_id,
             session_id: seed.session_id,
             project_id: self.manifest().project.id.clone(),
             runtime_profile_id: seed.runtime_profile_id,
@@ -158,6 +208,13 @@ impl crate::ProjectStorage {
             citations: Vec::new(),
         };
         let path = self.session_file_path(&metadata)?;
+        fs::create_dir_all(path.parent().expect("session directory")).map_err(|source| {
+            ProjectStorageError::Io {
+                action: "create session category",
+                path: path.clone(),
+                source,
+            }
+        })?;
         if path.exists() {
             return Err(ProjectStorageError::SessionAlreadyExists { path });
         }
@@ -174,7 +231,7 @@ impl crate::ProjectStorage {
     /// Appends one audit event to a session's turn log.
     ///
     /// Appends are single flushed writes at end of file, so a crash can only ever truncate the
-    /// last event line, never the front matter or earlier events.
+    /// last event, never the front matter or earlier events.
     ///
     /// # Errors
     ///
@@ -231,47 +288,136 @@ impl crate::ProjectStorage {
     ///
     /// Returns an error when the sessions directory cannot be read.
     pub fn list_sessions(&self) -> Result<SessionListing, ProjectStorageError> {
-        let directory = self.resolve_relative_path(SESSIONS_DIRECTORY)?;
         let mut sessions = Vec::new();
         let mut orphaned_temp_files = Vec::new();
-        let entries = fs::read_dir(&directory).map_err(|source| ProjectStorageError::Io {
-            action: "list sessions",
-            path: directory.clone(),
-            source,
-        })?;
-        for entry in entries {
-            let entry = entry.map_err(|source| ProjectStorageError::Io {
+        for relative in self.session_directories() {
+            let directory = self.resolve_relative_path(&relative)?;
+            if !directory.exists() {
+                continue;
+            }
+            let entries = fs::read_dir(&directory).map_err(|source| ProjectStorageError::Io {
                 action: "list sessions",
                 path: directory.clone(),
                 source,
             })?;
-            let file_name = entry.file_name().to_string_lossy().into_owned();
-            if file_name.starts_with('.')
-                && Path::new(&file_name).extension() == Some(OsStr::new("tmp"))
-            {
-                orphaned_temp_files.push(file_name);
-                continue;
+            for entry in entries {
+                let entry = entry.map_err(|source| ProjectStorageError::Io {
+                    action: "list sessions",
+                    path: directory.clone(),
+                    source,
+                })?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let file_name = Path::new(&relative)
+                    .strip_prefix(SESSIONS_DIRECTORY)
+                    .unwrap_or(Path::new(""))
+                    .join(&name)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if !entry
+                    .file_type()
+                    .map_err(|source| ProjectStorageError::Io {
+                        action: "inspect session record",
+                        path: entry.path(),
+                        source,
+                    })?
+                    .is_file()
+                {
+                    continue;
+                }
+                if name.starts_with('.')
+                    && Path::new(&file_name).extension() == Some(OsStr::new("tmp"))
+                {
+                    orphaned_temp_files.push(file_name);
+                    continue;
+                }
+                if Path::new(&file_name).extension() != Some(OsStr::new("md")) {
+                    continue;
+                }
+                let path = entry.path();
+                let byte_size = entry.metadata().map_err(|source| ProjectStorageError::Io {
+                    action: "inspect session record",
+                    path: path.clone(),
+                    source,
+                })?;
+                let raw = fs::read_to_string(&path).map_err(|source| ProjectStorageError::Io {
+                    action: "read session record",
+                    path: path.clone(),
+                    source,
+                })?;
+                let (metadata, _) = parse_session_markdown(&raw, &path)?;
+                if metadata.project_id != self.manifest().project.id {
+                    return Err(ProjectStorageError::ParseSession {
+                        path,
+                        reason: "session belongs to another project".into(),
+                    });
+                }
+                sessions.push(SessionSummary { metadata, file_name, byte_size: byte_size.len() });
             }
-            if Path::new(&file_name).extension() != Some(OsStr::new("md")) {
-                continue;
-            }
-            let path = entry.path();
-            let byte_size = entry.metadata().map_err(|source| ProjectStorageError::Io {
-                action: "inspect session record",
-                path: path.clone(),
-                source,
-            })?;
-            let raw = fs::read_to_string(&path).map_err(|source| ProjectStorageError::Io {
-                action: "read session record",
-                path: path.clone(),
-                source,
-            })?;
-            let (metadata, _) = parse_session_markdown(&raw, &path)?;
-            sessions.push(SessionSummary { metadata, file_name, byte_size: byte_size.len() });
         }
-        sessions.sort_by(|left, right| right.file_name.cmp(&left.file_name));
+        sessions.sort_by(|left, right| {
+            right
+                .metadata
+                .started_at_unix_seconds
+                .cmp(&left.metadata.started_at_unix_seconds)
+                .then_with(|| right.file_name.cmp(&left.file_name))
+        });
         orphaned_temp_files.sort();
         Ok(SessionListing { sessions, orphaned_temp_files })
+    }
+
+    /// Keeps feature-specific entry points from mixing histories.
+    pub fn list_sessions_for(
+        &self,
+        category: SessionCategory,
+        subject_id: Option<&str>,
+    ) -> Result<SessionListing, ProjectStorageError> {
+        let mut listing = self.list_sessions()?;
+        listing.sessions.retain(|row| {
+            row.metadata.category == category
+                && subject_id.is_none_or(|id| row.metadata.subject_id.as_deref() == Some(id))
+        });
+        listing
+            .orphaned_temp_files
+            .retain(|name| name.starts_with(&format!("{}/", category.as_str())));
+        Ok(listing)
+    }
+
+    fn session_directories(&self) -> Vec<PathBuf> {
+        let mut directories = vec![PathBuf::from(SESSIONS_DIRECTORY)];
+        directories.extend(
+            SessionCategory::ALL
+                .into_iter()
+                .filter(|category| *category != SessionCategory::Legacy)
+                .map(|category| Path::new(SESSIONS_DIRECTORY).join(category.as_str())),
+        );
+        directories
+    }
+
+    /// Stable runtime history scope for a recorded session. Never stores credentials.
+    pub fn session_runtime_directory(
+        &self,
+        session_id: &str,
+    ) -> Result<PathBuf, ProjectStorageError> {
+        let replay = self.load_session(session_id)?;
+        self.resolve_relative_path(
+            Path::new(SESSIONS_DIRECTORY)
+                .join(replay.metadata.category.as_str())
+                .join(session_id)
+                .join("codex"),
+        )
+    }
+
+    /// Marks a subsequent turn active without resetting prior usage.
+    pub fn resume_session(&self, session_id: &str) -> Result<(), ProjectStorageError> {
+        let replay = self.load_session(session_id)?;
+        let mut metadata = replay.metadata;
+        metadata.status = SessionStatus::Running;
+        metadata.completed_at_unix_seconds = None;
+        let path = self.find_session_file(session_id)?;
+        write_text_atomically(
+            &path,
+            &format!("{}\n{}", render_front_matter(&metadata), replay.body),
+        )
     }
 
     /// Loads one session record for read-only replay.
@@ -287,6 +433,12 @@ impl crate::ProjectStorage {
             source,
         })?;
         let (metadata, body) = parse_session_markdown(&raw, &path)?;
+        if metadata.session_id != session_id || metadata.project_id != self.manifest().project.id {
+            return Err(ProjectStorageError::ParseSession {
+                path,
+                reason: "session identity does not match its project or file".into(),
+            });
+        }
         Ok(SessionReplay { metadata, body })
     }
 
@@ -299,27 +451,37 @@ impl crate::ProjectStorage {
             file_name_timestamp(metadata.started_at_unix_seconds),
             metadata.session_id
         );
-        self.resolve_relative_path(Path::new(SESSIONS_DIRECTORY).join(file_name))
+        let directory = if metadata.category == SessionCategory::Legacy {
+            PathBuf::from(SESSIONS_DIRECTORY)
+        } else {
+            Path::new(SESSIONS_DIRECTORY).join(metadata.category.as_str())
+        };
+        self.resolve_relative_path(directory.join(file_name))
     }
 
     fn find_session_file(&self, session_id: &str) -> Result<PathBuf, ProjectStorageError> {
         validate_session_id(session_id)?;
-        let directory = self.resolve_relative_path(SESSIONS_DIRECTORY)?;
         let suffix = format!("--{session_id}.md");
-        let entries = fs::read_dir(&directory).map_err(|source| ProjectStorageError::Io {
-            action: "locate session record",
-            path: directory.clone(),
-            source,
-        })?;
-        for entry in entries {
-            let entry = entry.map_err(|source| ProjectStorageError::Io {
+        for relative in self.session_directories() {
+            let directory = self.resolve_relative_path(relative)?;
+            if !directory.exists() {
+                continue;
+            }
+            let entries = fs::read_dir(&directory).map_err(|source| ProjectStorageError::Io {
                 action: "locate session record",
                 path: directory.clone(),
                 source,
             })?;
-            let file_name = entry.file_name().to_string_lossy().into_owned();
-            if file_name.ends_with(&suffix) {
-                return Ok(entry.path());
+            for entry in entries {
+                let entry = entry.map_err(|source| ProjectStorageError::Io {
+                    action: "locate session record",
+                    path: directory.clone(),
+                    source,
+                })?;
+                let file_name = entry.file_name().to_string_lossy().into_owned();
+                if file_name.ends_with(&suffix) {
+                    return Ok(entry.path());
+                }
             }
         }
         Err(ProjectStorageError::SessionNotFound { session_id: session_id.to_owned() })
@@ -347,6 +509,12 @@ fn render_front_matter(metadata: &SessionMetadata) -> String {
     let _ = writeln!(lines, "schemaVersion: {SESSION_MARKDOWN_SCHEMA_VERSION}");
     let _ = writeln!(lines, "sessionId: {}", metadata.session_id);
     let _ = writeln!(lines, "projectId: {}", metadata.project_id);
+    let _ = writeln!(lines, "category: {}", metadata.category.as_str());
+    let _ = writeln!(
+        lines,
+        "subjectId: {}",
+        serde_json::to_string(&metadata.subject_id).expect("string JSON")
+    );
     let _ = writeln!(lines, "runtimeProfileId: {}", metadata.runtime_profile_id);
     match &metadata.backend_id {
         Some(backend_id) => {
@@ -440,6 +608,27 @@ fn parse_session_markdown(
     let backend_id = parse_optional_text(field("backendId")?);
     Ok((
         SessionMetadata {
+            category: match fields
+                .iter()
+                .find(|(key, _)| key == "category")
+                .map(|(_, value)| value.as_str())
+            {
+                Some("eda") => SessionCategory::Eda,
+                Some("datasheet") => SessionCategory::Datasheet,
+                Some("runtime") => SessionCategory::Runtime,
+                Some("legacy") | None => SessionCategory::Legacy,
+                Some(other) => {
+                    return Err(parse_error(format!("unknown session category `{other}`")));
+                }
+            },
+            subject_id: fields
+                .iter()
+                .find(|(key, _)| key == "subjectId")
+                .map(|(_, value)| {
+                    serde_json::from_str(value).map_err(|error| parse_error(error.to_string()))
+                })
+                .transpose()?
+                .flatten(),
             session_id: field("sessionId")?.to_owned(),
             project_id: field("projectId")?.to_owned(),
             runtime_profile_id: field("runtimeProfileId")?.to_owned(),
@@ -517,7 +706,24 @@ fn render_event(event: &SessionEvent) -> String {
     let timestamp = rfc3339(event.timestamp_unix_seconds);
     match &event.kind {
         SessionEventKind::Turn { actor, message } => {
-            format!("- **{timestamp}** · {} · {}", actor.as_str(), single_line(message))
+            if message.contains('\n') || message.contains('\r') {
+                // Nest Markdown under the event to preserve headings and fenced code
+                // while keeping model-authored text distinct from audit event headers.
+                let message = message.replace("\r\n", "\n").replace('\r', "\n");
+                let message = message
+                    .chars()
+                    .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+                    .collect::<String>();
+                let body = message
+                    .trim()
+                    .lines()
+                    .map(|line| format!("    {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!("- **{timestamp}** · {} · 消息\n\n{body}\n", actor.as_str())
+            } else {
+                format!("- **{timestamp}** · {} · {}", actor.as_str(), single_line(message))
+            }
         }
         SessionEventKind::ToolCall { summary } => {
             format!("- **{timestamp}** · 工具调用 · {}", single_line(summary))
@@ -687,6 +893,59 @@ mod tests {
     }
 
     #[test]
+    fn categorized_sessions_reopen_filter_and_keep_legacy_records() {
+        let root = test_root("categories");
+        let storage = ProjectStorage::create(&root, project("p")).unwrap();
+        storage.start_session(seed("old")).unwrap();
+        for (id, category, subject) in [
+            ("eda-1", SessionCategory::Eda, None),
+            ("ds-1", SessionCategory::Datasheet, Some("doc-1".into())),
+            ("ds-2", SessionCategory::Datasheet, Some("doc-2".into())),
+            ("runtime-1", SessionCategory::Runtime, None),
+        ] {
+            storage.start_categorized_session(seed(id), category, subject).unwrap();
+        }
+        let reopened = ProjectStorage::open(&root).unwrap();
+        assert_eq!(reopened.list_sessions().unwrap().sessions.len(), 5);
+        assert_eq!(
+            reopened.list_sessions_for(SessionCategory::Eda, None).unwrap().sessions[0]
+                .metadata
+                .session_id,
+            "eda-1"
+        );
+        let rows = reopened.list_sessions_for(SessionCategory::Datasheet, Some("doc-1")).unwrap();
+        assert_eq!(rows.sessions.len(), 1);
+        assert_eq!(rows.sessions[0].metadata.session_id, "ds-1");
+        assert!(rows.sessions[0].file_name.starts_with("datasheet/"));
+        assert!(
+            reopened
+                .session_runtime_directory("eda-1")
+                .unwrap()
+                .starts_with(root.join("sessions/eda/eda-1"))
+        );
+        assert!(
+            reopened
+                .start_categorized_session(seed("eda-1"), SessionCategory::Datasheet, None)
+                .is_err()
+        );
+        assert!(reopened.session_runtime_directory("../../escape").is_err());
+        reopened
+            .complete_session(
+                "eda-1",
+                SessionUsage { input_tokens: 21, output_tokens: 9 },
+                Vec::new(),
+                SessionStatus::Failed,
+            )
+            .unwrap();
+        reopened.resume_session("eda-1").unwrap();
+        let resumed = reopened.load_session("eda-1").unwrap();
+        assert_eq!(resumed.metadata.status, SessionStatus::Running);
+        assert_eq!(resumed.metadata.usage.input_tokens, 21);
+        assert!(resumed.metadata.completed_at_unix_seconds.is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn a_session_round_trips_through_markdown_and_survives_reopening() {
         let root = test_root("roundtrip");
         let storage = ProjectStorage::create(&root, project("power-supply")).expect("project");
@@ -757,7 +1016,11 @@ mod tests {
         assert_eq!(replay.metadata.session_id, "session_first");
         assert!(replay.body.contains("## 会话摘要"));
         assert!(replay.body.contains("## 轮次与工具调用"));
-        assert!(replay.body.contains("用户 · Add an input capacitor and keep it stable"));
+        assert!(
+            replay
+                .body
+                .contains("· 用户 · 消息\n\n    Add an input capacitor\n    and keep it stable")
+        );
         assert!(replay.body.contains("document=doc-abc hash=sha256:00"));
         assert!(replay.body.contains("备注 · 任务失败：连接超时"));
         let raw = fs::read_to_string(
