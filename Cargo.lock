@@ -1020,6 +1020,7 @@ dependencies = [
  "gpui_platform",
  "image",
  "jlcircuit-eda-bridge",
+ "pulldown-cmark",
  "raw-window-handle",
  "rfd",
  "serde",
@@ -1072,7 +1073,6 @@ dependencies = [
  "circuitfabric-document-opener",
  "circuitfabric-plugin-api",
  "dunce",
- "pdf-extract",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -3522,6 +3522,7 @@ name = "jlcircuit-eda-bridge"
 version = "0.1.0"
 dependencies = [
  "circuitfabric-codex-runtime",
+ "circuitfabric-contracts",
  "circuitfabric-plugin-api",
  "circuitfabric-project",
  "serde_json",

@@ -41,94 +41,74 @@ impl ControlPlaneView {
         Some((id.clone(), storage.root().to_path_buf()))
     }
 
-    /// Starts the supervised Codex App Server child process.
-    ///
-    /// Uses the saved snapshot and checks for an immediate process exit.
-    pub(super) fn start_codex_runtime(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.codex_process.is_some()
-            || matches!(self.codex_status, RuntimeLifecycleStatus::Starting)
-        {
-            "未启动：Codex App Server 正在运行或正在启动。".clone_into(&mut self.status);
-            cx.notify();
+    /// One-shot connection check for the saved Codex configuration: launch the
+    /// App Server once, require the JSON-RPC initialization handshake, then stop
+    /// the process. Nothing stays resident — tasks, datasheet extraction, and
+    /// EDA bridge sessions each spawn their own isolated process from the same
+    /// saved settings, so this check is the endpoint's only role.
+    pub(super) fn check_codex_runtime(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.codex_check_pending {
             return;
         }
         let Some(settings) = self.settings_for_execution(cx) else {
             return;
-        };
-        let project_context = self.current_project_context();
-        let launch_settings = match crate::application::project_runtime::codex_for_project(
-            &settings,
-            project_context.as_ref().map(|(_, root)| root.as_path()),
-        ) {
-            Ok(settings) => settings,
-            Err(reason) => {
-                self.status = reason;
-                cx.notify();
-                return;
-            }
         };
         let Some(provider) = circuitfabric_codex_runtime::execution::selected_provider(
             &settings,
             circuitfabric_codex_runtime::execution::AgentKind::Codex,
         )
         .cloned() else {
-            "未启动：请先配置默认 Provider。".clone_into(&mut self.status);
+            "未检查：请先配置可用的 Codex Provider。".clone_into(&mut self.status);
             cx.notify();
             return;
         };
-        self.codex_status = RuntimeLifecycleStatus::Starting;
-        self.codex_project_context = project_context.clone();
-        self.codex_active_provider =
-            Some(format!("{} / {} / {}", provider.id, provider.model, provider.base_url));
-        self.status = format!("Codex App Server: {} / {}", provider.id, provider.model);
+        self.codex_check_pending = true;
+        let snapshot = format!("{} / {} / {}", provider.id, provider.model, provider.base_url);
+        let command = settings.codex.command.clone();
+        self.status = format!("Codex 连接检查中：{snapshot}");
         let secrets = (self.secret_storage_provider == SecretStorageProvider::EncryptedVault)
             .then(|| self.vault.as_ref().map(|vault| vault.values().clone()))
             .flatten();
-        let launch = cx.background_spawn(async move {
-            CodexAppServerHandle::launch_with_secrets(&launch_settings, &provider, secrets.as_ref())
-                .map_err(|error| error.to_string())
+        let launch_settings = settings.codex.clone();
+        let check = cx.background_spawn(async move {
+            let started = Instant::now();
+            // `launch_with_secrets` requires the initialization handshake before
+            // returning, so success proves the executable, provider configuration,
+            // and key resolution all work end to end; the drop guard cleans up.
+            let outcome = CodexAppServerHandle::launch_with_secrets(
+                &launch_settings,
+                &provider,
+                secrets.as_ref(),
+            )
+            .map(|mut handle| {
+                let _ = handle.stop();
+            })
+            .map_err(|error| error.to_string());
+            (outcome, started.elapsed())
         });
         cx.spawn_in(window, async move |view, cx| {
-            let result = launch.await;
+            let (outcome, elapsed) = check.await;
             cx.update(|_, cx| {
                 view.update(cx, |view, cx| {
-                    if view.codex_project_context != project_context
-                        || view.current_project_context() != project_context
-                    {
-                        let stopped = match result {
-                            Ok(mut handle) => handle.stop().map_err(|error| error.to_string()),
-                            Err(_) => Ok(()),
-                        };
-                        view.codex_project_context = None;
-                        view.codex_active_provider = None;
-                        view.codex_status = match stopped {
-                            Ok(()) => {
-                                view.status =
-                                    "已取消 Codex 启动并清理进程；请在当前项目重新启动。".into();
-                                RuntimeLifecycleStatus::Stopped
-                            }
-                            Err(reason) => {
-                                view.status = format!("取消 Codex 启动时清理进程失败：{reason}");
-                                RuntimeLifecycleStatus::Failed { reason }
-                            }
-                        };
-                        cx.notify();
-                        return;
-                    }
-                    match result {
-                        Ok(handle) => {
-                            let pid = handle.pid();
-                            view.codex_process = Some(handle);
-                            view.codex_status = RuntimeLifecycleStatus::Running { pid };
-                        }
-                        Err(reason) => {
-                            view.codex_project_context = None;
-                            view.codex_active_provider = None;
-                            view.codex_status =
-                                RuntimeLifecycleStatus::Failed { reason: reason.clone() };
-                            view.status = reason;
-                        }
-                    }
+                    view.codex_check_pending = false;
+                    view.codex_check = Some(CodexCheckResult {
+                        at: Instant::now(),
+                        outcome: outcome.map(|()| CodexCheckReport {
+                            provider: snapshot,
+                            command,
+                            elapsed,
+                        }),
+                    });
+                    view.status = match &view.codex_check.as_ref().map(|result| &result.outcome) {
+                        Some(Ok(report)) => format!(
+                            "Codex 连接检查通过：{}（{}，耗时 {}）；检查进程已结束。",
+                            report.provider,
+                            report.command,
+                            report.elapsed.as_millis()
+                        ),
+                        Some(Err(reason)) => format!("Codex 连接检查未通过：{reason}"),
+                        None => String::new(),
+                    };
                     cx.notify();
                 })
                 .ok();
@@ -139,74 +119,33 @@ impl ControlPlaneView {
         cx.notify();
     }
 
-    pub(super) fn stop_codex_runtime(&mut self, cx: &mut Context<Self>) {
-        if let Some(cancel) = &self.task_cancel {
-            cancel.cancel();
+    /// Status color of the one-shot check, mirroring the bridge health dots.
+    pub(super) fn codex_check_dot(&self) -> u32 {
+        if self.codex_check_pending {
+            return 0x00f5_9e0b;
         }
-        if matches!(self.codex_status, RuntimeLifecycleStatus::Starting) {
-            self.codex_project_context = None;
-            "已请求取消 Codex 启动，启动结束后自动清理进程。".clone_into(&mut self.status);
-            cx.notify();
-            return;
+        match &self.codex_check {
+            Some(result) if result.outcome.is_ok() => 0x0022_c55e,
+            Some(_) => 0x00dc_2626,
+            None => 0x0094_a3b8,
         }
-        let Some(mut process) = self.codex_process.take() else {
-            "运行时当前未在运行。".clone_into(&mut self.status);
-            cx.notify();
-            return;
-        };
-        let pid = process.pid();
-        self.codex_project_context = None;
-        match process.stop() {
-            Ok(()) => {
-                self.codex_status = RuntimeLifecycleStatus::Stopped;
-                self.codex_active_provider = None;
-                self.status =
-                    format!("已停止 Codex App Server（PID {pid}）。已保存的运行时设置保持不变。");
-            }
-            Err(error) => {
-                self.codex_status = RuntimeLifecycleStatus::Failed { reason: error.to_string() };
-                self.status = format!("停止失败（PID {pid}）：{error}");
-            }
-        }
-        cx.notify();
     }
 
-    /// Reconciles the lifecycle chip with the real process state: a process that died on its
-    /// own is reported as stopped or failed instead of staying green.
-    pub(super) fn refresh_codex_lifecycle(&mut self) {
-        if self.codex_project_context.is_some()
-            && self.codex_project_context != self.current_project_context()
-        {
-            self.codex_project_context = None;
-            if let Some(mut process) = self.codex_process.take() {
-                self.codex_active_provider = None;
-                self.codex_status = match process.stop() {
-                    Ok(()) => {
-                        self.status =
-                            "项目已切换，旧项目的 Codex 进程已清理；请在当前项目重新启动。".into();
-                        RuntimeLifecycleStatus::Stopped
-                    }
-                    Err(error) => {
-                        let reason = error.to_string();
-                        self.status =
-                            format!("项目已切换，但旧项目的 Codex 进程清理失败：{reason}");
-                        RuntimeLifecycleStatus::Failed { reason }
-                    }
-                };
-            }
+    /// Short label for list cards and the sidebar chip.
+    pub(super) fn codex_check_label(&self, language: UiLanguage) -> String {
+        if self.codex_check_pending {
+            return language.choose("Codex 检查中…", "Codex checking…").to_owned();
         }
-        let exit = self.codex_process.as_mut().and_then(CodexAppServerHandle::try_exit);
-        if let Some(exit) = exit {
-            self.codex_process = None;
-            self.codex_active_provider = None;
-            self.codex_project_context = None;
-            if exit.success() {
-                self.codex_status = RuntimeLifecycleStatus::Stopped;
-            } else {
-                self.codex_status = RuntimeLifecycleStatus::Failed {
-                    reason: format!("进程已退出（{exit}）"),
-                };
-            }
+        match &self.codex_check {
+            Some(result) => match &result.outcome {
+                Ok(_) => format!(
+                    "{}（{} 前）",
+                    language.choose("Codex 检查通过", "Codex check passed"),
+                    elapsed_label(language, result.at.elapsed()),
+                ),
+                Err(_) => language.choose("Codex 检查未通过", "Codex check failed").to_owned(),
+            },
+            None => language.choose("Codex 未检查", "Codex not checked").to_owned(),
         }
     }
 
@@ -463,7 +402,7 @@ impl ControlPlaneView {
             let selected = matches!(self.agents_selection, AgentsSelection::Runtime(chosen) if chosen == adapter);
             let is_codex = adapter == RuntimeAdapter::CodexAppServer;
             let status_label =
-                if is_codex { self.codex_status.clone().label(language) } else { String::new() };
+                if is_codex { self.codex_check_label(language) } else { String::new() };
             runtime_cards = runtime_cards.child(
                 div()
                     .id(format!("runtime-card-{}", adapter.label()))
@@ -487,7 +426,7 @@ impl ControlPlaneView {
                             .flex()
                             .items_center()
                             .gap_2()
-                            .when(is_codex, |row| row.child(status_dot(self.codex_status.dot())))
+                            .when(is_codex, |row| row.child(status_dot(self.codex_check_dot())))
                             .child(
                                 div()
                                     .text_sm()
@@ -1290,12 +1229,13 @@ impl ControlPlaneView {
     ) -> impl IntoElement {
         let entity = cx.entity().clone();
         let language = self.language;
-        let status = self.codex_status.clone();
-        let is_running = self.codex_process.is_some();
-        let is_starting = matches!(self.codex_status, RuntimeLifecycleStatus::Starting);
-        let starter = entity.clone();
-        let binding_saver = entity.clone();
-        let stopper = entity;
+        let checker = entity.clone();
+        let binding_saver = entity;
+        let check_pending = self.codex_check_pending;
+        let last_check = self
+            .codex_check
+            .as_ref()
+            .map(|result| (elapsed_label(language, result.at.elapsed()), result.outcome.clone()));
         let launch_provider = circuitfabric_codex_runtime::execution::selected_provider(
             &self.saved_settings,
             circuitfabric_codex_runtime::execution::AgentKind::Codex,
@@ -1311,13 +1251,6 @@ impl ControlPlaneView {
                 )
                 .to_owned(),
         };
-        let active_provider_note = self
-            .codex_active_provider
-            .clone()
-            .map(|provider| {
-                format!("｜{}{provider}", language.choose("当前进程：", "current process: "))
-            })
-            .unwrap_or_default();
         let codex_dirty = self.runtime_dirty(RuntimeAdapter::CodexAppServer, cx);
         let codex_binding = self.codex_provider.read(cx).value().trim().to_owned();
         let codex_binding_display = if codex_binding.is_empty() {
@@ -1353,8 +1286,8 @@ impl ControlPlaneView {
                             .child(
                                 div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(
                                     language.choose(
-                                        "本地 stdio JSON-RPC 端点；由 CircuitFabric 以子进程方式启动与停止。",
-                                        "Local stdio JSON-RPC endpoint; started and stopped as a CircuitFabric child process.",
+                                        "本地 stdio JSON-RPC 端点。任务、数据手册提取与 EDA 会话均按已保存配置即时拉起一次性进程，无常驻服务。",
+                                        "Local stdio JSON-RPC endpoint. Tasks, datasheet extraction, and EDA sessions each spawn a one-off process from the saved configuration; nothing stays resident.",
                                     ),
                                 ),
                             ),
@@ -1368,75 +1301,78 @@ impl ControlPlaneView {
                             .py_1()
                             .rounded_sm()
                             .bg(rgb(SURFACE_BG))
-                            .child(status_dot(status.dot()))
+                            .child(status_dot(self.codex_check_dot()))
                             .child(
                                 div()
                                     .text_xs()
                                     .font_weight(FontWeight::MEDIUM)
-                                    .child(status.label(language)),
+                                    .child(self.codex_check_label(language)),
                             ),
                     ),
             )
             .child(
                 Self::adapter_section_card(
                     "1",
-                    language.choose("运行 · 启动与停止", "Run · start and stop"),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .gap_2()
-                        .child(
-                            action_button("start-codex-runtime")
-                                .primary()
-                                .disabled(is_running || is_starting || self.current_project_context().is_none())
-                                .label(language.choose("启动", "Start"))
-                                .on_click(move |_, window, cx| {
-                                    starter.update(cx, |view, cx| {
-                                        view.start_codex_runtime(window, cx);
-                                    });
-                                }),
-                        )
-                        .child(
-                            action_button("stop-codex-runtime")
-                                .disabled(!is_running && !is_starting && self.task_cancel.is_none())
-                                .label(language.choose("停止", "Stop"))
-                                .on_click(move |_, _, cx| {
-                                    stopper.update(
-                                        cx,
-                                        ControlPlaneView::stop_codex_runtime,
-                                    );
-                                }),
-                        ),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(TEXT_SECONDARY))
-                        .child(format!(
-                            "{}{}{active_provider_note}",
-                            language.choose(
-                                "下次启动 Provider：",
-                                "Next launch provider: "
-                            ),
-                            launch_provider_summary,
-                        )),
+                    language.choose(
+                        "连接检查 · 验证已保存配置",
+                        "Connection check · verify saved configuration",
+                    ),
                 )
                 .child(
                     div().text_xs().text_color(rgb(TEXT_MUTED)).child(
                         language.choose(
-                            "启动使用当前项目根目录；请先在「项目」页打开项目。切换项目时清理旧进程，在新项目重新启动。退出应用时清理子进程。",
-                            "Start uses the current project root; open a project first. Switching projects cleans up the old process; start again for the new project. Child processes are cleaned up on app exit.",
+                            "检查会用已保存的 Codex 命令与 Provider 临时启动一次 App Server，完成 JSON-RPC 初始化握手后立即结束进程，不驻留。任务、提取与 EDA 会话不依赖此检查，各自即时拉起一次性进程。",
+                            "The check launches the App Server once with the saved Codex command and provider, completes the JSON-RPC initialization handshake, and stops the process immediately. Tasks, extraction, and EDA sessions do not depend on it; each spawns its own one-off process.",
                         ),
                     ),
                 )
-                .child(settings_summary_row(
-                    language.choose("项目根目录（自动）", "Project root (automatic)"),
-                    self.current_project_context().map_or_else(
-                        || language.choose("未选择项目，请先打开项目", "No project selected; open a project first").to_owned(),
-                        |(_, root)| root.display().to_string(),
-                    ),
-                )),
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            action_button("check-codex-runtime")
+                                .primary()
+                                .disabled(check_pending)
+                                .label(if check_pending {
+                                    language.choose("检查中…", "Checking…").to_owned()
+                                } else {
+                                    language.choose("检查连接", "Check connection").to_owned()
+                                })
+                                .on_click(move |_, window, cx| {
+                                    checker.update(cx, |view, cx| {
+                                        view.check_codex_runtime(window, cx);
+                                    });
+                                }),
+                        )
+                        .child(
+                            div().text_xs().text_color(rgb(TEXT_SECONDARY)).child(format!(
+                                "{}{}",
+                                language.choose("任务使用的 Provider：", "Provider used by tasks: "),
+                                launch_provider_summary,
+                            )),
+                        ),
+                )
+                .child(
+                    div().text_sm().whitespace_normal().child(match &last_check {
+                        None => language
+                            .choose("尚未执行连接检查。", "No connection check has been run yet.")
+                            .to_owned(),
+                        Some((elapsed, Ok(report))) => format!(
+                            "{} · {elapsed}{} · {} · {} ms",
+                            language.choose("检查通过", "Check passed"),
+                            language.choose(" 前", " ago"),
+                            report.provider,
+                            report.elapsed.as_millis(),
+                        ),
+                        Some((elapsed, Err(reason))) => format!(
+                            "{} · {elapsed}{} · {reason}",
+                            language.choose("检查未通过", "Check failed"),
+                            language.choose(" 前", " ago"),
+                        ),
+                    }),
+                ),
             )
             .child(
                 Self::adapter_section_card(
@@ -1500,6 +1436,16 @@ impl ControlPlaneView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.run_agent_task_in_session(adapter, None, window, cx);
+    }
+
+    fn run_agent_task_in_session(
+        &mut self,
+        adapter: RuntimeAdapter,
+        resume_id: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         use circuitfabric_codex_runtime::execution::{AgentKind, Cancellation};
         if self.task_cancel.is_some() {
             return;
@@ -1553,18 +1499,36 @@ impl ControlPlaneView {
             adapter.label()
         );
         let session = project_scope.as_ref().and_then(|(storage, _)| {
-            match crate::application::runtime_session::start(
-                storage,
-                &profile_id,
-                adapter.backend_id(),
-            ) {
+            let started = if let Some(id) = &resume_id {
+                storage.load_session(id).map_err(|error| error.to_string()).and_then(|replay| {
+                    if replay.metadata.category != circuitfabric_project::SessionCategory::Runtime
+                        || replay.metadata.backend_id.as_deref() != Some(adapter.backend_id())
+                    {
+                        return Err("此会话不属于当前运行时入口".into());
+                    }
+                    storage.resume_session(id).map_err(|error| error.to_string())?;
+                    Ok(id.clone())
+                })
+            } else {
+                crate::application::runtime_session::start(
+                    storage,
+                    &profile_id,
+                    adapter.backend_id(),
+                )
+            };
+            match started {
                 Ok(session_id) => Some((storage.clone(), session_id)),
                 Err(error) => {
-                    self.status = format!("任务继续执行，但项目会话记录创建失败：{error}");
+                    self.status = format!("未执行：项目会话记录创建失败：{error}");
                     None
                 }
             }
         });
+        if project_scope.is_some() && session.is_none() {
+            self.task_cancel = None;
+            cx.notify();
+            return;
+        }
         self.task_identity = Some((
             project.clone(),
             session.as_ref().map(|(_, id)| id.clone()),
@@ -1579,18 +1543,40 @@ impl ControlPlaneView {
         let secrets = self.vault.as_ref().map(|vault| vault.values().clone());
         let work = cx.background_spawn(async move {
             let mut usage = None;
-            let result = circuitfabric_codex_runtime::execution::run_task_observed(
-                &settings,
-                kind,
-                &grants,
-                &prompt,
-                image.as_deref(),
-                project_root.as_deref(),
-                secrets.as_ref(),
-                &cancel,
-                &mut |_, _| {},
-                &mut |reported| usage = Some(reported),
-            );
+            let result = if kind == AgentKind::Codex
+                && let Some((storage, session_id)) = &session
+            {
+                match storage.session_runtime_directory(session_id) {
+                    Ok(history) => circuitfabric_codex_runtime::execution::run_session_observed(
+                        &settings,
+                        &grants,
+                        &prompt,
+                        image.as_deref(),
+                        storage.root(),
+                        &history,
+                        secrets.as_ref(),
+                        &cancel,
+                        &mut |_, _| {},
+                        &mut |reported| usage = Some(reported),
+                    ),
+                    Err(error) => Err(circuitfabric_codex_runtime::RuntimeError::InvalidSettings(
+                        error.to_string(),
+                    )),
+                }
+            } else {
+                circuitfabric_codex_runtime::execution::run_task_observed(
+                    &settings,
+                    kind,
+                    &grants,
+                    &prompt,
+                    image.as_deref(),
+                    project_root.as_deref(),
+                    secrets.as_ref(),
+                    &cancel,
+                    &mut |_, _| {},
+                    &mut |reported| usage = Some(reported),
+                )
+            };
             let persistence_error = session.as_ref().and_then(|(storage, session_id)| {
                 let error_text = result.as_ref().err().map(ToString::to_string);
                 let outcome =
@@ -1643,6 +1629,18 @@ impl ControlPlaneView {
     ) -> impl IntoElement {
         let runner = cx.entity().clone();
         let stopper = runner.clone();
+        let continuer = runner.clone();
+        let resume_id = self
+            .session_replay
+            .as_ref()
+            .filter(|selection| {
+                Some(&selection.project_id) == self.navigation.selected_project.as_ref()
+                    && selection.replay.metadata.category
+                        == circuitfabric_project::SessionCategory::Runtime
+                    && selection.replay.metadata.backend_id.as_deref() == Some(adapter.backend_id())
+                    && adapter == RuntimeAdapter::CodexAppServer
+            })
+            .map(|selection| selection.replay.metadata.session_id.clone());
         let working_directory_note = self
             .navigation
             .selected_project
@@ -1695,6 +1693,31 @@ impl ControlPlaneView {
                             }),
                     ),
             )
+            .when_some(resume_id, |panel, session_id| {
+                panel.child(
+                    action_button("continue-runtime-session")
+                        .label("继续选中的会话")
+                        .disabled(self.task_cancel.is_some())
+                        .on_click(move |_, window, cx| {
+                            continuer.update(cx, |view, cx| {
+                                view.run_agent_task_in_session(
+                                    adapter,
+                                    Some(session_id.clone()),
+                                    window,
+                                    cx,
+                                );
+                            });
+                        }),
+                )
+            })
+            .when_some(self.navigation.selected_project.as_ref(), |panel, project| {
+                panel.child(self.render_feature_session_history(
+                    project,
+                    circuitfabric_project::SessionCategory::Runtime,
+                    None,
+                    &cx.entity(),
+                ))
+            })
             .child(
                 div()
                     .id("runtime-task-result")
@@ -1758,7 +1781,7 @@ impl ControlPlaneView {
             .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(root_note))
             .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(
                 language.choose(
-                    "智能体进程以项目根目录为工作目录；提示词自动附加项目级说明；工具授权取全局与项目 allowlist 的交集，项目不能扩大全局授权。每次运行都会写入项目会话记录，可在“会话”标签回放。",
+                    "智能体进程以项目根目录为工作目录；提示词附加项目说明；工具授权取全局与项目 allowlist 的交集。会话历史在此入口查看，Codex 可选中记录后继续。",
                     "Agent processes run with the project root as their working directory; project instructions are prepended to the prompt; tool grants are the intersection of global and project allowlists, so a project never expands global authorization. Every run is recorded as a project session, replayable in the Sessions tab.",
                 ),
             ))

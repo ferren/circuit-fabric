@@ -78,7 +78,8 @@ impl EdaServiceSelection {
     }
 }
 
-/// Observable state of the supervised Codex App Server process.
+/// Observable state of the supervised bridge process.  Codex no longer keeps a
+/// resident child: its page shows the one-shot [`CodexCheckResult`] instead.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum RuntimeLifecycleStatus {
     Starting,
@@ -156,6 +157,24 @@ impl BridgeHealth {
 pub(super) struct BridgeTestResult {
     pub(super) at: Instant,
     pub(super) outcome: Result<BridgeStatusReport, String>,
+}
+
+/// Outcome of the one-shot Codex connection check. The saved configuration is
+/// launched once, must complete the JSON-RPC initialization handshake, and the
+/// process is stopped immediately — no child stays resident. Tasks, datasheet
+/// extraction, and EDA bridge sessions each spawn their own isolated process
+/// from the same saved settings, so this check is the endpoint's only role.
+pub(super) struct CodexCheckResult {
+    pub(super) at: Instant,
+    pub(super) outcome: Result<CodexCheckReport, String>,
+}
+
+/// What a passing check actually verified, shown next to the result.
+#[derive(Clone)]
+pub(super) struct CodexCheckReport {
+    pub(super) provider: String,
+    pub(super) command: String,
+    pub(super) elapsed: Duration,
 }
 
 pub(super) fn elapsed_label(language: UiLanguage, elapsed: Duration) -> String {
@@ -255,10 +274,11 @@ impl BomExportFormat {
     }
 }
 
-/// The read-only replay currently displayed in the Sessions tab.
+/// The replay selected for the detail modal and optional runtime continuation.
 pub(super) struct SessionReplaySelection {
     pub(super) project_id: ProjectId,
     pub(super) replay: SessionReplay,
+    pub(super) markdown: Entity<gpui_component::text::TextViewState>,
 }
 
 /// Default width of the docked document-preview pane; the window grows by this much when
@@ -335,17 +355,7 @@ pub(super) enum PdfIndexState {
     Failed,
 }
 
-/// Completed steps of an interrupted datasheet extraction. "Continue" reuses them while
-/// the document content is unchanged: completed category replies and Jev batches are reused.
-#[derive(Clone, Debug, Default)]
-pub(super) struct DatasheetCheckpoint {
-    pub(super) content_hash: String,
-    pub(super) model_steps: Vec<(String, String)>,
-    /// `(arguments, result)` per finished Jev batch, in call order.
-    pub(super) jev_results: Vec<(serde_json::Value, serde_json::Value)>,
-    /// Cached judgments belong to the backend/model configuration that produced them.
-    pub(super) judge_definition: Option<circuitfabric_codex_runtime::tools::McpServerDefinition>,
-}
+pub(super) use crate::application::datasheet_checkpoint::DatasheetCheckpoint;
 
 /// The document currently shown in the right-hand preview pane.
 #[derive(Clone)]
@@ -417,7 +427,9 @@ pub(super) struct ControlPlaneView {
     pub(super) project_storages: BTreeMap<ProjectId, ProjectStorage>,
     pub(super) project_data: BTreeMap<ProjectId, ProjectWorkspaceData>,
     pub(super) session_replay: Option<SessionReplaySelection>,
+    pub(super) session_modal_open: bool,
     pub(super) session_project_filter: Option<ProjectId>,
+    pub(super) session_category_filter: circuitfabric_project::SessionCategory,
     // Docked document preview: the selection and, when the pane widened the window on
     // open, the size to restore when it closes. `document_preview_width` follows the
     // divider drag.
@@ -432,6 +444,9 @@ pub(super) struct ControlPlaneView {
     // keyed by the document it belongs to.
     pub(super) datasheet_stream:
         Option<(ProjectId, String, std::sync::Arc<std::sync::Mutex<String>>)>,
+    pub(super) datasheet_stream_scroll: gpui::ScrollHandle,
+    pub(super) datasheet_stream_modal_scroll: gpui::ScrollHandle,
+    pub(super) datasheet_stream_modal_open: bool,
     pub(super) datasheet_extract_started: Option<Instant>,
     pub(super) datasheet_cancel: Option<circuitfabric_codex_runtime::execution::Cancellation>,
     pub(super) datasheet_checkpoint: Option<(ProjectId, String, DatasheetCheckpoint)>,
@@ -496,10 +511,8 @@ pub(super) struct ControlPlaneView {
     pub(super) adapter_settings_open: Option<RuntimeAdapter>,
     pub(super) provider_editor_open: bool,
     pub(super) dialog_error: Option<String>,
-    pub(super) codex_process: Option<CodexAppServerHandle>,
-    pub(super) codex_status: RuntimeLifecycleStatus,
-    pub(super) codex_active_provider: Option<String>,
-    pub(super) codex_project_context: Option<(ProjectId, PathBuf)>,
+    pub(super) codex_check_pending: bool,
+    pub(super) codex_check: Option<CodexCheckResult>,
     pub(super) bridge_process: Option<BridgeProcessHandle>,
     pub(super) bridge_status: RuntimeLifecycleStatus,
     pub(super) bridge_active_address: Option<String>,
@@ -583,5 +596,53 @@ impl Drop for ControlPlaneView {
             cancel.cancel();
         }
         // Dropping `vault` zeroizes the derived key and all decrypted values.
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::DatasheetCheckpoint;
+    use serde_json::json;
+
+    #[test]
+    fn legacy_null_parameter_output_is_feedback_instead_of_a_reusable_step() {
+        let invalid = json!({"electricalCharacteristics":[{"parameter":null,"evidence":"IDD Supply current"}]}).to_string();
+        let mut checkpoint = DatasheetCheckpoint::default();
+        checkpoint.model_steps.push(("PDF source".into(), invalid.clone()));
+        assert!(
+            checkpoint.cached_model_reply(0, "electricalCharacteristics", "PDF source").is_none()
+        );
+        assert!(checkpoint.model_steps.is_empty());
+        let feedback = &checkpoint.model_feedback["electricalCharacteristics"];
+        assert_eq!(feedback.response, invalid);
+        assert!(feedback.error.contains("parameter"));
+    }
+
+    #[test]
+    fn resume_keeps_completed_batches_and_retries_incomplete_legacy_results() {
+        let arguments = json!({"items":{"0":{}}});
+        let good = json!({"content":[{"text":json!({"results":{"0":{"answers":{
+            "category":{"choice":"pin","confidence":0.9},"faithful":{"noul":0.96}
+        }}},"errors":{}}).to_string()}]});
+        let failed = json!({"content":[{"text":json!({
+            "results":{},"errors":{"0":"HTTP 429"}
+        }).to_string()}]});
+        let mut checkpoint = DatasheetCheckpoint::default();
+        checkpoint.cache_jev_result(0, &arguments, &good).unwrap();
+        assert!(checkpoint.cache_jev_result(1, &arguments, &failed).is_err());
+        assert_eq!(checkpoint.jev_results.len(), 1);
+        // Older code stored partial MCP successes along with subsequent batches.
+        checkpoint.jev_results.push((arguments.clone(), failed));
+        checkpoint.jev_results.push((arguments.clone(), good.clone()));
+        assert_eq!(checkpoint.cached_jev_result(0, &arguments), Some(good.clone()));
+        assert!(checkpoint.cached_jev_result(1, &arguments).is_none());
+        assert_eq!(checkpoint.jev_results.len(), 1);
+        // The retried batch can now complete and be reused on another continuation.
+        checkpoint.cache_jev_result(1, &arguments, &good).unwrap();
+        assert_eq!(checkpoint.cached_jev_result(1, &arguments), Some(good));
+        assert!(
+            checkpoint.cached_jev_result(1, &json!({"items":{"0":{"changed":true}}})).is_none()
+        );
+        assert_eq!(checkpoint.jev_results.len(), 1);
     }
 }

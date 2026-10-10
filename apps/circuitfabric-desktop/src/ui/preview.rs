@@ -497,6 +497,16 @@ impl ControlPlaneView {
             items.push((None, self.render_preview_focus_banner(focus, preview, &entity)));
         }
         if show_data {
+            items.push((
+                None,
+                self.render_feature_session_history(
+                    &preview.project_id,
+                    circuitfabric_project::SessionCategory::Datasheet,
+                    Some(&preview.document_id),
+                    &entity,
+                )
+                .into_any_element(),
+            ));
             let stream_log = self
                 .datasheet_stream
                 .as_ref()
@@ -513,10 +523,17 @@ impl ControlPlaneView {
                     self.datasheet_rows_visible,
                     self.datasheet_extracting,
                     self.datasheet_feedback.as_deref(),
-                    stream_log,
-                    self.datasheet_extract_started
-                        .filter(|_| self.datasheet_extracting)
-                        .map(|started| started.elapsed().as_secs()),
+                    stream_log.map(|log| {
+                        Self::render_datasheet_stream(
+                            &log,
+                            self.datasheet_extract_started
+                                .filter(|_| self.datasheet_extracting)
+                                .map(|started| started.elapsed().as_secs()),
+                            language,
+                            &self.datasheet_stream_scroll,
+                            &entity,
+                        )
+                    }),
                     self.datasheet_checkpoint.as_ref().is_some_and(
                         |(project_id, document_id, _)| {
                             *project_id == preview.project_id && *document_id == preview.document_id
@@ -1168,8 +1185,7 @@ impl ControlPlaneView {
         visible_rows: usize,
         extracting: bool,
         feedback: Option<&str>,
-        stream_log: Option<String>,
-        elapsed_seconds: Option<u64>,
+        stream_window: Option<Div>,
         can_resume: bool,
         focus: Option<&FragmentAnchor>,
         row_anchor: Option<&gpui::ScrollAnchor>,
@@ -1234,8 +1250,6 @@ impl ControlPlaneView {
 
         let feedback_note =
             feedback.map(|message| Self::render_preview_truncation_note(message.to_owned()));
-        let stream_window =
-            stream_log.map(|log| Self::render_datasheet_stream(&log, elapsed_seconds, language));
         let Some(extraction) = &preview.extraction else {
             return div().v_flex().gap_3().p_3().children(feedback_note).children(stream_window).child(
                 div()
@@ -2211,51 +2225,5 @@ impl ControlPlaneView {
             .text_xs()
             .text_color(rgb(0x00b4_5309))
             .child(message)
-    }
-
-    /// The live extraction log: stage lines plus the model reply as it streams. Only the
-    /// tail is rendered, bottom-aligned, so the newest output stays in view.
-    pub(super) fn render_datasheet_stream(
-        log: &str,
-        elapsed_seconds: Option<u64>,
-        language: UiLanguage,
-    ) -> Div {
-        const TAIL_CHARS: usize = 2000;
-        let skip = log.chars().count().saturating_sub(TAIL_CHARS);
-        let tail: String = log.chars().skip(skip).collect();
-        div()
-            .v_flex()
-            .gap_1()
-            .p_2()
-            .rounded_md()
-            .border_1()
-            .border_color(rgb(BORDER))
-            .bg(rgb(SURFACE_BG))
-            .child(
-                div()
-                    .text_xs()
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(rgb(TEXT_SECONDARY))
-                    .child(match elapsed_seconds {
-                        Some(seconds) => language.choose_owned(
-                            format!("模型输出（进行中… {seconds}s）"),
-                            format!("Model output (running… {seconds}s)"),
-                        ),
-                        None => language
-                            .choose("模型输出（已结束）", "Model output (finished)")
-                            .to_owned(),
-                    }),
-            )
-            .child(
-                div()
-                    .v_flex()
-                    .justify_end()
-                    .h(px(180.))
-                    .overflow_hidden()
-                    .text_xs()
-                    .text_color(rgb(TEXT_MUTED))
-                    .whitespace_normal()
-                    .child(tail),
-            )
     }
 }

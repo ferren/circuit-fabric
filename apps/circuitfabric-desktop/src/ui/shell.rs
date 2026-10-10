@@ -4,7 +4,6 @@ use super::*;
 impl Render for ControlPlaneView {
     #[allow(clippy::too_many_lines)]
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.refresh_codex_lifecycle();
         self.refresh_bridge_lifecycle();
         self.sync_window_title(window);
         let command_palette = if self.command_palette_open {
@@ -44,6 +43,11 @@ impl Render for ControlPlaneView {
         } else {
             None
         };
+        let session_modal = (self.session_modal_open && self.session_replay.is_some())
+            .then(|| self.render_session_modal(cx).into_any_element());
+        let datasheet_stream_modal = (self.datasheet_stream_modal_open
+            && self.datasheet_stream.is_some())
+        .then(|| self.render_datasheet_stream_modal(cx).into_any_element());
         let entity = cx.entity().clone();
         let active_screen = self.navigation.screen;
         let language = self.language;
@@ -255,26 +259,13 @@ impl Render for ControlPlaneView {
                                     .flex()
                                     .items_center()
                                     .gap_2()
-                                    .child(status_dot(self.codex_status.dot()))
-                                    .child(div().text_xs().text_color(rgb(SIDEBAR_TEXT)).child(
-                                        match &self.codex_status {
-                                            RuntimeLifecycleStatus::Starting => {
-                                                language.choose("Codex 启动中…", "Codex starting…")
-                                            }
-                                            RuntimeLifecycleStatus::Running { .. } => {
-                                                language.choose("Codex 运行中", "Codex running")
-                                            }
-                                            RuntimeLifecycleStatus::Stopped => {
-                                                language.choose("运行时离线", "Runtime offline")
-                                            }
-                                            RuntimeLifecycleStatus::Failed { .. } => {
-                                                language.choose(
-                                                    "Codex 启动失败",
-                                                    "Codex failed to start",
-                                                )
-                                            }
-                                        },
-                                    )),
+                                    .child(status_dot(self.codex_check_dot()))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(SIDEBAR_TEXT))
+                                            .child(self.codex_check_label(language)),
+                                    ),
                             )
                             .child(div().text_xs().text_color(rgb(SIDEBAR_GROUP)).child(
                                 language.choose("v0.1 · 本地控制面", "v0.1 · local control plane"),
@@ -473,7 +464,9 @@ impl Render for ControlPlaneView {
                     .when_some(vault_quick_unlock, ParentElement::child)
                     .when_some(jev_backend_modal, ParentElement::child)
                     .when_some(jev_key_modal, ParentElement::child)
-                    .when_some(catalog_modal, ParentElement::child),
+                    .when_some(catalog_modal, ParentElement::child)
+                    .when_some(session_modal, ParentElement::child)
+                    .when_some(datasheet_stream_modal, ParentElement::child),
             )
     }
 }

@@ -251,7 +251,7 @@ impl AuditRecord {
             },
         }];
         for (line_index, raw) in replay.body.lines().enumerate() {
-            let line = raw.trim();
+            let line = raw.trim_end();
             // Only storage-generated event headers are audit events. A list in a message
             // or the word "approval" inside an agent answer cannot create an approval event.
             let Some((timestamp, header)) = session_event_header(line) else {
@@ -333,6 +333,10 @@ impl AuditRecord {
 }
 
 fn session_event_header(line: &str) -> Option<(u64, &str)> {
+    // Multiline model output is nested under its event, never an audit header.
+    if line.starts_with(char::is_whitespace) {
+        return None;
+    }
     let (value, rest) = line.trim().strip_prefix("- **")?.split_once("** · ")?;
     let (header, _) = rest.split_once(" · ")?;
     Some((parse_rfc3339(value)?, header.trim()))
@@ -733,6 +737,15 @@ mod tests {
         assert_eq!(AuditRecord::from_session(&zero).len(), 3);
         assert!(session_event_header("- **1970-01-01X00:00:00Z** · 审批 · yes").is_none());
         assert!(parse_rfc3339("2026-02-30T00:00:00Z").is_none());
+        let multiline = replay(
+            "- **1970-01-01T00:00:00Z** · 智能体 · 消息\n\n    ## 审批示例\n    - **1970-01-01T00:00:00Z** · 审批 · approved\n    - **1970-01-01T00:00:00Z** · 用量 · 输入 0 tokens · 输出 0 tokens\n",
+        );
+        assert!(
+            AuditRecord::from_session(&multiline)
+                .iter()
+                .all(|record| record.kind == AuditKind::Session)
+        );
+        assert!(!UsageRecord::from_session(&multiline, "s.md").usage_reported);
     }
 
     #[test]

@@ -11,6 +11,7 @@ mod authorization;
 mod bootstrap;
 mod changes;
 mod commands;
+mod datasheet_stream;
 mod documents;
 mod evidence;
 mod export;
@@ -27,6 +28,7 @@ mod runtime;
 mod secrets;
 mod selectable_text;
 mod semantics;
+mod session_markdown;
 mod sessions;
 mod settings;
 mod shell;
@@ -55,7 +57,9 @@ use circuitfabric_codex_runtime::{
 use circuitfabric_contracts::{
     DatasheetExtraction, DocumentKind, FactStatus, Project, SnapshotAuthority,
 };
-use circuitfabric_document_opener::{DocumentOpenerRegistry, extract_datasheet_by_category};
+use circuitfabric_document_opener::{
+    DocumentOpenerRegistry, extract_datasheet_by_category_with_pages,
+};
 use circuitfabric_plugin_api::{
     DocumentBlockKind, DocumentOpenDenial, DocumentSpanStyle, DocumentView, DocumentViewBody,
 };

@@ -17,6 +17,7 @@ native-ui = [
   "dep:rfd",
   "dep:circuitfabric-document-opener",
   "dep:circuitfabric-plugin-api",
+  "dep:pulldown-cmark",
 ]
 
 [dependencies]
@@ -26,6 +27,7 @@ circuitfabric-document-opener = { workspace = true, optional = true, features = 
   "raster-pdf",
 ] }
 circuitfabric-plugin-api = { workspace = true, optional = true }
+pulldown-cmark = { workspace = true, optional = true }
 circuitfabric-project.workspace = true
 image = "0.25"
 jlcircuit-eda-bridge.workspace = true

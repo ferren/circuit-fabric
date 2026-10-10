@@ -59,6 +59,345 @@ fn mount_profile<'a>(
 }
 
 #[gpui::test]
+fn datasheet_stream_follows_only_at_bottom_and_expands_live(cx: &mut TestAppContext) {
+    let profile = Profile::new();
+    let (view, cx) = mount_profile(cx, &profile, ControlPlaneScreen::Documents);
+    cx.simulate_resize(gpui::size(px(1400.), px(900.)));
+    let buffer = std::sync::Arc::new(std::sync::Mutex::new(
+        "FIRST OUTPUT\n思考内容与输出记录\n".repeat(200),
+    ));
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.document_preview = Some(super::DocumentPreviewSelection {
+                project_id: "p".into(),
+                document_id: "doc-a".into(),
+                file_name: "current.pdf".into(),
+                state: super::DocumentPreviewState::Unavailable { reason: "fixture".into() },
+                extraction: None,
+            });
+            view.preview_show_data = true;
+            view.datasheet_stream = Some(("p".into(), "doc-a".into(), buffer.clone()));
+            view.datasheet_extracting = true;
+            view.datasheet_extract_started = Some(std::time::Instant::now());
+            cx.notify();
+        });
+    });
+    draw(cx);
+    let inline = view.read_with(cx, |view, _| view.datasheet_stream_scroll.clone());
+    assert!(inline.max_offset().y > px(2000.), "full history must exceed the old 2000-char tail");
+    assert_eq!(inline.offset().y, -inline.max_offset().y);
+    let initial_extent = inline.max_offset().y;
+    buffer.lock().unwrap().push_str(&"新增输出\n".repeat(30));
+    cx.update(|_, cx| view.update(cx, |_, cx| cx.notify()));
+    draw(cx);
+    assert!(inline.max_offset().y > initial_extent);
+    assert_eq!(inline.offset().y, -inline.max_offset().y, "new output follows at the bottom");
+
+    let body = cx.debug_bounds("datasheet-stream-body").unwrap();
+    cx.simulate_event(ScrollWheelEvent {
+        position: body.center(),
+        delta: ScrollDelta::Pixels(point(px(0.), px(90.))),
+        ..Default::default()
+    });
+    draw(cx);
+    let reading_offset = inline.offset();
+    assert!(reading_offset.y > -inline.max_offset().y, "wheel can scroll up into the history");
+    buffer.lock().unwrap().push_str(&"阅读期间的实时输出\n".repeat(20));
+    cx.update(|_, cx| view.update(cx, |_, cx| cx.notify()));
+    draw(cx);
+    assert_eq!(inline.offset(), reading_offset, "streaming must preserve the reader's position");
+    inline.set_offset(point(px(0.), px(0.)));
+    cx.update(|_, cx| view.update(cx, |_, cx| cx.notify()));
+    draw(cx);
+    assert_eq!(inline.offset().y, px(0.), "the beginning of the log remains accessible");
+    inline.scroll_to_bottom();
+    draw(cx);
+    buffer.lock().unwrap().push_str(&"恢复跟随\n".repeat(20));
+    cx.update(|_, cx| view.update(cx, |_, cx| cx.notify()));
+    draw(cx);
+    assert_eq!(inline.offset().y, -inline.max_offset().y, "returning to bottom resumes following");
+
+    let expand = cx.debug_bounds("expand-datasheet-stream").unwrap();
+    cx.simulate_click(expand.center(), Default::default());
+    draw(cx);
+    let modal = cx.debug_bounds("datasheet-stream-modal").expect("expand opens the dialog");
+    assert!(modal.size.width > body.size.width);
+    let expanded = view.read_with(cx, |view, _| view.datasheet_stream_modal_scroll.clone());
+    assert_eq!(expanded.offset().y, -expanded.max_offset().y);
+    let modal_extent = expanded.max_offset().y;
+    let inline_offset = inline.offset();
+    buffer.lock().unwrap().push_str(&"弹窗实时更新\n".repeat(40));
+    cx.update(|_, cx| view.update(cx, |_, cx| cx.notify()));
+    draw(cx);
+    assert!(expanded.max_offset().y > modal_extent, "open dialog reads live output");
+    assert_eq!(expanded.offset().y, -expanded.max_offset().y);
+    assert!(inline.offset().y < inline_offset.y, "inline and dialog both receive new output");
+
+    let modal_body = cx.debug_bounds("datasheet-stream-modal-body").unwrap();
+    cx.simulate_event(ScrollWheelEvent {
+        position: modal_body.center(),
+        delta: ScrollDelta::Pixels(point(px(0.), px(90.))),
+        ..Default::default()
+    });
+    draw(cx);
+    let expanded_reading_offset = expanded.offset();
+    let inline_offset = inline.offset();
+    assert!(expanded_reading_offset.y > -expanded.max_offset().y);
+    buffer.lock().unwrap().push_str(&"最终输出\n".repeat(30));
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.datasheet_extracting = false;
+            cx.notify();
+        })
+    });
+    draw(cx);
+    assert_eq!(expanded.offset(), expanded_reading_offset, "dialog scrolling is independent");
+    assert!(inline.offset().y < inline_offset.y, "completion includes the last output");
+
+    cx.simulate_resize(gpui::size(px(780.), px(540.)));
+    draw(cx);
+    let modal = cx.debug_bounds("datasheet-stream-modal").unwrap();
+    assert!(modal.right() <= px(780.) && modal.bottom() <= px(540.));
+    assert!(cx.debug_bounds("datasheet-stream-modal-body").unwrap().size.height > px(100.));
+    let close = cx.debug_bounds("close-datasheet-stream").unwrap();
+    cx.simulate_click(close.center(), Default::default());
+    draw(cx);
+    assert!(cx.debug_bounds("datasheet-stream-modal").is_none());
+    assert_eq!(view.read_with(cx, |view, _| view.datasheet_extracting), false);
+    assert!(cx.debug_bounds("datasheet-stream-body").is_some());
+}
+
+#[gpui::test]
+fn session_entry_renders_only_selected_category_and_opens_the_original_category(
+    cx: &mut TestAppContext,
+) {
+    use circuitfabric_project::{ProjectStorage, SessionCategory, SessionSeed};
+    let profile = Profile::new();
+    let root = profile.0.join("project");
+    std::fs::create_dir_all(&root).unwrap();
+    let store = ProjectStorage::create(
+        &root,
+        circuitfabric_contracts::Project {
+            id: "p".into(),
+            name: "分类会话".into(),
+            description: None,
+        },
+    )
+    .unwrap();
+    let rows = [
+        ("eda", SessionCategory::Eda),
+        ("datasheet", SessionCategory::Datasheet),
+        ("runtime", SessionCategory::Runtime),
+        ("legacy", SessionCategory::Legacy),
+    ];
+    for (id, category) in rows {
+        store
+            .start_categorized_session(
+                SessionSeed {
+                    session_id: id.into(),
+                    runtime_profile_id: "provider".into(),
+                    backend_id: Some("codex".into()),
+                },
+                category,
+                None,
+            )
+            .unwrap();
+    }
+    let (view, cx) = mount_profile(cx, &profile, ControlPlaneScreen::SessionsAndTasks);
+    cx.simulate_resize(gpui::size(px(1400.), px(1200.)));
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            crate::application::project_data::attach_project_storage(
+                &mut view.workspace,
+                &mut view.project_storages,
+                &mut view.project_data,
+                store,
+            )
+            .unwrap();
+            view.navigation.selected_project = Some("p".into());
+            cx.notify();
+        })
+    });
+    for (selected_id, category) in rows {
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.session_category_filter = category;
+                cx.notify();
+            })
+        });
+        draw(cx);
+        for (id, _) in rows {
+            let selector = match id {
+                "eda" => "session-row-eda",
+                "datasheet" => "session-row-datasheet",
+                "runtime" => "session-row-runtime",
+                "legacy" => "session-row-legacy",
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                cx.debug_bounds(selector).is_some(),
+                id == selected_id,
+                "entry must render only the current category: {selected_id} / {id}"
+            );
+        }
+    }
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| view.open_session_replay("p".into(), "runtime".into(), cx))
+    });
+    assert_eq!(view.update(cx, |view, _| view.session_category_filter), SessionCategory::Runtime);
+    draw(cx);
+    assert!(cx.debug_bounds("session-replay-body").is_some());
+    cx.update(|_, cx| view.update(cx, ControlPlaneView::close_session_replay));
+    draw(cx);
+    assert!(cx.debug_bounds("session-detail-modal").is_none());
+    assert_eq!(
+        view.read_with(cx, |view, _| view
+            .session_replay
+            .as_ref()
+            .unwrap()
+            .replay
+            .metadata
+            .session_id
+            .clone()),
+        "runtime",
+        "closing details must keep the record selected for continuation"
+    );
+}
+
+#[gpui::test]
+fn document_session_history_opens_formatted_scrollable_modal_without_changing_document(
+    cx: &mut TestAppContext,
+) {
+    use circuitfabric_project::{
+        ProjectStorage, SessionActor, SessionCategory, SessionEvent, SessionEventKind, SessionSeed,
+    };
+    let profile = Profile::new();
+    let root = profile.0.join("project");
+    std::fs::create_dir_all(&root).unwrap();
+    let store = ProjectStorage::create(
+        &root,
+        circuitfabric_contracts::Project {
+            id: "p".into(),
+            name: "文档会话".into(),
+            description: None,
+        },
+    )
+    .unwrap();
+    for (id, category, document) in [
+        ("current", SessionCategory::Datasheet, Some("doc-a")),
+        ("other-document", SessionCategory::Datasheet, Some("doc-b")),
+        ("runtime", SessionCategory::Runtime, None),
+    ] {
+        store
+            .start_categorized_session(
+                SessionSeed {
+                    session_id: id.into(),
+                    runtime_profile_id: "provider".into(),
+                    backend_id: Some("codex".into()),
+                },
+                category,
+                document.map(str::to_owned),
+            )
+            .unwrap();
+    }
+    let message = format!(
+        "# Extraction result\n\n**Readable** and *formatted* with `inline code`.\n\n- First item\n\n> Evidence\n\n```json\n{{\"pins\": []}}\n```\n\n| Name | Value |\n| --- | --- |\n| Voltage | 3.3 V |\n\n{}\n\nFINAL MARKER",
+        "## Step\n\nDetails\n\n".repeat(140)
+    );
+    store
+        .append_session_event(
+            "current",
+            &SessionEvent {
+                timestamp_unix_seconds: 100,
+                kind: SessionEventKind::Turn { actor: SessionActor::Agent, message },
+            },
+        )
+        .unwrap();
+    let (view, cx) = mount_profile(cx, &profile, ControlPlaneScreen::Documents);
+    cx.simulate_resize(gpui::size(px(1400.), px(900.)));
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            crate::application::project_data::attach_project_storage(
+                &mut view.workspace,
+                &mut view.project_storages,
+                &mut view.project_data,
+                store,
+            )
+            .unwrap();
+            view.navigation.selected_project = Some("p".into());
+            view.document_preview = Some(super::DocumentPreviewSelection {
+                project_id: "p".into(),
+                document_id: "doc-a".into(),
+                file_name: "current.pdf".into(),
+                state: super::DocumentPreviewState::Unavailable { reason: "fixture".into() },
+                extraction: None,
+            });
+            view.preview_show_data = true;
+            cx.notify();
+        });
+    });
+    draw(cx);
+    let row = cx.debug_bounds("session-row-current").expect("document session list row");
+    assert!(cx.debug_bounds("session-row-other-document").is_none());
+    assert!(cx.debug_bounds("session-row-runtime").is_none());
+    assert!(row.size.height > px(40.), "history rows need a visible click target: {row:?}");
+    let preview_offset = view.read_with(cx, |view, _| view.preview_scroll.offset());
+    cx.simulate_click(row.center(), Default::default());
+    draw(cx);
+    let modal = cx.debug_bounds("session-detail-modal").expect("click opens window-level modal");
+    assert!(
+        modal.size.width > px(800.),
+        "modal must provide more reading width than the document pane"
+    );
+    let body = cx.debug_bounds("session-replay-body").unwrap();
+    let header = cx.debug_bounds("session-modal-header").unwrap();
+    let markdown =
+        view.read_with(cx, |view, _| view.session_replay.as_ref().unwrap().markdown.clone());
+    let before = cx.update(|_, cx| markdown.read(cx).list_state().logical_scroll_top());
+    scroll(cx, body.center().x.as_f32(), body.center().y.as_f32());
+    let after = cx.update(|_, cx| markdown.read(cx).list_state().logical_scroll_top());
+    assert!(
+        after.item_ix > before.item_ix || after.offset_in_item > before.offset_in_item,
+        "wheel must scroll the modal's rich text"
+    );
+    assert_eq!(cx.debug_bounds("session-modal-header").unwrap(), header);
+    assert_eq!(view.read_with(cx, |view, _| view.preview_scroll.offset()), preview_offset);
+    assert_eq!(
+        view.read_with(cx, |view, _| view.document_preview.as_ref().unwrap().document_id.clone()),
+        "doc-a"
+    );
+    cx.update(|_, cx| {
+        markdown.update(cx, |state, cx| {
+            state.select_all(cx);
+            let text = state.selected_text();
+            assert!(text.contains("Extraction result"));
+            assert!(text.contains("Readable and formatted with inline code"));
+            assert!(text.contains("Voltage") && text.contains("3.3 V"));
+            assert!(
+                text.contains("FINAL MARKER"),
+                "long histories must not be capped at 120 blocks"
+            );
+            assert!(!text.contains("**Readable**") && !text.contains("```json"));
+            assert!(state.list_state().max_offset_for_scrollbar().y > px(0.));
+        });
+    });
+    cx.simulate_resize(gpui::size(px(780.), px(540.)));
+    draw(cx);
+    let modal = cx.debug_bounds("session-detail-modal").unwrap();
+    let close = cx.debug_bounds("action-button-close-session-replay").unwrap();
+    assert!(modal.right() <= px(780.) && modal.bottom() <= px(540.));
+    assert!(cx.debug_bounds("session-replay-body").unwrap().size.height > px(100.));
+    assert!(close.bottom() < modal.bottom());
+    cx.simulate_click(close.center(), Default::default());
+    draw(cx);
+    assert!(cx.debug_bounds("session-detail-modal").is_none());
+    assert!(
+        cx.debug_bounds("session-row-current").is_some(),
+        "closing keeps the original history visible"
+    );
+}
+
+#[gpui::test]
 fn real_vault_page_allocates_height_to_its_panels(cx: &mut TestAppContext) {
     let profile = Profile::new();
     let (view, cx) = mount_profile(cx, &profile, ControlPlaneScreen::SecretsVault);
@@ -139,6 +478,134 @@ fn real_runtime_settings_dialogs_show_their_form_body(cx: &mut TestAppContext) {
         field.size.height > px(30.) && field.top() >= card.top() && field.bottom() <= card.bottom(),
         "provider field must be visible inside the dialog: {field:?}"
     );
+}
+
+#[gpui::test]
+fn provider_quick_actions_persist_the_change_a_restart_would_read_back(cx: &mut TestAppContext) {
+    use circuitfabric_codex_runtime::{LlmProviderSettings, RuntimeSettings};
+    let profile = Profile::new();
+    let settings_path = profile.0.join("runtime.json");
+    {
+        // The reported state: a newly added provider ended up as the default.
+        let mut settings = RuntimeSettings::default();
+        let mut added = LlmProviderSettings::default();
+        added.id = "added".into();
+        settings.providers.push(added);
+        settings.default_provider_id = "added".into();
+        settings.save(&settings_path).unwrap();
+    }
+    let (view, cx) = mount_profile(cx, &profile, ControlPlaneScreen::AgentsAndMcp);
+    let persisted = || RuntimeSettings::load_or_default(&settings_path).unwrap();
+    let persisted_flag = |id: &str| {
+        persisted()
+            .providers
+            .iter()
+            .find(|provider| provider.id == id)
+            .unwrap_or_else(|| panic!("provider `{id}` must stay configured"))
+            .enabled
+    };
+
+    // Switching the default back to the previous provider must reach disk without
+    // the "保存 Provider 列表" dialog; bootstrap reads exactly this file on launch.
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            assert_eq!(view.default_provider_id, "added");
+            view.selected_provider = 0;
+            view.set_default_provider(cx);
+            assert_eq!(view.default_provider_id, "zai");
+        })
+    });
+    assert_eq!(persisted().default_provider_id, "zai");
+
+    // Disabling a non-default provider persists the same immediate way.
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.selected_provider = 1;
+            view.toggle_provider(cx);
+        })
+    });
+    assert!(!persisted_flag("added"));
+
+    // Disabling the default provider is invalid; the transaction and the draft roll back.
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.selected_provider = 0;
+            view.toggle_provider(cx);
+            assert!(view.providers[0].enabled, "rejected toggle must roll back the draft");
+        })
+    });
+    assert!(persisted_flag("zai"));
+
+    // Removing a saved provider persists immediately and keeps one provider configured.
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.selected_provider = 1;
+            view.remove_provider(cx);
+            assert_eq!(view.providers.len(), 1);
+        })
+    });
+    assert_eq!(
+        persisted().providers.iter().map(|provider| provider.id.as_str()).collect::<Vec<_>>(),
+        ["zai"]
+    );
+    assert_eq!(persisted().default_provider_id, "zai");
+}
+
+#[gpui::test]
+fn native_vision_grays_vision_fields_while_keeping_their_values(cx: &mut TestAppContext) {
+    use circuitfabric_codex_runtime::RuntimeSettings;
+    let profile = Profile::new();
+    let settings_path = profile.0.join("runtime.json");
+    {
+        // Separate-vision era values: the provider routes images through a
+        // distinct vision model that must survive the native-vision switch.
+        let mut settings = RuntimeSettings::default();
+        settings.providers[0].vision_model = Some("kept-vision-model".into());
+        settings.save(&settings_path).unwrap();
+    }
+    let (view, cx) = mount_profile(cx, &profile, ControlPlaneScreen::AgentsAndMcp);
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.selected_provider = 0;
+            assert!(!view.providers[0].native_vision);
+            assert!(
+                view.providers[0].vision_model.read(cx).is_editable(),
+                "separate-vision fields must be editable when the LLM lacks native vision"
+            );
+            assert_eq!(
+                view.providers[0].vision_model.read(cx).value().to_string(),
+                "kept-vision-model"
+            );
+            // Declaring native vision grays the separate fields in place…
+            view.toggle_vision(cx);
+            assert!(view.providers[0].native_vision);
+            assert!(
+                !view.providers[0].vision_model.read(cx).is_editable(),
+                "native vision must lock the separate vision fields"
+            );
+            // …without losing their stored content, and saving keeps both.
+            assert_eq!(
+                view.providers[0].vision_model.read(cx).value().to_string(),
+                "kept-vision-model"
+            );
+            view.save_providers_checked(cx).expect("provider list saves");
+        })
+    });
+    let persisted = RuntimeSettings::load_or_default(&settings_path).unwrap();
+    assert!(persisted.providers[0].native_vision);
+    assert_eq!(persisted.providers[0].vision_model.as_deref(), Some("kept-vision-model"));
+    // Turning native vision off restores editing with the values intact.
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.toggle_vision(cx);
+            assert!(!view.providers[0].native_vision);
+            assert!(view.providers[0].vision_model.read(cx).is_editable());
+            assert_eq!(
+                view.providers[0].vision_model.read(cx).value().to_string(),
+                "kept-vision-model"
+            );
+        })
+    });
 }
 
 #[gpui::test]
@@ -567,6 +1034,122 @@ fn overview_refresh_recovers_failed_sources_registry_and_removes_projects(cx: &m
     assert!(view.update(cx, |view, _| view.overview_model().resources.is_empty()));
     assert!(view.read_with(cx, |view, _| view.navigation.selected_project.is_none()));
     assert!(root.exists(), "removal from registry does not delete domain files");
+}
+
+struct SessionScrollFixture {
+    markdown: gpui::Entity<gpui_component::text::TextViewState>,
+}
+
+impl Render for SessionScrollFixture {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child(
+            gpui_component::text::TextView::new(&self.markdown)
+                .w_full()
+                .h_full()
+                .p_4()
+                .scrollable(true)
+                .selectable(true),
+        )
+    }
+}
+
+/// Exercise the same list offsets used by scrollbar dragging, with a cold first
+/// layout followed by many positions. Print timing as evidence; the regression
+/// assertion uses block boundaries rather than a machine-dependent frame limit.
+#[gpui::test]
+fn session_scrollbar_uses_independent_message_blocks_and_keeps_its_extent(cx: &mut TestAppContext) {
+    use gpui::AppContext;
+    use gpui_component::text::TextViewState;
+    cx.update(gpui_component::init);
+    let raw = if let Some(path) = std::env::var_os("CF_SESSION_SCROLL_FIXTURE") {
+        let raw = std::fs::read_to_string(path).unwrap();
+        raw.split_once("\n---\n").map_or(raw.clone(), |(_, body)| body.to_owned())
+    } else {
+        let paragraph = "Readable 中文 extraction detail. ".repeat(400);
+        let mut raw = String::from("## 轮次与工具调用\n\n");
+        for turn in 0..8 {
+            raw.push_str(&format!("- **1970-01-01T00:00:0{turn}Z** · 智能体 · {paragraph}\n"));
+        }
+        raw.push_str("- **1970-01-01T00:00:09Z** · 智能体 · 消息\n\n");
+        raw.push_str(&"    ## Step\n\n    **Formatted** details\n\n".repeat(300));
+        raw.push_str("    FINAL MARKER\n");
+        raw
+    };
+    let event_count = raw.lines().filter(|line| line.starts_with("- **")).count();
+    let source = super::session_markdown::presentation_source(&raw);
+    let original = cx.new(|cx| TextViewState::markdown(&raw, cx));
+    let corrected = cx.new(|cx| TextViewState::markdown(&source, cx));
+    let mut fixture = None;
+    let (_, cx) = cx.add_window_view(|window, cx| {
+        let view = cx.new(|_| SessionScrollFixture { markdown: original.clone() });
+        fixture = Some(view.clone());
+        gpui_component::Root::new(view, window, cx).bordered(false)
+    });
+    cx.simulate_resize(gpui::size(px(900.), px(600.)));
+    draw(cx);
+    let baseline_count = cx.update(|_, cx| original.read(cx).list_state().item_count());
+    let before = measure_session_drag(cx, &original);
+    fixture.unwrap().update(cx, |fixture, cx| {
+        fixture.markdown = corrected.clone();
+        cx.notify();
+    });
+    draw(cx);
+    let fixed_count = cx.update(|_, cx| corrected.read(cx).list_state().item_count());
+    assert!(
+        fixed_count > baseline_count,
+        "the audit envelope must not collapse all messages into one list block"
+    );
+    assert!(
+        fixed_count >= event_count * 2,
+        "each audit event needs its own header and body blocks"
+    );
+    let after = measure_session_drag(cx, &corrected);
+    eprintln!(
+        "Session scrollbar layout comparison: chars={}, blocks={}→{}, median_us={}→{}, p95_us={}→{}",
+        raw.len(),
+        baseline_count,
+        fixed_count,
+        before.0,
+        after.0,
+        before.1,
+        after.1
+    );
+    // Full-history copy still works even though blocks outside the viewport are culled.
+    corrected.update(cx, |state, cx| {
+        state.select_all(cx);
+        let text = state.selected_text();
+        assert!(!text.is_empty());
+        if raw.contains("FINAL MARKER") {
+            assert!(text.contains("FINAL MARKER"));
+        }
+    });
+}
+
+fn measure_session_drag(
+    cx: &mut VisualTestContext,
+    markdown: &gpui::Entity<gpui_component::text::TextViewState>,
+) -> (u128, u128) {
+    let list = cx.update(|_, cx| markdown.read(cx).list_state().clone());
+    let extent = list.max_offset_for_scrollbar().y;
+    assert!(extent > px(0.));
+    list.scrollbar_drag_started();
+    let mut times = Vec::new();
+    for index in 0..12 {
+        let started = std::time::Instant::now();
+        let fraction = f32::from((index * 7 % 12) as u8) / 11.;
+        list.set_offset_from_scrollbar(point(px(0.), -extent * fraction));
+        markdown.update(cx, |_, cx| cx.notify());
+        draw(cx);
+        times.push(started.elapsed().as_micros());
+        assert_eq!(
+            list.max_offset_for_scrollbar().y,
+            extent,
+            "scrollbar extent must remain stable during dragging"
+        );
+    }
+    list.scrollbar_drag_ended();
+    times.sort_unstable();
+    (times[times.len() / 2], times[times.len() * 95 / 100])
 }
 
 struct AutoHeightDialog;

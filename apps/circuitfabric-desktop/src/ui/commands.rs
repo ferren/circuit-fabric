@@ -56,6 +56,20 @@ impl ControlPlaneView {
     ) {
         let keystroke = &event.keystroke;
 
+        if self.datasheet_stream_modal_open {
+            if keystroke.key == "escape" {
+                self.close_datasheet_stream_modal(cx);
+            }
+            return;
+        }
+
+        if self.session_modal_open && self.session_replay.is_some() {
+            if keystroke.key == "escape" {
+                self.close_session_replay(cx);
+            }
+            return;
+        }
+
         if keystroke.modifiers.secondary() && keystroke.key.eq_ignore_ascii_case("k") {
             self.toggle_command_palette(window, cx);
             return;

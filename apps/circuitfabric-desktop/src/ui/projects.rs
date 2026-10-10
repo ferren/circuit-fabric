@@ -189,7 +189,12 @@ impl ControlPlaneView {
         };
         match storage.load_session(&session_id) {
             Ok(replay) => {
-                self.session_replay = Some(SessionReplaySelection { project_id, replay });
+                self.session_category_filter = replay.metadata.category;
+                let presentation = super::session_markdown::presentation_source(&replay.body);
+                let markdown =
+                    cx.new(|cx| gpui_component::text::TextViewState::markdown(&presentation, cx));
+                self.session_replay = Some(SessionReplaySelection { project_id, replay, markdown });
+                self.session_modal_open = true;
             }
             Err(error) => self.status = format!("未打开会话：{error}"),
         }
@@ -197,7 +202,8 @@ impl ControlPlaneView {
     }
 
     pub(super) fn close_session_replay(&mut self, cx: &mut Context<Self>) {
-        self.session_replay = None;
+        // Keep the selected runtime record available to the explicit continue button.
+        self.session_modal_open = false;
         cx.notify();
     }
 

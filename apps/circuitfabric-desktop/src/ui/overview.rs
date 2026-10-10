@@ -239,9 +239,9 @@ impl ControlPlaneView {
             })
             .unwrap_or_else(|| language.choose("无运行任务", "Idle").into());
         let health = panel(language.choose("运行时健康", "Runtime health"))
-            .child(format!("Codex App Server · {}", self.codex_status.label(language)))
+            .child(format!("Codex App Server · {}", self.codex_check_label(language)))
             .child(format!("EDA bridge · {}", self.bridge_health.label(language)))
-            .child(language.choose("来自受监管进程及最近 TCP 探测；TCP 可达不等于 EDA 插件就绪。", "Supervised process and latest TCP probe; reachable TCP does not imply EDA readiness."))
+            .child(language.choose("Codex 显示最近一次连接检查；bridge 来自受监管进程及最近 TCP 探测，TCP 可达不等于 EDA 插件就绪。", "Codex shows the latest connection check; the bridge row comes from the supervised process and latest TCP probe, and reachable TCP does not imply EDA readiness."))
             .child(format!("{} · {}", language.choose("当前任务", "Current task"),
                 current_task));
         let mut sessions = panel(language.choose("最近持久会话", "Recent persisted sessions"));
