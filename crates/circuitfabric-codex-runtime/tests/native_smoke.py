@@ -114,7 +114,7 @@ if __name__ == '__main__':
     worker.start()
     try:
         with tempfile.TemporaryDirectory(prefix='runtime-smoke-', dir=repo / 'target') as directory:
-            provider = {'id': 'local', 'name': 'Local fixture', 'base_url': f'http://127.0.0.1:{server.server_port}/v1', 'model': 'claude-sonnet-4-6', 'api_key_environment_variable': 'CF_SMOKE_API_KEY', 'enabled': True, 'supports_vision': False}
+            provider = {'id': 'local', 'name': 'Local fixture', 'base_url': f'http://127.0.0.1:{server.server_port}/v1', 'model': 'claude-sonnet-4-6', 'api_key_environment_variable': 'CF_SMOKE_API_KEY', 'enabled': True, 'native_vision': False}
             settings = {'codex': {'command': 'codex', 'working_directory': directory, 'model': None, 'api_key_environment_variable': 'CF_SMOKE_API_KEY'}, 'default_provider_id': 'local', 'providers': [provider], 'bridge': {'listen_address': '127.0.0.1:49630'}}
             skills = []
             for name in ['a', 'b']:
@@ -167,8 +167,8 @@ if __name__ == '__main__':
             assert result.returncode == 0, result.stderr
             assert ('/alternate/v1/responses', 'fixture-alternate') in requests
             print('provider binding and service route: PASS', flush=True)
-            # Vision overrides the language model and includes image bytes in the request.
-            alternate.update(supports_vision=True, vision_base_url=f'http://127.0.0.1:{server.server_port}/vision/v1', vision_model='fixture-vision', vision_api_key_environment_variable='CF_SMOKE_API_KEY')
+            # Without native vision the separate vision model serves the image.
+            alternate.update(native_vision=False, vision_base_url=f'http://127.0.0.1:{server.server_port}/vision/v1', vision_model='fixture-vision', vision_api_key_environment_variable='CF_SMOKE_API_KEY')
             picture = Path(directory) / 'pixel.png'
             def png_chunk(kind, data):
                 return struct.pack('!I', len(data)) + kind + data + struct.pack('!I', zlib.crc32(kind + data))
@@ -178,6 +178,15 @@ if __name__ == '__main__':
             assert result.returncode == 0, result.stderr
             assert ('/vision/v1/responses', 'fixture-vision') in requests and any(image_seen), (requests, image_seen, result.stdout, result.stderr)
             print('vision service and image input: PASS', flush=True)
+            # Native vision sends the image straight to the main model; the kept
+            # separate vision values are ignored, not applied.
+            image_seen.clear()
+            alternate.update(native_vision=True)
+            path.write_text(json.dumps(settings), encoding='utf-8')
+            result = subprocess.run([str(binary), str(path), 'codex', 'CF_OK', str(picture)], env=environment, capture_output=True, text=True, timeout=220)
+            assert result.returncode == 0, result.stderr
+            assert ('/alternate/v1/responses', 'fixture-alternate') in requests and any(image_seen), (requests, image_seen, result.stdout, result.stderr)
+            print('native vision routes images to the main model: PASS', flush=True)
             for kind in ['codex', 'claude', 'dsh']:
                 result = subprocess.run([str(binary), str(path), kind, 'CF_WAIT_FOR_CANCEL', 'cancel'], env=environment, capture_output=True, text=True, timeout=30)
                 assert result.returncode == 0 and 'CF_CANCEL_OK' in result.stdout, (kind, result.stderr)

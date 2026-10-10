@@ -33,6 +33,28 @@ impl ControlPlaneView {
         provider: LlmProviderSettings,
         cx: &mut Context<Self>,
     ) -> ProviderFields {
+        let vision_base_url = Self::input(
+            window,
+            provider.vision_base_url.unwrap_or_default(),
+            "https://api.example.com/v1",
+            cx,
+        );
+        let vision_model =
+            Self::input(window, provider.vision_model.unwrap_or_default(), "vision-model-name", cx);
+        let vision_api_key_environment_variable = Self::input(
+            window,
+            provider.vision_api_key_environment_variable.unwrap_or_default(),
+            "VISION_API_KEY_ENVIRONMENT_VARIABLE",
+            cx,
+        );
+        // While the LLM itself handles images, the separate vision fields gray
+        // out; their stored values stay visible and are restored as editable
+        // drafts once native vision is turned off.
+        if provider.native_vision {
+            for state in [&vision_base_url, &vision_model, &vision_api_key_environment_variable] {
+                state.update(cx, |state, cx| state.set_disabled(true, cx));
+            }
+        }
         ProviderFields {
             id: Self::input(window, provider.id, "provider-id", cx),
             name: Self::input(window, provider.name, "Provider name", cx),
@@ -44,25 +66,10 @@ impl ControlPlaneView {
                 "API_KEY_ENVIRONMENT_VARIABLE",
                 cx,
             ),
-            supports_vision: provider.supports_vision,
-            vision_base_url: Self::input(
-                window,
-                provider.vision_base_url.unwrap_or_default(),
-                "https://api.example.com/v1",
-                cx,
-            ),
-            vision_model: Self::input(
-                window,
-                provider.vision_model.unwrap_or_default(),
-                "vision-model-name",
-                cx,
-            ),
-            vision_api_key_environment_variable: Self::input(
-                window,
-                provider.vision_api_key_environment_variable.unwrap_or_default(),
-                "VISION_API_KEY_ENVIRONMENT_VARIABLE",
-                cx,
-            ),
+            native_vision: provider.native_vision,
+            vision_base_url,
+            vision_model,
+            vision_api_key_environment_variable,
             enabled: provider.enabled,
         }
     }

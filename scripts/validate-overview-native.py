@@ -42,7 +42,7 @@ def fixture(scenario):
         'providers': [{'id': 'fixture', 'name': 'Native fixture', 'kind': 'open_ai_compatible',
                        'base_url': 'http://127.0.0.1:49000/v1', 'model': 'fixture',
                        'api_key_environment_variable': 'CF_UNUSED_FIXTURE_KEY',
-                       'supports_vision': False, 'enabled': True}],
+                       'native_vision': False, 'enabled': True}],
         'global_preferences': {'language': 'simplified_chinese', 'data_directory': str(profile / 'data')},
         'catalog': {'skills': [], 'mcp_servers': [], 'removed_bundled_servers': ['typesafe-jev']},
         'bridge': {'listen_address': '127.0.0.1:49639'},

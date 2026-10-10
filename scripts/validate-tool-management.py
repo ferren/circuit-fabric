@@ -39,7 +39,7 @@ for resource_id in ['first', 'second']:
         'environment_variables':[],'enabled':True})
 settings = {'providers':[{'id':'local','name':'Native fixture','kind':'open_ai_compatible',
     'base_url':'http://127.0.0.1:49000/v1','model':'fixture','api_key_environment_variable':'CF_UNUSED_FIXTURE_KEY',
-    'supports_vision':False,'enabled':True}], 'default_provider_id':'local',
+    'native_vision':False,'enabled':True}], 'default_provider_id':'local',
     'tools':{'authorized_skill_ids':['skill-00','skill-01'],'authorized_mcp_server_ids':[]},
     'catalog':{'skills':skills,'mcp_servers':servers,'removed_bundled_servers':['typesafe-jev']},
     'global_preferences':{'language':'simplified_chinese','data_directory':str(ARTIFACTS / 'workspace-data')}}

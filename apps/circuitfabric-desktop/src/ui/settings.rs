@@ -16,7 +16,7 @@ impl ControlPlaneView {
                     .value()
                     .to_string(),
                 enabled: provider.enabled,
-                supports_vision: provider.supports_vision,
+                native_vision: provider.native_vision,
                 vision_base_url: Self::optional_value(
                     provider.vision_base_url.read(cx).value().to_string(),
                 ),
@@ -129,7 +129,7 @@ impl ControlPlaneView {
             model: "gpt-5.4".to_owned(),
             api_key_environment_variable: "OPENAI_API_KEY".to_owned(),
             enabled: true,
-            supports_vision: false,
+            native_vision: false,
             vision_base_url: None,
             vision_model: None,
             vision_api_key_environment_variable: None,
@@ -148,41 +148,132 @@ impl ControlPlaneView {
             return;
         }
         let selected = self.selected_provider.min(self.providers.len() - 1);
-        let removed_id = self.providers[selected].id.read(cx).value().to_string();
-        self.providers.remove(selected);
+        let removed = self.providers.remove(selected);
+        let removed_id = removed.id.read(cx).value().to_string();
+        let previous_default = self.default_provider_id.clone();
+        let removed_was_default = self.default_provider_id == removed_id;
         self.selected_provider = selected.min(self.providers.len() - 1);
-        if self.default_provider_id == removed_id {
+        if removed_was_default {
             self.default_provider_id = self.providers[0].id.read(cx).value().to_string();
         }
-        self.status = format!("已移除 Provider `{removed_id}`，保存后生效。");
+        if !self.saved_settings.providers.iter().any(|provider| provider.id == removed_id) {
+            self.status = format!("已移除草稿 Provider `{removed_id}`；保存 Provider 列表后生效。");
+            cx.notify();
+            return;
+        }
+        match self.save_update(
+            crate::application::settings_persistence::SettingsUpdate::RemoveProvider {
+                id: removed_id.clone(),
+            },
+        ) {
+            Ok(()) => {
+                // The persisted replacement default is authoritative; a draft list
+                // that still ends with an unsaved provider must not shadow it.
+                if removed_was_default {
+                    self.default_provider_id = self.saved_settings.default_provider_id.clone();
+                }
+                self.status = format!(
+                    "已移除并保存 Provider `{removed_id}`；下次任务生效，运行中的服务须重启。"
+                );
+            }
+            Err(error) => {
+                self.providers.insert(selected, removed);
+                self.selected_provider = selected;
+                self.default_provider_id = previous_default;
+                self.status = format!("移除未保存：{error}");
+            }
+        }
         cx.notify();
     }
 
+    /// Quick actions persist immediately through section-scoped updates, so an
+    /// unsaved form draft elsewhere on the page never rides along and closing the
+    /// app never discards the click. Providers that exist only as drafts keep the
+    /// draft semantics: they reach disk with the next "保存 Provider 列表".
     pub(super) fn set_default_provider(&mut self, cx: &mut Context<Self>) {
         let selected = self.selected_provider.min(self.providers.len() - 1);
-        self.default_provider_id = self.providers[selected].id.read(cx).value().to_string();
-        self.status = format!("默认 Provider 已设为 `{}`，保存后生效。", self.default_provider_id);
+        let previous_default = self.default_provider_id.clone();
+        let id = self.providers[selected].id.read(cx).value().to_string();
+        self.default_provider_id = id.clone();
+        if !self.saved_settings.providers.iter().any(|provider| provider.id == id) {
+            self.status =
+                format!("Provider `{id}` 尚未保存；默认项将随「保存 Provider 列表」生效。");
+            cx.notify();
+            return;
+        }
+        match self.save_update(
+            crate::application::settings_persistence::SettingsUpdate::DefaultProvider {
+                id: id.clone(),
+            },
+        ) {
+            Ok(()) => {
+                self.status = format!(
+                    "默认 Provider 已设为 `{id}` 并保存；下次任务生效，运行中的服务须重启。"
+                )
+            }
+            Err(error) => {
+                self.default_provider_id = previous_default;
+                self.status = format!("默认 Provider 未保存：{error}");
+            }
+        }
         cx.notify();
     }
 
     pub(super) fn toggle_provider(&mut self, cx: &mut Context<Self>) {
         let selected = self.selected_provider.min(self.providers.len() - 1);
+        let id = self.providers[selected].id.read(cx).value().to_string();
         self.providers[selected].enabled = !self.providers[selected].enabled;
-        self.status = format!(
-            "Provider `{}` 的{}修改尚未保存；请点击「保存 Provider 列表」。",
-            self.providers[selected].id.read(cx).value(),
-            if self.providers[selected].enabled { "启用" } else { "停用" }
-        );
+        let enabled = self.providers[selected].enabled;
+        if !self.saved_settings.providers.iter().any(|provider| provider.id == id) {
+            self.status = format!("Provider `{id}` 尚未保存；启停将随「保存 Provider 列表」生效。");
+            cx.notify();
+            return;
+        }
+        let update = crate::application::settings_persistence::SettingsUpdate::ProviderEnabled {
+            id: id.clone(),
+            enabled,
+        };
+        match self.save_update(update) {
+            Ok(()) => {
+                self.status = format!(
+                    "Provider `{id}` 已{}并保存；下次任务生效，运行中的服务须重启。",
+                    if enabled { "启用" } else { "停用" }
+                )
+            }
+            Err(error) => {
+                self.providers[selected].enabled = !enabled;
+                self.status = format!("未保存：{error}");
+            }
+        }
         cx.notify();
     }
 
     pub(super) fn toggle_vision(&mut self, cx: &mut Context<Self>) {
         let selected = self.selected_provider.min(self.providers.len() - 1);
-        self.providers[selected].supports_vision = !self.providers[selected].supports_vision;
+        let (provider_id, native) = {
+            let fields = &mut self.providers[selected];
+            fields.native_vision = !fields.native_vision;
+            let native = fields.native_vision;
+            // The separate vision fields gray out while the LLM handles images
+            // natively; their values stay visible and come back editable when
+            // native vision is turned off again.
+            let vision_states = [
+                fields.vision_base_url.clone(),
+                fields.vision_model.clone(),
+                fields.vision_api_key_environment_variable.clone(),
+            ];
+            for state in &vision_states {
+                state.update(cx, |state, cx| state.set_disabled(native, cx));
+            }
+            (fields.id.read(cx).value().to_string(), native)
+        };
         self.status = format!(
-            "Provider `{}` 的 Vision {}修改尚未保存；请点击「保存 Provider 列表」。",
-            self.providers[selected].id.read(cx).value(),
-            if self.providers[selected].supports_vision { "启用" } else { "停用" }
+            "Provider `{provider_id}`：{}。修改尚未保存；请点击「保存 Provider 列表」。",
+            if native {
+                "LLM 本身支持视觉，图像直接使用主模型，独立 Vision 配置已灰掉（原值保留）"
+            } else {
+                "LLM 本身不支持视觉，图像需经独立 Vision 模型处理"
+            },
         );
         cx.notify();
     }
@@ -609,8 +700,8 @@ impl ControlPlaneView {
     }
 
     /// Modal editor for the selected provider. Saving the provider list happens inside the
-    /// dialog and closes it on success; quick list actions (default, enable, remove) stay on
-    /// the page and remain drafts until this save runs.
+    /// dialog and closes it on success; quick list actions (default, enable, remove) persist
+    /// on click, so this save mainly carries the form fields and brand-new providers.
     pub(super) fn render_provider_dialog(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity().clone();
         let language = self.language;
@@ -757,15 +848,15 @@ impl ControlPlaneView {
                                     )
                                     .child(
                                         action_button("toggle-vision")
-                                            .label(if provider.supports_vision {
+                                            .label(if provider.native_vision {
                                                 language.choose(
-                                                    "Vision：已启用",
-                                                    "Vision: enabled",
+                                                    "LLM 本身支持视觉：是",
+                                                    "LLM sees images natively: yes",
                                                 )
                                             } else {
                                                 language.choose(
-                                                    "Vision：已停用",
-                                                    "Vision: disabled",
+                                                    "LLM 本身支持视觉：否",
+                                                    "LLM sees images natively: no",
                                                 )
                                             })
                                             .on_click(move |_, _, cx| {
@@ -776,6 +867,25 @@ impl ControlPlaneView {
                                             }),
                                     ),
                             )
+                            .child(
+                                div().text_xs().text_color(rgb(TEXT_MUTED)).whitespace_normal()
+                                    .child(language.choose(
+                                        "「是」表示 LLM 本身能直接处理图像，图片直接发给主模型，无需下方独立配置；「否」表示图片需经下方独立 Vision 模型处理。",
+                                        "Yes means the LLM itself processes images, so they go straight to the main model; no means images are handled by the separate vision model below.",
+                                    )),
+                            )
+                            .when(provider.native_vision, |this| {
+                                this.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(TEXT_SECONDARY))
+                                        .whitespace_normal()
+                                        .child(language.choose(
+                                            "LLM 本身处理图像：下方独立 Vision 配置已灰掉停用，原值保留不丢失，关闭本开关后可继续编辑。",
+                                            "The LLM handles images itself: the separate vision fields below are grayed out and disabled; their values are kept and editable again once this switch is off.",
+                                        )),
+                                )
+                            })
                             .child(
                                 div()
                                     .flex()
@@ -1073,7 +1183,11 @@ impl ControlPlaneView {
                             .gap_2()
                             .when_some(default_badge, ParentElement::child)
                             .child(enabled_badge)
-                            .when(provider.supports_vision, |row| row.child(vision_badge)),
+                            .when(
+                                provider.native_vision
+                                    || !provider.vision_model.read(cx).value().trim().is_empty(),
+                                |row| row.child(vision_badge),
+                            ),
                     ),
             )
             .child(info_note(
@@ -1103,18 +1217,27 @@ impl ControlPlaneView {
                         provider.api_key_environment_variable.read(cx).value().to_string(),
                     ))
                     .when_some(api_key_hint, ParentElement::child)
-                    .child(settings_summary_row(
-                        "Vision",
-                        if provider.supports_vision {
-                            format!(
-                                "{}（{}）",
-                                language.choose("已启用", "Enabled"),
-                                provider.vision_model.read(cx).value()
-                            )
+                    .child({
+                        let vision_model = provider.vision_model.read(cx).value().to_string();
+                        let vision_summary = if provider.native_vision {
+                            language
+                                .choose(
+                                    "LLM 本身支持视觉（图像直发主模型）",
+                                    "LLM sees images natively (images go to the main model)",
+                                )
+                                .to_owned()
+                        } else if vision_model.trim().is_empty() {
+                            language
+                                .choose("未配置（图片任务不可用）", "Not configured (image tasks unavailable)")
+                                .to_owned()
                         } else {
-                            language.choose("已停用", "Disabled").to_owned()
-                        },
-                    )),
+                            format!(
+                                "{}（{vision_model}）",
+                                language.choose("独立 Vision 模型", "Separate vision model")
+                            )
+                        };
+                        settings_summary_row("Vision", vision_summary)
+                    }),
             )
             .child(Self::save_state_note(dirty, language))
             .child(
@@ -1156,8 +1279,8 @@ impl ControlPlaneView {
             .child(
                 div().text_xs().text_color(rgb(TEXT_MUTED)).child(
                     language.choose(
-                        "上述默认项、启停与删除均为草稿，连同表单修改一起在「编辑 Provider…」弹窗中保存后生效。默认项用于未指定 Provider 的运行时。",
-                        "Default, enabled, and removal changes are drafts; they take effect together with the form edits saved in the Edit provider dialog. The default applies to runtimes without an explicit provider binding.",
+                        "默认项、启停与删除点击后立即保存；表单修改仍在「编辑 Provider…」弹窗中保存。默认项用于未指定 Provider 的运行时。",
+                        "Default, enable, and removal clicks save immediately; form edits still save in the Edit provider dialog. The default applies to runtimes without an explicit provider binding.",
                     ),
                 ),
             )

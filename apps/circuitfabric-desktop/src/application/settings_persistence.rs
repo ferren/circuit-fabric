@@ -6,9 +6,18 @@ use circuitfabric_codex_runtime::{
 };
 use std::path::Path;
 
+/// One independently saved section of the runtime settings.
+///
+/// The `DefaultProvider`, `ProviderEnabled`, and `RemoveProvider` variants carry
+/// the provider quick actions from the Agents & tools detail pane: each switches
+/// exactly its own field on the saved copy, so unsaved provider form drafts on
+/// the page are never pulled into the transaction.
 #[derive(Clone, Debug)]
 pub enum SettingsUpdate {
     Providers { providers: Vec<LlmProviderSettings>, default_provider_id: String },
+    DefaultProvider { id: String },
+    ProviderEnabled { id: String, enabled: bool },
+    RemoveProvider { id: String },
     Codex { command: String, provider_id: String },
     Claude { command: String, provider_id: String },
     Dsh { command: String, provider_id: String },
@@ -19,11 +28,40 @@ pub enum SettingsUpdate {
 }
 
 impl SettingsUpdate {
-    fn apply(self, saved: &mut RuntimeSettings) {
+    fn apply(self, saved: &mut RuntimeSettings) -> Result<(), RuntimeError> {
         match self {
             Self::Providers { providers, default_provider_id } => {
                 saved.providers = providers;
                 saved.default_provider_id = default_provider_id;
+            }
+            // An unknown or disabled target is rejected by the whole-file validation
+            // in `RuntimeSettings::save`, with the same message a dialog save yields.
+            Self::DefaultProvider { id } => saved.default_provider_id = id,
+            Self::ProviderEnabled { id, enabled } => {
+                let provider = saved.providers.iter_mut().find(|provider| provider.id == id);
+                if let Some(provider) = provider {
+                    provider.enabled = enabled;
+                } else {
+                    return Err(RuntimeError::InvalidSettings(format!(
+                        "provider `{id}` is not configured"
+                    )));
+                }
+            }
+            Self::RemoveProvider { id } => {
+                if !saved.providers.iter().any(|provider| provider.id == id) {
+                    return Err(RuntimeError::InvalidSettings(format!(
+                        "provider `{id}` is not configured"
+                    )));
+                }
+                if saved.providers.len() == 1 {
+                    return Err(RuntimeError::InvalidSettings(
+                        "at least one LLM provider must be configured".to_owned(),
+                    ));
+                }
+                saved.providers.retain(|provider| provider.id != id);
+                if saved.default_provider_id == id {
+                    saved.default_provider_id = saved.providers[0].id.clone();
+                }
             }
             Self::Codex { command, provider_id } => {
                 saved.codex.command = command;
@@ -56,6 +94,7 @@ impl SettingsUpdate {
                 }
             },
         }
+        Ok(())
     }
 }
 
@@ -64,7 +103,7 @@ impl SettingsUpdate {
 /// with defaults, or pull drafts from any other page into this transaction.
 pub fn save_update(path: &Path, update: SettingsUpdate) -> Result<RuntimeSettings, RuntimeError> {
     let mut saved = RuntimeSettings::load_or_default(path)?;
-    update.apply(&mut saved);
+    update.apply(&mut saved)?;
     saved.save(path)?;
     Ok(saved)
 }
@@ -286,5 +325,107 @@ mod tests {
         assert!(saved.catalog.removed_bundled_servers.contains(&BUNDLED_JEV_SERVER_ID.into()));
         let restored = RuntimeSettings::load_or_default(&path).unwrap();
         assert!(!restored.catalog.mcp_servers.iter().any(|s| s.id == BUNDLED_JEV_SERVER_ID));
+    }
+
+    fn two_provider_settings(default: &str) -> RuntimeSettings {
+        let mut settings = RuntimeSettings::default();
+        let mut added = LlmProviderSettings::default();
+        added.id = "added".into();
+        settings.providers.push(added);
+        settings.default_provider_id = default.into();
+        settings
+    }
+
+    #[test]
+    fn provider_quick_actions_persist_only_their_section_and_reload_latest_file() {
+        let fixture = Fixture::new();
+        let path = fixture.path();
+        // Mirrors the reported flow: a newly added provider is the default, and the
+        // user switches the default back to the previous provider. Loading back the
+        // seed keeps the bundled-catalog merge out of the comparison.
+        two_provider_settings("added").save(&path).unwrap();
+        let initial = RuntimeSettings::load_or_default(&path).unwrap();
+
+        let saved =
+            save_update(&path, SettingsUpdate::DefaultProvider { id: "zai".into() }).unwrap();
+        let mut expected = initial.clone();
+        expected.default_provider_id = "zai".into();
+        assert_eq!(saved, expected);
+        assert_eq!(RuntimeSettings::load_or_default(&path).unwrap(), expected);
+
+        // The saved copy's enabled flag flips for exactly the named provider; any
+        // unsaved form edits elsewhere are not pulled into this transaction.
+        let saved = save_update(
+            &path,
+            SettingsUpdate::ProviderEnabled { id: "added".into(), enabled: false },
+        )
+        .unwrap();
+        expected.providers[1].enabled = false;
+        assert_eq!(saved, expected);
+        assert_eq!(RuntimeSettings::load_or_default(&path).unwrap(), expected);
+
+        // Removing a non-default provider leaves the default untouched.
+        let saved =
+            save_update(&path, SettingsUpdate::RemoveProvider { id: "added".into() }).unwrap();
+        expected.providers.remove(1);
+        assert_eq!(saved, expected);
+        assert_eq!(RuntimeSettings::load_or_default(&path).unwrap(), expected);
+    }
+
+    #[test]
+    fn removing_the_default_provider_reassigns_the_default_to_the_first_remaining_one() {
+        let fixture = Fixture::new();
+        let path = fixture.path();
+        two_provider_settings("zai").save(&path).unwrap();
+        let initial = RuntimeSettings::load_or_default(&path).unwrap();
+        let saved =
+            save_update(&path, SettingsUpdate::RemoveProvider { id: "zai".into() }).unwrap();
+        let mut expected = initial;
+        expected.providers.remove(0);
+        expected.default_provider_id = "added".into();
+        assert_eq!(saved, expected);
+        assert_eq!(RuntimeSettings::load_or_default(&path).unwrap(), expected);
+    }
+
+    #[test]
+    fn provider_quick_actions_reject_unknown_ids_invalid_targets_and_keep_the_file() {
+        let fixture = Fixture::new();
+        let path = fixture.path();
+        two_provider_settings("zai").save(&path).unwrap();
+        let original = fs::read(&path).unwrap();
+
+        assert!(
+            save_update(&path, SettingsUpdate::DefaultProvider { id: "missing".into() }).is_err()
+        );
+        assert!(
+            save_update(
+                &path,
+                SettingsUpdate::ProviderEnabled { id: "missing".into(), enabled: false }
+            )
+            .is_err()
+        );
+        // Disabling the default provider would leave the settings without an
+        // enabled default; validation must reject the whole transaction.
+        assert!(
+            save_update(
+                &path,
+                SettingsUpdate::ProviderEnabled { id: "zai".into(), enabled: false }
+            )
+            .is_err()
+        );
+        assert!(
+            save_update(&path, SettingsUpdate::RemoveProvider { id: "missing".into() }).is_err()
+        );
+        assert_eq!(fs::read(&path).unwrap(), original);
+
+        // Removing the last remaining provider is rejected, keeping one configured.
+        save_update(&path, SettingsUpdate::RemoveProvider { id: "added".into() }).unwrap();
+        assert!(save_update(&path, SettingsUpdate::RemoveProvider { id: "zai".into() }).is_err());
+        let remaining = RuntimeSettings::load_or_default(&path).unwrap();
+        assert_eq!(
+            remaining.providers.iter().map(|provider| provider.id.as_str()).collect::<Vec<_>>(),
+            ["zai"]
+        );
+        assert_eq!(remaining.default_provider_id, "zai");
     }
 }

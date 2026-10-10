@@ -7,7 +7,7 @@ pub(super) struct ProviderFields {
     pub(super) base_url: Entity<InputState>,
     pub(super) model: Entity<InputState>,
     pub(super) api_key_environment_variable: Entity<InputState>,
-    pub(super) supports_vision: bool,
+    pub(super) native_vision: bool,
     pub(super) vision_base_url: Entity<InputState>,
     pub(super) vision_model: Entity<InputState>,
     pub(super) vision_api_key_environment_variable: Entity<InputState>,

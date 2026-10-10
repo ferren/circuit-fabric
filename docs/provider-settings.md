@@ -6,7 +6,7 @@ Runtime settings are saved outside the repository at the platform application-da
 
 - `id`, `name`, `base_url`, and `model`;
 - `api_key_environment_variable`, which is a variable name rather than a secret value;
-- `enabled` and `supports_vision`;
+- `enabled` and `native_vision` (whether the LLM itself processes images);
 - optional vision `base_url`, `model`, and API-key environment-variable name.
 
 The selected default provider is used when the JLCircuit bridge starts Codex App Server. Multiple providers can be added, edited, enabled/disabled, and switched as the default in the desktop UI.
@@ -24,7 +24,7 @@ Example shape, with no credentials:
       "model": "glm-5.3-flash",
       "api_key_environment_variable": "JLCIRCUIT_LLM_API_KEY",
       "enabled": true,
-      "supports_vision": true,
+      "native_vision": false,
       "vision_base_url": "https://openrouter.ai/api/v1",
       "vision_model": "z-ai/glm-5.3-flash",
       "vision_api_key_environment_variable": "JLCIRCUIT_VISION_LLM_API_KEY"
@@ -33,13 +33,13 @@ Example shape, with no credentials:
 }
 ```
 
-The bridge uses the Codex adapter's selected provider. The desktop image input routes through the selected provider's separate Vision URL, model and environment-variable reference. Bridge messages currently accept text only.
+The bridge uses the Codex adapter's selected provider. Image tasks follow the provider's vision mode: with `native_vision` the image goes straight to the main model and the separate vision fields are unused (the desktop grays them out but keeps their values); without it, the image routes through the separate Vision URL, model and environment-variable reference, which image tasks require at run time. Bridge messages currently accept text only.
 
 ## Runtime binding and protocols
 
 `adapters.codex_provider_id`, `adapters.claude_provider_id` and `adapters.dsh_provider_id` independently select providers; an empty binding uses the default. Disabled and missing bindings fail validation. Codex requires Responses, Claude Code requires Anthropic Messages, and DSH uses Chat Completions through its `llm-deepseek` adapter. A service must support that protocol and tool calling. Claude normalizes a trailing `/v1` to avoid duplicate path segments.
 
-Each task creates an isolated process/session from saved configuration. Results show the provider, model and service URL used by that task. Save form changes before running the next task. The Codex Start button performs a separate JSON-RPC connection check; restart that process to change its configuration. Claude and DSH use per-task processes rather than a persistent idle server.
+Each task creates an isolated process/session from saved configuration. Results show the provider, model and service URL used by that task. Save form changes before running the next task. The Codex endpoint offers a one-shot connection check: the saved configuration is launched once, must complete the JSON-RPC initialization handshake, and the process stops immediately — nothing stays resident. Claude and DSH use per-task processes rather than a persistent idle server.
 
 ## 保存操作的范围
 
@@ -95,7 +95,7 @@ Never put credentials in command arguments or URLs. Supply the named variables e
 
 The desktop app keeps every API key value in one encrypted store, `secrets.vault.json` next to `runtime.json`. The file holds only AES-256-GCM ciphertext under a key derived with PBKDF2-HMAC-SHA256 (600k iterations) from a vault password the user chooses at creation; a plaintext index of variable *names* (never values) lets the locked screen show what is stored. On startup the app prompts for the password when a vault exists; unlocking holds only the derived key in zeroized memory until relock or exit.
 
-At run time a whitelisted variable name resolves to the unlocked vault value first and to the process environment second. Task, MCP-test, supervised Codex and desktop-spawned bridge processes all receive values strictly through child-process environment injection; nothing is logged or passed on command lines. A missing value fails the task with a message naming both remedies. A manually started bridge never sees the vault: give it real environment variables, or start it from the desktop.
+At run time a whitelisted variable name resolves to the unlocked vault value first and to the process environment second. Task, MCP-test, connection-check Codex and desktop-spawned bridge processes all receive values strictly through child-process environment injection; nothing is logged or passed on command lines. A missing value fails the task with a message naming both remedies. A manually started bridge never sees the vault: give it real environment variables, or start it from the desktop.
 
 Existing deployments that already export `JLCIRCUIT_LLM_API_KEY` etc. keep working unchanged — the vault is additive, and an OS-level variable only applies when the unlocked vault does not define the same name.
 
@@ -105,7 +105,7 @@ Provider, runtime and catalog definitions are global. Projects persist their own
 
 Desktop revocation, catalog changes and project switches cancel the active task. Bridge tasks monitor configuration files and cancel when they change. New tasks recalculate authorization. Configuration writes validate first, then replace the destination through a temporary file. Failed catalog/grant writes restore prior in-memory configuration and report failure.
 
-桌面 Codex 的工作目录由当前项目根目录自动确定，在运行区域只读展示，不属于全局运行时设置。先打开项目才能启动 Codex 连接检查进程；切换项目会停止旧项目进程，启动中的旧项目进程在启动结束后清理，需在新项目重新启动。旧配置文件中的 `codex.working_directory` 字段保留以兼容已有配置，但桌面启动会覆盖该字段的值，保存命令或 Provider 不会写入项目路径。工作目录表示进程的起始目录，访问权限仍由运行时沙箱及授权规则决定。
+桌面不驻留 Codex 进程：连接检查用已保存配置临时启动一次、握手成功后立即结束。任务与数据手册提取的工作目录由当前项目根目录逐次确定，不属于全局运行时设置。旧配置文件中的 `codex.working_directory` 字段保留以兼容已有配置，任务不再读取它作为工作目录；保存命令或 Provider 不会写入项目路径。工作目录表示进程的起始目录，访问权限仍由运行时沙箱及授权规则决定。
 
 Task processes use the selected project root as their working directory and an isolated temporary configuration/home directory. Without a project, the task test panel uses an isolated temporary working directory. Codex receives explicit project instructions rather than inheriting parent-directory project instructions. Engineering access is through authorized MCP servers. Windows Job Objects with KILL_ON_JOB_CLOSE own child process trees, including application-exit cleanup. Temporary configurations are removed at task completion; project directories are never removed. Live processes and sessions are not persisted.
 

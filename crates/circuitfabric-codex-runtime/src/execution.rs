@@ -376,17 +376,28 @@ fn run_task_in(
     let mut provider =
         selected_provider(settings, kind).ok_or_else(|| invalid("Provider 不可用"))?.clone();
     if image.is_some() {
-        if kind != AgentKind::Codex || !provider.supports_vision {
-            return Err(invalid("图片任务需要 Codex 运行时及已启用的 Vision 配置"));
+        if kind != AgentKind::Codex {
+            return Err(invalid("图片任务需要 Codex 运行时"));
         }
-        provider.base_url =
-            provider.vision_base_url.clone().ok_or_else(|| invalid("缺少 Vision 服务地址"))?;
-        provider.model =
-            provider.vision_model.clone().ok_or_else(|| invalid("缺少 Vision 模型"))?;
-        provider.api_key_environment_variable = provider
-            .vision_api_key_environment_variable
-            .clone()
-            .ok_or_else(|| invalid("缺少 Vision 环境变量名"))?;
+        if !provider.native_vision {
+            // The LLM cannot see images itself; route the task through the
+            // separate vision model. Each missing field names itself so the
+            // user knows exactly what to configure.
+            provider.base_url = provider.vision_base_url.clone().ok_or_else(|| {
+                invalid(
+                    "该 LLM 无原生视觉能力且未配置 Vision 服务地址；请在 Provider 设置中填写\
+                     独立 Vision 模型，或开启「LLM 本身支持视觉」",
+                )
+            })?;
+            provider.model =
+                provider.vision_model.clone().ok_or_else(|| invalid("缺少 Vision 模型"))?;
+            provider.api_key_environment_variable = provider
+                .vision_api_key_environment_variable
+                .clone()
+                .ok_or_else(|| invalid("缺少 Vision API Key 环境变量名"))?;
+        }
+        // With `native_vision`, the image goes straight to the main model with
+        // the provider's regular base URL, model, and key configuration.
     }
     let key = crate::secrets::resolve(&provider.api_key_environment_variable, secrets).ok_or_else(
         || {

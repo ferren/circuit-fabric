@@ -119,8 +119,14 @@ pub struct LlmProviderSettings {
     pub api_key_environment_variable: String,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    /// Whether the LLM itself processes images natively.
+    ///
+    /// When true, image tasks go straight to the main model and the separate
+    /// vision configuration below is unused — the desktop grays those fields
+    /// out but keeps their stored values. When false, image tasks are routed
+    /// through the separate vision model, which must then be configured.
     #[serde(default)]
-    pub supports_vision: bool,
+    pub native_vision: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vision_base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -146,7 +152,10 @@ impl Default for LlmProviderSettings {
             model: "glm-5.3-flash".to_owned(),
             api_key_environment_variable: "JLCIRCUIT_LLM_API_KEY".to_owned(),
             enabled: true,
-            supports_vision: true,
+            // The bundled Z.ai profile historically routed images through the
+            // separate OpenRouter vision backend; `native_vision: false` keeps
+            // that behavior instead of silently repointing image tasks.
+            native_vision: false,
             vision_base_url: Some("https://openrouter.ai/api/v1".to_owned()),
             vision_model: Some("z-ai/glm-5.3-flash".to_owned()),
             vision_api_key_environment_variable: Some("JLCIRCUIT_VISION_LLM_API_KEY".to_owned()),
@@ -426,23 +435,10 @@ impl RuntimeSettings {
                     provider.id
                 )));
             }
-            if provider.supports_vision {
-                for (label, value) in [
-                    ("vision base URL", provider.vision_base_url.as_deref()),
-                    ("vision model", provider.vision_model.as_deref()),
-                    (
-                        "vision API key environment variable",
-                        provider.vision_api_key_environment_variable.as_deref(),
-                    ),
-                ] {
-                    if value.is_none_or(str::is_empty) {
-                        return Err(RuntimeError::InvalidSettings(format!(
-                            "provider `{}` requires a {} when vision is enabled",
-                            provider.id, label
-                        )));
-                    }
-                }
-            }
+            // The separate vision configuration is deliberately optional in both
+            // modes: with `native_vision` it is unused, and without it the fields
+            // are only needed once the user runs image tasks, which report each
+            // missing field by name instead of blocking the whole save.
         }
         if !provider_ids.contains(&self.default_provider_id) {
             return Err(RuntimeError::InvalidSettings(format!(
@@ -477,7 +473,7 @@ impl RuntimeSettings {
                 name: id,
                 model: self.codex.model.clone().unwrap_or_else(|| defaults.model.clone()),
                 api_key_environment_variable: self.codex.api_key_environment_variable.clone(),
-                supports_vision: false,
+                native_vision: false,
                 vision_base_url: None,
                 vision_model: None,
                 vision_api_key_environment_variable: None,
@@ -1420,7 +1416,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {{
             model: "z-ai/glm-5.3-flash".to_owned(),
             api_key_environment_variable: "OPENROUTER_API_KEY".to_owned(),
             enabled: false,
-            supports_vision: false,
+            native_vision: false,
             vision_base_url: None,
             vision_model: None,
             vision_api_key_environment_variable: None,
@@ -1432,6 +1428,50 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {{
         assert!(encoded.contains("vision_base_url"));
         assert!(!encoded.contains("secret-value"));
         assert!(!encoded.contains("api-key-value"));
+    }
+
+    #[test]
+    fn vision_settings_are_optional_and_survive_native_vision_round_trips() {
+        // A native-vision LLM needs no separate vision backend: the provider is
+        // valid without one, and previously stored values survive the round trip
+        // unchanged (grayed out in the UI, never dropped).
+        let native = LlmProviderSettings {
+            id: "native".to_owned(),
+            name: "Native multimodal".to_owned(),
+            base_url: "https://api.example.com/v1".to_owned(),
+            model: "multimodal-model".to_owned(),
+            api_key_environment_variable: "EXAMPLE_API_KEY".to_owned(),
+            native_vision: true,
+            vision_base_url: Some("https://vision.example.com/v1".to_owned()),
+            vision_model: Some("kept-vision-model".to_owned()),
+            vision_api_key_environment_variable: Some("VISION_API_KEY".to_owned()),
+            enabled: true,
+        };
+        let mut settings = RuntimeSettings::default();
+        settings.providers[0] = native.clone();
+        settings.default_provider_id = "native".to_owned();
+        settings.validate().expect("native vision without a separate backend stays valid");
+        let encoded = serde_json::to_string(&settings).expect("settings serialize");
+        let restored: RuntimeSettings = serde_json::from_str(&encoded).expect("settings parse");
+        assert!(restored.providers[0].native_vision);
+        assert_eq!(restored.providers[0].vision_model.as_deref(), Some("kept-vision-model"));
+        assert_eq!(
+            restored.providers[0].vision_base_url.as_deref(),
+            Some("https://vision.example.com/v1")
+        );
+
+        // A text-only provider without any vision configuration remains valid;
+        // image tasks report the missing backend when they are actually run.
+        let text_only = LlmProviderSettings {
+            vision_base_url: None,
+            vision_model: None,
+            vision_api_key_environment_variable: None,
+            ..LlmProviderSettings::default()
+        };
+        let mut settings = RuntimeSettings::default();
+        settings.providers[0] = text_only;
+        settings.default_provider_id = DEFAULT_PROVIDER_ID.to_owned();
+        settings.validate().expect("text-only provider without vision stays valid");
     }
 
     #[test]
