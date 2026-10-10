@@ -1,4 +1,4 @@
-//! Concrete one-task adapters. A new process owns each task and is always reaped.
+//! Concrete turn adapters. Each process is reaped; project session history can survive it.
 use crate::{
     CodexAppServerClient, RuntimeError, RuntimeSettings, ToolAuthorizationSettings,
     tools::{executable, invalid},
@@ -60,7 +60,7 @@ pub enum AgentKind {
 }
 
 /// Reported runtime counters. Absence is represented by `None`, never an estimated zero.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TaskTokenUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -68,8 +68,8 @@ pub struct TaskTokenUsage {
 
 impl TaskTokenUsage {
     pub(crate) fn from_codex_notification(value: &serde_json::Value) -> Option<Self> {
-        // Each task starts a fresh thread; total is cumulative. Repeated notifications
-        // replace the previous snapshot instead of being added (which double-counts).
+        // Totals are cumulative per thread. Repeated notifications replace the previous
+        // snapshot; persistent sessions subtract the saved baseline before reporting a turn.
         let total = value.pointer("/params/tokenUsage/total")?;
         Some(Self {
             input_tokens: total["inputTokens"].as_u64()?,
@@ -257,7 +257,95 @@ pub fn run_task_observed(
         cancel,
         on_delta,
         on_usage,
+        None,
+        crate::TURN_MAX_DURATION,
     )
+}
+
+/// Uses an application-owned persistent Codex home and resumes its saved thread.
+/// Credentials and MCP configuration are supplied afresh for each turn.
+/// # Errors
+/// Fails explicitly on corrupt/missing history or a changed provider/tool scope.
+#[allow(clippy::too_many_arguments)]
+pub fn run_session_observed(
+    settings: &RuntimeSettings,
+    grants: &ToolAuthorizationSettings,
+    prompt: &str,
+    image: Option<&std::path::Path>,
+    working_directory: &std::path::Path,
+    history_directory: &std::path::Path,
+    secrets: Option<&crate::secrets::SecretValues>,
+    cancel: &Cancellation,
+    on_delta: &mut dyn FnMut(crate::TurnDelta, &str),
+    on_usage: &mut dyn FnMut(TaskTokenUsage),
+) -> Result<String, RuntimeError> {
+    run_session_observed_within(
+        settings,
+        grants,
+        prompt,
+        image,
+        working_directory,
+        history_directory,
+        secrets,
+        cancel,
+        on_delta,
+        on_usage,
+        crate::TURN_MAX_DURATION,
+    )
+}
+
+/// [`run_session_observed`] with a caller-chosen upper bound for the turn, for short
+/// structured steps where a model that keeps reasoning without answering should fail fast
+/// with [`RuntimeError::TooLong`] instead of after [`crate::TURN_MAX_DURATION`].
+/// # Errors
+/// Same errors as `run_session_observed`.
+#[allow(clippy::too_many_arguments)]
+pub fn run_session_observed_within(
+    settings: &RuntimeSettings,
+    grants: &ToolAuthorizationSettings,
+    prompt: &str,
+    image: Option<&std::path::Path>,
+    working_directory: &std::path::Path,
+    history_directory: &std::path::Path,
+    secrets: Option<&crate::secrets::SecretValues>,
+    cancel: &Cancellation,
+    on_delta: &mut dyn FnMut(crate::TurnDelta, &str),
+    on_usage: &mut dyn FnMut(TaskTokenUsage),
+    max_turn: std::time::Duration,
+) -> Result<String, RuntimeError> {
+    if !working_directory.is_dir() {
+        return Err(invalid("项目工作目录不存在"));
+    }
+    run_task_in(
+        settings,
+        AgentKind::Codex,
+        grants,
+        prompt,
+        image,
+        Some(working_directory),
+        secrets,
+        cancel,
+        on_delta,
+        on_usage,
+        Some(history_directory),
+        max_turn,
+    )
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredThread {
+    schema_version: u32,
+    thread_id: String,
+    /// Only identifiers/settings, never resolved key values.
+    scope: serde_json::Value,
+    usage: TaskTokenUsage,
+}
+
+fn save_thread(path: &std::path::Path, state: &StoredThread) -> Result<(), RuntimeError> {
+    let temporary = path.with_extension("tmp");
+    fs::write(&temporary, serde_json::to_vec_pretty(state)?)?;
+    fs::rename(temporary, path)?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -272,6 +360,8 @@ fn run_task_in(
     cancel: &Cancellation,
     on_delta: &mut dyn FnMut(crate::TurnDelta, &str),
     on_usage: &mut dyn FnMut(TaskTokenUsage),
+    history_directory: Option<&std::path::Path>,
+    max_turn: std::time::Duration,
 ) -> Result<String, RuntimeError> {
     settings.validate()?;
     settings.catalog.validate_secret_references(secrets)?;
@@ -325,7 +415,16 @@ fn run_task_in(
             }
         }
     }
-    let environment = RunEnvironment::new(working_directory)?;
+    let environment = if let Some(home) = history_directory {
+        fs::create_dir_all(home)?;
+        RunEnvironment {
+            home: home.to_owned(),
+            current: working_directory.expect("session project root").to_owned(),
+            temporary: false,
+        }
+    } else {
+        RunEnvironment::new(working_directory)?
+    };
     let input = format!("{instructions}\n\n{prompt}");
     if kind == AgentKind::Codex {
         let mut inputs = vec![serde_json::json!({"type":"text","text":input})];
@@ -343,6 +442,7 @@ fn run_task_in(
             cancel,
             &mut |kind, delta| on_delta(kind, &redact(delta, &key, &servers, secrets)),
             on_usage,
+            max_turn,
         )
         .map(|output| redact(&output, &key, &servers, secrets));
     }
@@ -354,7 +454,7 @@ fn run_task_in(
     execute_cli(command, &environment, input, kind, cancel, &key, &servers, secrets, on_usage)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn run_codex(
     settings: &RuntimeSettings,
     provider: &crate::LlmProviderSettings,
@@ -366,6 +466,7 @@ fn run_codex(
     cancel: &Cancellation,
     on_delta: &mut dyn FnMut(crate::TurnDelta, &str),
     on_usage: &mut dyn FnMut(TaskTokenUsage),
+    max_turn: std::time::Duration,
 ) -> Result<String, RuntimeError> {
     let mut command = crate::app_server_command(&settings.codex, provider);
     restrict_environment(&mut command, &provider.api_key_environment_variable, servers, secrets);
@@ -421,11 +522,35 @@ fn run_codex(
     }
     let mut client =
         CodexAppServerClient::launch_command(command, &settings.codex.command, cancel.clone())?;
+    client.max_duration = max_turn;
     client.initialize()?;
-    let thread = client.start_thread(Some(&provider.model))?;
+    let binding_path = environment.home.join("circuitfabric-thread.json");
+    let scope = serde_json::json!({"provider": provider.id, "model": provider.model,
+        "baseUrl": provider.base_url, "grants": grants, "servers": servers});
+    let mut stored = if !environment.temporary && binding_path.exists() {
+        let saved: StoredThread = serde_json::from_slice(&fs::read(&binding_path)?)?;
+        if saved.schema_version != 1 || saved.scope != scope {
+            return Err(invalid("会话的 Provider 或工具授权已变化，请新建会话；旧历史保留"));
+        }
+        client.resume_thread(&saved.thread_id, &provider.model, &environment.current)?;
+        saved
+    } else {
+        StoredThread {
+            schema_version: 1,
+            thread_id: client.start_thread(Some(&provider.model))?,
+            scope,
+            usage: TaskTokenUsage::default(),
+        }
+    };
+    if !environment.temporary {
+        save_thread(&binding_path, &stored)?;
+    }
+    let baseline = stored.usage;
     let mut output = String::new();
-    client.run_turn_observed(
-        &thread,
+    let thread_id = stored.thread_id.clone();
+    let mut persistence_error = None;
+    let outcome = client.run_turn_observed(
+        &thread_id,
         input,
         |kind, delta| {
             if kind == crate::TurnDelta::Answer {
@@ -433,8 +558,23 @@ fn run_codex(
             }
             on_delta(kind, delta);
         },
-        on_usage,
-    )?;
+        |reported| {
+            on_usage(TaskTokenUsage {
+                input_tokens: reported.input_tokens.saturating_sub(baseline.input_tokens),
+                output_tokens: reported.output_tokens.saturating_sub(baseline.output_tokens),
+            });
+            stored.usage = reported;
+            if !environment.temporary
+                && let Err(error) = save_thread(&binding_path, &stored)
+            {
+                persistence_error = Some(error);
+            }
+        },
+    );
+    if let Some(error) = persistence_error {
+        return Err(error);
+    }
+    outcome?;
     Ok(output)
 }
 
@@ -718,6 +858,7 @@ static RUN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 struct RunEnvironment {
     home: PathBuf,
     current: PathBuf,
+    temporary: bool,
 }
 impl RunEnvironment {
     fn new(working_directory: Option<&std::path::Path>) -> Result<Self, RuntimeError> {
@@ -732,11 +873,14 @@ impl RunEnvironment {
         ));
         fs::create_dir(&home)?;
         let current = working_directory.map_or_else(|| home.clone(), std::path::Path::to_path_buf);
-        Ok(Self { home, current })
+        Ok(Self { home, current, temporary: true })
     }
 }
 impl Drop for RunEnvironment {
     fn drop(&mut self) {
+        if !self.temporary {
+            return;
+        }
         for _ in 0..20 {
             if fs::remove_dir_all(&self.home).is_ok() || !self.home.exists() {
                 break;
@@ -808,6 +952,96 @@ impl ProcessOwnership {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn persistent_threads_resume_after_process_exit_and_quota_failure_without_double_usage() {
+        let test_scope = RunEnvironment::new(None).unwrap();
+        let launcher = test_scope.home.join("mock.cmd");
+        fs::write(&launcher, "@powershell -NoProfile -NonInteractive -File \"%~dp0mock.ps1\"\r\n")
+            .unwrap();
+        fs::write(test_scope.home.join("mock.ps1"), r#"
+$ErrorActionPreference = 'Stop'
+$out = [Console]::Out
+$history = Join-Path $env:CODEX_HOME 'mock-history.json'
+$trace = Join-Path $env:CODEX_HOME 'mock-rpc.txt'
+while ($null -ne ($line = [Console]::In.ReadLine())) {
+  $m = $line | ConvertFrom-Json
+  Add-Content -LiteralPath $trace -Value $m.method
+  if ($m.method -eq 'initialize') { $out.WriteLine('{"id":' + $m.id + ',"result":{}}') }
+  elseif ($m.method -eq 'thread/start') {
+    '{"turns":0,"first":""}' | Set-Content -LiteralPath $history
+    $out.WriteLine('{"id":' + $m.id + ',"result":{"thread":{"id":"persistent-thread"}}}')
+  }
+  elseif ($m.method -eq 'thread/resume') {
+    if (!(Test-Path -LiteralPath $history)) { throw 'history missing' }
+    if ($m.params.threadId -ne 'persistent-thread' -or $m.params.sandbox -ne 'read-only') { throw 'wrong identity or scope' }
+    $out.WriteLine('{"id":' + $m.id + ',"result":{"thread":{"id":"persistent-thread"}}}')
+  }
+  elseif ($m.method -eq 'turn/start') {
+    $state = Get-Content -LiteralPath $history -Raw | ConvertFrom-Json
+    $state.turns += 1
+    if ($state.turns -eq 1) { $state.first = $m.params.input[0].text }
+    $state | ConvertTo-Json | Set-Content -LiteralPath $history
+    $out.WriteLine('{"id":' + $m.id + ',"result":{"turn":{"id":"turn"}}}')
+    $out.WriteLine('{"method":"thread/tokenUsage/updated","params":{"threadId":"persistent-thread","turnId":"turn","tokenUsage":{"total":{"inputTokens":' + ($state.turns * 10) + ',"outputTokens":' + ($state.turns * 2) + '}}}}')
+    if ($m.params.input[0].text -match 'quota') {
+      $out.WriteLine('{"method":"turn/completed","params":{"threadId":"persistent-thread","turn":{"id":"turn","status":"failed","error":{"message":"quota exhausted"}}}}')
+    } else {
+      $delta = @{method='item/agentMessage/delta';params=@{delta=$state.first}} | ConvertTo-Json -Compress -Depth 6
+      $out.WriteLine($delta)
+      $out.WriteLine('{"method":"turn/completed","params":{"threadId":"persistent-thread","turn":{"id":"turn","status":"completed"}}}')
+    }
+  }
+  $out.Flush()
+}
+"#).unwrap();
+        let mut settings = RuntimeSettings::default();
+        settings.codex.command = launcher.to_string_lossy().into_owned();
+        let secrets = crate::secrets::SecretValues::single(
+            &settings.providers[0].api_key_environment_variable,
+            "mock-key-value",
+        );
+        let home = test_scope.home.join("project/sessions/eda/s1/codex");
+        fs::create_dir_all(home.parent().unwrap()).unwrap();
+        let run = |prompt: &str, latest: &mut Option<TaskTokenUsage>| {
+            run_session_observed(
+                &settings,
+                &ToolAuthorizationSettings::default(),
+                prompt,
+                None,
+                &test_scope.home,
+                &home,
+                Some(&secrets),
+                &Cancellation::default(),
+                &mut |_, _| {},
+                &mut |value| *latest = Some(value),
+            )
+        };
+        let mut usage = None;
+        assert!(
+            run("remember first message", &mut usage).unwrap().contains("remember first message")
+        );
+        assert_eq!(usage, Some(TaskTokenUsage { input_tokens: 10, output_tokens: 2 }));
+        assert!(home.join("circuitfabric-thread.json").is_file());
+        assert!(run("quota", &mut usage).unwrap_err().to_string().contains("quota exhausted"));
+        assert_eq!(usage, Some(TaskTokenUsage { input_tokens: 10, output_tokens: 2 }));
+        assert!(run("continue", &mut usage).unwrap().contains("remember first message"));
+        assert_eq!(usage, Some(TaskTokenUsage { input_tokens: 10, output_tokens: 2 }));
+        let trace = fs::read_to_string(home.join("mock-rpc.txt")).unwrap();
+        assert_eq!(trace.matches("thread/start").count(), 1);
+        assert_eq!(trace.matches("thread/resume").count(), 2);
+        assert!(
+            !fs::read_to_string(home.join("circuitfabric-thread.json"))
+                .unwrap()
+                .contains("mock-key-value")
+        );
+        fs::write(home.join("circuitfabric-thread.json"), "{").unwrap();
+        assert!(
+            run("continue", &mut usage).is_err(),
+            "corruption must not start a fresh conversation"
+        );
+    }
+
     #[test]
     fn runtime_usage_uses_cumulative_snapshots_and_distinguishes_zero_from_missing() {
         use super::TaskTokenUsage;

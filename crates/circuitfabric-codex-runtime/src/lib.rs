@@ -295,8 +295,32 @@ pub enum RuntimeError {
     ProtocolJson(#[from] serde_json::Error),
     #[error("Codex App Server rejected `{method}`: {message}")]
     Rpc { method: String, message: String },
-    #[error("Codex App Server closed its output before answering `{method}`")]
-    Closed { method: String },
+    /// The process exited or closed stdout; `detail` carries its last stderr lines.
+    #[error("Codex 进程已退出或关闭了输出（等待 `{method}` 时）{detail}")]
+    Closed { method: String, detail: String },
+    /// The server sent nothing at all for `seconds`; the provider stream most likely hung.
+    #[error(
+        "Codex App Server {seconds} 秒内没有任何响应（等待 `{method}` 时），模型服务可能卡住了"
+    )]
+    Stalled { method: String, seconds: u64 },
+    /// The turn kept running past its upper bound ([`TURN_MAX_DURATION`] by default).
+    #[error("模型调用超过 {minutes} 分钟上限仍未完成（等待 `{method}` 时）")]
+    TooLong { method: String, minutes: u64 },
+}
+
+impl RuntimeError {
+    /// Whether the server went silent without failing; a fresh attempt usually succeeds.
+    #[must_use]
+    pub fn is_stalled(&self) -> bool {
+        matches!(self, Self::Stalled { .. })
+    }
+
+    /// Whether the turn hit its upper bound while still streaming, typically a model stuck
+    /// in reasoning; a fresh attempt usually behaves differently.
+    #[must_use]
+    pub fn is_too_long(&self) -> bool {
+        matches!(self, Self::TooLong { .. })
+    }
 }
 
 impl RuntimeSettings {
@@ -550,9 +574,41 @@ pub struct CodexAppServerClient {
     ownership: Option<execution::ProcessOwnership>,
     input: BufWriter<ChildStdin>,
     output: Receiver<Result<Value, String>>,
+    stderr: std::sync::Arc<std::sync::Mutex<StderrTail>>,
+    idle_timeout: Duration,
+    /// Upper bound for one turn; [`TURN_MAX_DURATION`] unless a caller narrows it.
+    pub(crate) max_duration: Duration,
     pending: VecDeque<Value>,
     next_request_id: u64,
     cancel: execution::Cancellation,
+}
+
+/// Bounded tail of the App Server's stderr, kept to explain an unexpected exit.
+#[derive(Debug, Default)]
+struct StderrTail {
+    lines: VecDeque<String>,
+    finished: bool,
+}
+
+const STDERR_TAIL_LINES: usize = 12;
+const STDERR_LINE_CHARS: usize = 300;
+const STDERR_DETAIL_CHARS: usize = 800;
+
+/// Masks credential-looking tokens: `Bearer …` values and long mixed letter/digit runs.
+fn redact_stderr_line(line: &str) -> String {
+    let mut bearer = false;
+    line.split(' ')
+        .map(|token| {
+            let secret = bearer
+                || (token.len() >= 24
+                    && token.chars().any(|ch| ch.is_ascii_digit())
+                    && token.chars().any(|ch| ch.is_ascii_alphabetic())
+                    && token.chars().all(|ch| ch.is_ascii_alphanumeric() || "-_=+".contains(ch)));
+            bearer = token.eq_ignore_ascii_case("bearer");
+            if secret { "[redacted]" } else { token }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 impl CodexAppServerClient {
@@ -581,12 +637,35 @@ impl CodexAppServerClient {
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|source| RuntimeError::Launch { command: name.to_owned(), source })?;
         let ownership = execution::ProcessOwnership::attach(&mut child)?;
         let input = child.stdin.take().ok_or(RuntimeError::MissingStream { stream: "stdin" })?;
         let output = child.stdout.take().ok_or(RuntimeError::MissingStream { stream: "stdout" })?;
+        let error_output =
+            child.stderr.take().ok_or(RuntimeError::MissingStream { stream: "stderr" })?;
+        let stderr = std::sync::Arc::new(std::sync::Mutex::new(StderrTail::default()));
+        let tail = std::sync::Arc::clone(&stderr);
+        // Always drained so a chatty process never blocks on a full pipe.
+        std::thread::spawn(move || {
+            for line in BufReader::new(error_output).lines() {
+                let Ok(line) = line else { break };
+                let line: String = line.trim().chars().take(STDERR_LINE_CHARS).collect();
+                if line.is_empty() {
+                    continue;
+                }
+                if let Ok(mut tail) = tail.lock() {
+                    if tail.lines.len() == STDERR_TAIL_LINES {
+                        tail.lines.pop_front();
+                    }
+                    tail.lines.push_back(redact_stderr_line(&line));
+                }
+            }
+            if let Ok(mut tail) = tail.lock() {
+                tail.finished = true;
+            }
+        });
 
         let (sender, output_messages) = mpsc::sync_channel(256);
         std::thread::spawn(move || {
@@ -604,10 +683,33 @@ impl CodexAppServerClient {
             ownership: Some(ownership),
             input: BufWriter::new(input),
             output: output_messages,
+            stderr,
+            idle_timeout: TURN_IDLE_TIMEOUT,
+            max_duration: TURN_MAX_DURATION,
             pending: VecDeque::new(),
             next_request_id: 1,
             cancel,
         })
+    }
+
+    /// The last stderr lines, formatted for an error message; empty when there were none.
+    /// Waits briefly for the stderr reader so lines written just before exit are included.
+    fn stderr_detail(&self) -> String {
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            let finished = self.stderr.lock().map_or(true, |tail| tail.finished);
+            if finished || Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let lines = self.stderr.lock().map(|tail| tail.lines.clone()).unwrap_or_default();
+        if lines.is_empty() {
+            return String::new();
+        }
+        let joined = lines.into_iter().collect::<Vec<_>>().join(" | ");
+        let start = joined.chars().count().saturating_sub(STDERR_DETAIL_CHARS);
+        format!("；最后的错误输出：{}", joined.chars().skip(start).collect::<String>())
     }
 
     /// Performs the mandatory App Server `initialize` / `initialized` handshake.
@@ -648,6 +750,28 @@ impl CodexAppServerClient {
         )
     }
 
+    /// Reload a persisted conversation with the current execution boundaries.
+    /// # Errors
+    /// Returns the server error when history is missing; never silently starts a new thread.
+    pub fn resume_thread(
+        &mut self,
+        thread_id: &str,
+        model: &str,
+        cwd: &std::path::Path,
+    ) -> Result<(), RuntimeError> {
+        let result = self.request(
+            "thread/resume",
+            &json!({
+                "threadId": thread_id, "model": model, "cwd": cwd,
+                "approvalPolicy": "never", "sandbox": "read-only",
+            }),
+        )?;
+        if result.pointer("/thread/id").and_then(Value::as_str) != Some(thread_id) {
+            return Err(tools::invalid("运行时恢复了不同的会话标识"));
+        }
+        Ok(())
+    }
+
     /// Starts a turn and forwards streamed agent-message deltas to the callback.
     ///
     /// # Errors
@@ -686,8 +810,8 @@ impl CodexAppServerClient {
 
     /// Run a turn, forwarding both the reasoning-summary stream and the answer stream.
     ///
-    /// The turn fails after [`TURN_IDLE_TIMEOUT`] without any server message, or after
-    /// [`TURN_MAX_DURATION`] in total; a long turn that keeps streaming is not cut off.
+    /// The turn fails after [`TURN_IDLE_TIMEOUT`] without any server message, or after its
+    /// upper bound ([`TURN_MAX_DURATION`] by default) in total, however steadily it streams.
     /// # Errors
     /// Returns transport errors, cancellations, timeouts and failed turn statuses.
     pub fn run_turn_streaming<F>(
@@ -728,12 +852,27 @@ impl CodexAppServerClient {
             .and_then(Value::as_str)
             .ok_or_else(|| tools::invalid("运行时未返回任务标识"))?
             .to_owned();
-        let hard_deadline = Instant::now() + TURN_MAX_DURATION;
-        let mut idle_deadline = Instant::now() + TURN_IDLE_TIMEOUT;
+        let idle_timeout = self.idle_timeout;
+        let max_duration = self.max_duration;
+        let hard_deadline = Instant::now() + max_duration;
+        let mut idle_deadline = Instant::now() + idle_timeout;
         let mut last_error_notification = None;
         loop {
-            let message = self.read_message("turn/completed", idle_deadline.min(hard_deadline))?;
-            idle_deadline = Instant::now() + TURN_IDLE_TIMEOUT;
+            let message = self
+                .read_message("turn/completed", idle_deadline.min(hard_deadline))
+                .map_err(|error| match error {
+                    RuntimeError::Stalled { method, .. } if Instant::now() >= hard_deadline => {
+                        RuntimeError::TooLong {
+                            method,
+                            minutes: max_duration.as_secs().div_ceil(60),
+                        }
+                    }
+                    RuntimeError::Stalled { method, .. } => {
+                        RuntimeError::Stalled { method, seconds: idle_timeout.as_secs() }
+                    }
+                    other => other,
+                })?;
+            idle_deadline = Instant::now() + idle_timeout;
             let method = message.get("method").and_then(Value::as_str);
             if method == Some("thread/tokenUsage/updated")
                 && message.pointer("/params/threadId").and_then(Value::as_str) == Some(thread_id)
@@ -826,9 +965,14 @@ impl CodexAppServerClient {
 
     fn read_message(&mut self, method: &str, deadline: Instant) -> Result<Value, RuntimeError> {
         loop {
-            if Instant::now() >= deadline || self.cancel.0.load(std::sync::atomic::Ordering::SeqCst)
-            {
-                return Err(tools::invalid("任务已取消或超时"));
+            if self.cancel.0.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(RuntimeError::Rpc {
+                    method: method.to_owned(),
+                    message: "任务已取消".to_owned(),
+                });
+            }
+            if Instant::now() >= deadline {
+                return Err(RuntimeError::Stalled { method: method.to_owned(), seconds: 0 });
             }
             let message = match self.pending.pop_front() {
                 Some(message) => message,
@@ -859,10 +1003,16 @@ impl CodexAppServerClient {
                     });
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) if Instant::now() < deadline => {}
-                Err(_) => {
-                    return Err(RuntimeError::Rpc {
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(RuntimeError::Stalled {
                         method: method.to_owned(),
-                        message: "运行时连接关闭或响应超时".to_owned(),
+                        seconds: timeout.as_secs(),
+                    });
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(RuntimeError::Closed {
+                        method: method.to_owned(),
+                        detail: self.stderr_detail(),
                     });
                 }
             }
@@ -1084,6 +1234,104 @@ fn describe_rpc_error(error: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fake App Server that answers the handshake, starts a turn, streams one reasoning
+    /// delta and then runs `after_delta` (PowerShell) instead of completing the turn.
+    #[cfg(windows)]
+    fn fake_app_server_turn(after_delta: &str) -> Result<Vec<String>, RuntimeError> {
+        fake_app_server_turn_within(after_delta, TURN_MAX_DURATION)
+    }
+
+    #[cfg(windows)]
+    fn fake_app_server_turn_within(
+        after_delta: &str,
+        max_duration: Duration,
+    ) -> Result<Vec<String>, RuntimeError> {
+        let script = format!(
+            r#"$out = [Console]::Out
+while ($null -ne ($line = [Console]::In.ReadLine())) {{
+  $m = $line | ConvertFrom-Json
+  if ($m.method -eq 'initialize') {{ $out.WriteLine('{{"id":' + $m.id + ',"result":{{}}}}') }}
+  elseif ($m.method -eq 'thread/start') {{ $out.WriteLine('{{"id":' + $m.id + ',"result":{{"thread":{{"id":"t1"}}}}}}') }}
+  elseif ($m.method -eq 'turn/start') {{
+    $out.WriteLine('{{"id":' + $m.id + ',"result":{{"turn":{{"id":"u1"}}}}}}')
+    $out.WriteLine('{{"method":"item/reasoning/textDelta","params":{{"delta":"thinking"}}}}')
+    $out.Flush()
+    {after_delta}
+  }}
+  $out.Flush()
+}}"#
+        );
+        let mut command = Command::new("powershell");
+        command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+        let mut client = CodexAppServerClient::launch_command(
+            command,
+            "powershell",
+            execution::Cancellation::default(),
+        )?;
+        client.idle_timeout = Duration::from_secs(2);
+        client.max_duration = max_duration;
+        client.initialize()?;
+        let thread = client.start_thread(None)?;
+        let mut deltas = Vec::new();
+        client.run_turn_streaming(&thread, &[json!({"type":"text","text":"hi"})], |_, delta| {
+            deltas.push(delta.to_owned());
+        })?;
+        Ok(deltas)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_silent_turn_reports_a_stall_not_a_closed_connection() {
+        let started = Instant::now();
+        let error = fake_app_server_turn("Start-Sleep -Seconds 30").expect_err("turn must stall");
+        assert!(error.is_stalled(), "{error}");
+        assert!(error.to_string().contains("2 秒内没有任何响应"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(20), "stall detected by the idle timeout");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn endless_reasoning_hits_the_callers_turn_limit() {
+        let started = Instant::now();
+        let error = fake_app_server_turn_within(
+            "while ($true) { $out.WriteLine('{\"method\":\"item/reasoning/textDelta\",\"params\":{\"delta\":\"...\"}}'); $out.Flush(); Start-Sleep -Milliseconds 300 }",
+            Duration::from_secs(4),
+        )
+        .expect_err("a turn that never answers must end");
+        assert!(error.is_too_long() && !error.is_stalled(), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(20), "ended by the 4 s limit");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_exiting_server_reports_its_last_stderr_lines() {
+        let error = fake_app_server_turn(
+            "[Console]::Error.WriteLine('stream disconnected: 502 Bad Gateway, key sk1234567890abcdefghijklmnop'); exit 3",
+        )
+        .expect_err("server exits mid-turn");
+        assert!(matches!(error, RuntimeError::Closed { .. }), "{error}");
+        let message = error.to_string();
+        assert!(message.contains("502 Bad Gateway"), "{message}");
+        assert!(
+            !message.contains("sk1234567890"),
+            "credential-looking tokens are masked: {message}"
+        );
+        assert!(!error.is_stalled());
+    }
+
+    #[test]
+    fn stderr_redaction_masks_bearer_values_and_long_tokens() {
+        assert_eq!(
+            redact_stderr_line("Authorization: Bearer abc.def error 401 for model gpt-4o"),
+            "Authorization: Bearer [redacted] error 401 for model gpt-4o"
+        );
+        assert_eq!(redact_stderr_line("key=AbC123dEf456GhI789jKl012"), "[redacted]");
+        assert_eq!(
+            redact_stderr_line("C:\\Users\\Ferren\\.codex\\config.toml not found"),
+            "C:\\Users\\Ferren\\.codex\\config.toml not found"
+        );
+    }
 
     #[test]
     fn failed_turn_reports_server_error_message_and_info() {
