@@ -3,7 +3,7 @@
   "uuid": "d08e836c5c864f1fad566fbf4bcd1684",
   "displayName": "CircuitFabric",
   "description": "CircuitFabric assistant bridge for local Codex App Server sessions.",
-  "version": "0.2.10",
+  "version": "0.2.11",
   "publisher": "CircuitFabric",
   "engines": { "eda": "^3.2.0" },
   "license": "MIT",

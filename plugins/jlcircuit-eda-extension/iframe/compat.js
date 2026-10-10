@@ -5,6 +5,7 @@ try {
   var cfReady = false;
   var cfProject = "";
   var cfMessage = null;
+  var cfBusy = false;
   var cfSession = "compat-" + new Date().getTime() + "-" + Math.floor(Math.random() * 1000000);
   var projectInput = document.getElementById("project");
   var bridgeInput = document.getElementById("bridge");
@@ -15,6 +16,8 @@ try {
   var projectList = document.createElement("div");
   var projectHint = document.createElement("p");
   var listButton = document.createElement("button");
+  var sessionList = document.createElement("div");
+  var sessionButton = document.createElement("button");
 
   projectList.id = "circuitfabric-project-list";
   projectList.style.margin = "6px 0";
@@ -31,14 +34,22 @@ try {
   settings.appendChild(listButton);
   settings.appendChild(projectList);
   settings.appendChild(projectHint);
+  sessionList.id = "circuitfabric-eda-sessions";
+  sessionButton.type = "button";
+  sessionButton.className = "secondary";
+  sessionButton.textContent = "刷新 EDA 会话";
+  settings.appendChild(sessionButton);
+  settings.appendChild(sessionList);
 
   function setConnection(kind, text) {
     document.getElementById("dot").className = "dot " + kind;
     document.getElementById("connection").textContent = text;
   }
   function setControls() {
-    sendButton.disabled = !cfReady || !cfProject;
-    listButton.disabled = !cfReady;
+    sendButton.disabled = !cfReady || !cfProject || cfBusy;
+    listButton.disabled = !cfReady || cfBusy;
+    sessionButton.disabled = !cfReady || !cfProject || cfBusy;
+    document.getElementById("clear").disabled = cfBusy;
   }
   function addMessage(role, text) {
     var welcome = document.getElementById("welcome");
@@ -62,6 +73,7 @@ try {
   }
   function clearProjects() {
     projectList.innerHTML = "";
+    sessionList.innerHTML = "";
     cfProject = "";
     projectInput.value = "";
     setControls();
@@ -73,12 +85,45 @@ try {
     cfSocket.send(JSON.stringify({type:"list_projects"}));
   }
   function chooseProject(id, label) {
-    if (!cfSocket || cfSocket.readyState !== 1) return;
+    if (cfBusy || !cfSocket || cfSocket.readyState !== 1) return;
     cfProject = "";
+    sessionList.innerHTML = "";
     projectInput.value = label;
     projectHint.textContent = "正在选择项目…";
     setControls();
     cfSocket.send(JSON.stringify({type:"select_project",projectId:id}));
+  }
+  function newSession() {
+    if (cfBusy) return;
+    cfSession = "compat-" + new Date().getTime() + "-" + Math.floor(Math.random() * 1000000);
+    cfMessage = null;
+    document.getElementById("session").textContent = "当前会话：" + cfSession;
+    var conversation = document.getElementById("conversation");
+    var welcome = document.getElementById("welcome");
+    conversation.innerHTML = "";
+    conversation.appendChild(welcome);
+    welcome.style.display = "";
+  }
+  function requestSessions() {
+    if (cfReady && cfProject && !cfBusy) cfSocket.send(JSON.stringify({type:"list_sessions"}));
+  }
+  function renderSessions(sessions) {
+    sessionList.innerHTML = "";
+    var title = document.createElement("p");
+    title.className = "hint";
+    title.textContent = "当前项目的 EDA 会话（选择记录后可继续发送）：";
+    sessionList.appendChild(title);
+    (sessions || []).forEach(function (session) {
+      var button = document.createElement("button");
+      button.type = "button";
+      button.className = "secondary";
+      button.textContent = session.startedAt + " · " + session.status + " · " + session.sessionId.slice(0, 12);
+      button.onclick = function () {
+        if (cfBusy) return;
+        cfSocket.send(JSON.stringify({type:"load_session",sessionId:session.sessionId}));
+      };
+      sessionList.appendChild(button);
+    });
   }
   function renderProjects(projects) {
     var i, project, label, button;
@@ -138,17 +183,33 @@ try {
         projectInput.value = cfProject;
         projectHint.textContent = "已选择项目：" + cfProject;
         setControls();
+        newSession();
+        requestSessions();
+      } else if (message.type === "sessions" && message.projectId === cfProject) {
+        renderSessions(message.sessions);
+      } else if (message.type === "session_loaded" && message.projectId === cfProject) {
+        if (cfBusy) return;
+        newSession();
+        cfSession = message.sessionId;
+        document.getElementById("session").textContent = "当前会话：" + cfSession;
+        addMessage("assistant", message.body || "此会话尚无已保存消息。");
+        document.getElementById("livePhase").textContent = "历史已加载；输入消息后继续此会话";
       } else if (message.type === "chat_started") {
         document.getElementById("livePhase").textContent = "Codex 正在处理请求…";
       } else if (message.type === "chat_delta") {
         if (!cfMessage) cfMessage = addMessage("assistant", "");
         cfMessage.textContent += message.delta || "";
       } else if (message.type === "chat_completed") {
+        cfBusy = false;
+        setControls();
         document.getElementById("live").className = "live done";
         document.getElementById("liveState").textContent = "当前状态：执行完成";
         document.getElementById("livePhase").textContent = "最近一次请求已完成";
         cfMessage = null;
+        requestSessions();
       } else if (message.type === "error") {
+        cfBusy = false;
+        setControls();
         detail = message.message || "Bridge 请求失败";
         if (message.requestType === "select_project") {
           cfProject = "";
@@ -172,6 +233,7 @@ try {
     ws.onclose = function () {
       if (cfSocket === ws) {
         cfReady = false;
+        cfBusy = false;
         cfProject = "";
         setControls();
         setConnection("", "已断开");
@@ -187,7 +249,9 @@ try {
   }
   function send() {
     var text = instruction.value.replace(/^\s+|\s+$/g, "");
-    if (!text || !cfReady || !cfProject || !cfSocket || cfSocket.readyState !== 1) return;
+    if (!text || cfBusy || !cfReady || !cfProject || !cfSocket || cfSocket.readyState !== 1) return;
+    cfBusy = true;
+    setControls();
     document.getElementById("live").className = "live running";
     document.getElementById("liveState").textContent = "当前状态：执行中";
     document.getElementById("livePhase").textContent = "Codex 正在处理请求…";
@@ -196,6 +260,8 @@ try {
     cfSocket.send(JSON.stringify({type:"chat",sessionId:cfSession,text:text}));
   }
   listButton.onclick = requestProjects;
+  sessionButton.onclick = requestSessions;
+  document.getElementById("clear").onclick = newSession;
   refreshButton.onclick = reconnect;
   sendButton.onclick = send;
   bridgeInput.onchange = reconnect;

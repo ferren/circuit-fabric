@@ -1,5 +1,5 @@
 param(
-    [string]$OutputPath = "artifacts/circuitfabric-jlc-eda-extension_v0.2.10.eext"
+    [string]$OutputPath = "artifacts/circuitfabric-jlc-eda-extension_v0.2.11.eext"
 )
 
 $ErrorActionPreference = "Stop"

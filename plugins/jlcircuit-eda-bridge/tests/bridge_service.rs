@@ -208,4 +208,46 @@ fn verify_project_selection(address: &str, dir: &Path) {
         exchange(json!({"type":"select_project","projectId":"second-project"}))["type"],
         "project_selected"
     );
+    // Histories are served from the selected project and only the EDA category.
+    let project_root = dir.join("project-root");
+    std::fs::create_dir_all(&project_root).unwrap();
+    let storage = circuitfabric_project::ProjectStorage::create(
+        &project_root,
+        circuitfabric_contracts::Project {
+            id: "second-project".into(),
+            name: "Second".into(),
+            description: None,
+        },
+    )
+    .unwrap();
+    for (id, category) in [
+        ("eda-history", circuitfabric_project::SessionCategory::Eda),
+        ("datasheet-history", circuitfabric_project::SessionCategory::Datasheet),
+    ] {
+        storage
+            .start_categorized_session(
+                circuitfabric_project::SessionSeed {
+                    session_id: id.into(),
+                    runtime_profile_id: "p".into(),
+                    backend_id: Some("codex".into()),
+                },
+                category,
+                None,
+            )
+            .unwrap();
+    }
+    let sessions = exchange(json!({"type":"list_sessions"}));
+    assert_eq!(sessions["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(sessions["sessions"][0]["sessionId"], "eda-history");
+    assert_eq!(
+        exchange(json!({"type":"load_session","sessionId":"eda-history"}))["type"],
+        "session_loaded"
+    );
+    let rejected = exchange(json!({"type":"load_session","sessionId":"datasheet-history"}));
+    assert_eq!(rejected["type"], "error");
+    assert!(rejected["message"].as_str().unwrap().contains("EDA"));
+    assert_eq!(
+        exchange(json!({"type":"load_session","sessionId":"../../outside"}))["type"],
+        "error"
+    );
 }

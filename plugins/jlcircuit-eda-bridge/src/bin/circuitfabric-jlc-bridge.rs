@@ -11,7 +11,6 @@
 )]
 
 use std::{
-    collections::BTreeMap,
     env,
     io::{self, Read, Write},
     net::{TcpListener, TcpStream},
@@ -20,10 +19,13 @@ use std::{
 
 use circuitfabric_codex_runtime::{
     RuntimeSettings,
-    execution::{AgentKind, Cancellation, run_task},
+    execution::{AgentKind, Cancellation, run_session_observed},
 };
 use circuitfabric_plugin_api::EdaBridge as _;
-use circuitfabric_project::{ProjectRegistry, ProjectStorage};
+use circuitfabric_project::{
+    ProjectRegistry, ProjectStorage, SessionActor, SessionCategory, SessionEvent, SessionEventKind,
+    SessionSeed, SessionStatus, SessionUsage,
+};
 use serde_json::{Value, json};
 
 const BRIDGE_PROTOCOL_VERSION: u64 = 1;
@@ -56,8 +58,6 @@ fn main() -> Result<(), String> {
 #[allow(clippy::too_many_lines)]
 fn serve_connection(mut stream: TcpStream, config_path: &std::path::Path) -> Result<(), String> {
     websocket_handshake(&mut stream)?;
-    let mut threads = BTreeMap::<String, String>::new();
-    let mut previous_snapshot = None;
     let mut project_id: Option<String> = None;
 
     while let Some(raw) = read_text_frame(&mut stream)? {
@@ -70,8 +70,6 @@ fn serve_connection(mut stream: TcpStream, config_path: &std::path::Path) -> Res
                     .is_none_or(|id| id.trim().is_empty())
                 {
                     project_id = None;
-                    threads.clear();
-                    previous_snapshot = None;
                     send_json(
                         &mut stream,
                         json!({
@@ -82,15 +80,7 @@ fn serve_connection(mut stream: TcpStream, config_path: &std::path::Path) -> Res
                     continue;
                 }
                 // Keep legacy hello-with-project clients compatible.
-                select_project(
-                    &mut stream,
-                    config_path,
-                    &message,
-                    &mut project_id,
-                    &mut threads,
-                    &mut previous_snapshot,
-                    "hello_ack",
-                )?;
+                select_project(&mut stream, config_path, &message, &mut project_id, "hello_ack")?;
             }
             Some("list_projects") => {
                 match ProjectRegistry::load_or_default(config_path.with_file_name("projects.json"))
@@ -118,8 +108,6 @@ fn serve_connection(mut stream: TcpStream, config_path: &std::path::Path) -> Res
                     config_path,
                     &message,
                     &mut project_id,
-                    &mut threads,
-                    &mut previous_snapshot,
                     "project_selected",
                 )?;
             }
@@ -149,6 +137,9 @@ fn serve_connection(mut stream: TcpStream, config_path: &std::path::Path) -> Res
                         .map_err(|e| e.to_string())?;
                 let root = registry.root_for(project_id).ok_or_else(|| "项目未注册".to_owned())?;
                 let storage = ProjectStorage::open(root).map_err(|e| e.to_string())?;
+                if storage.manifest().project.id != project_id {
+                    return Err("项目注册信息与项目目录不匹配".into());
+                }
                 let project_snapshot =
                     std::fs::read(storage.configuration_path()).map_err(|e| e.to_string())?;
                 let configuration = storage.load_configuration().map_err(|e| e.to_string())?;
@@ -183,15 +174,44 @@ fn serve_connection(mut stream: TcpStream, config_path: &std::path::Path) -> Res
                 {
                     return Err("配置或授权已变化，请重试任务".into());
                 }
-                if previous_snapshot.as_ref() != Some(&snapshots) {
-                    threads.clear();
-                }
-                previous_snapshot = Some(snapshots.clone());
-                let previous = threads.get(&thread_id).cloned().unwrap_or_default();
-                let prompt = format!("{previous}\n\nUser: {prompt}");
                 if prompt.len() > 256 * 1024 {
                     return Err("会话上下文过长，请新建会话".to_owned());
                 }
+                let provider = circuitfabric_codex_runtime::execution::selected_provider(
+                    &settings,
+                    AgentKind::Codex,
+                )
+                .ok_or("Codex Provider 不可用")?;
+                let existing = match storage.load_session(session_id) {
+                    Ok(replay) if replay.metadata.category == SessionCategory::Eda => {
+                        replay.metadata
+                    }
+                    Ok(_) => return Err("此会话不属于 EDA 类别".into()),
+                    Err(circuitfabric_project::ProjectStorageError::SessionNotFound { .. }) => {
+                        storage
+                            .start_categorized_session(
+                                SessionSeed {
+                                    session_id: session_id.into(),
+                                    runtime_profile_id: provider.id.clone(),
+                                    backend_id: Some("codex".into()),
+                                },
+                                SessionCategory::Eda,
+                                None,
+                            )
+                            .map_err(|error| error.to_string())?
+                    }
+                    Err(error) => return Err(error.to_string()),
+                };
+                storage.resume_session(session_id).map_err(|error| error.to_string())?;
+                let history = storage
+                    .session_runtime_directory(session_id)
+                    .map_err(|error| error.to_string())?;
+                append_event(
+                    &storage,
+                    session_id,
+                    SessionEventKind::Turn { actor: SessionActor::User, message: text.into() },
+                )?;
+                let mut usage = None;
                 let result = std::thread::scope(|scope| {
                     scope.spawn(|| {
                         while !done.load(std::sync::atomic::Ordering::SeqCst) {
@@ -204,19 +224,76 @@ fn serve_connection(mut stream: TcpStream, config_path: &std::path::Path) -> Res
                             std::thread::sleep(std::time::Duration::from_millis(50));
                         }
                     });
-                    let result = run_task(&settings, AgentKind::Codex, &grants, &prompt, &cancel);
+                    let result = run_session_observed(
+                        &settings,
+                        &grants,
+                        &prompt,
+                        None,
+                        storage.root(),
+                        &history,
+                        None,
+                        &cancel,
+                        &mut |_, _| {},
+                        &mut |reported| usage = Some(reported),
+                    );
                     done.store(true, std::sync::atomic::Ordering::SeqCst);
                     result
                 });
+                if let Some(reported) = usage {
+                    append_event(
+                        &storage,
+                        session_id,
+                        SessionEventKind::UsageRecorded {
+                            usage: SessionUsage {
+                                input_tokens: reported.input_tokens,
+                                output_tokens: reported.output_tokens,
+                            },
+                        },
+                    )?;
+                }
+                let total = SessionUsage {
+                    input_tokens: existing
+                        .usage
+                        .input_tokens
+                        .saturating_add(usage.map_or(0, |value| value.input_tokens)),
+                    output_tokens: existing
+                        .usage
+                        .output_tokens
+                        .saturating_add(usage.map_or(0, |value| value.output_tokens)),
+                };
+                storage
+                    .complete_session(
+                        session_id,
+                        total,
+                        existing.citations,
+                        if result.is_ok() {
+                            SessionStatus::Completed
+                        } else {
+                            SessionStatus::Failed
+                        },
+                    )
+                    .map_err(|error| error.to_string())?;
                 match result {
                     Ok(output) => {
-                        threads.insert(thread_id, format!("{prompt}\n\nAssistant: {output}"));
+                        append_event(
+                            &storage,
+                            session_id,
+                            SessionEventKind::Turn {
+                                actor: SessionActor::Agent,
+                                message: output.clone(),
+                            },
+                        )?;
                         send_json(
                             &mut stream,
                             json!({"type":"chat_delta","sessionId":session_id,"delta":output}),
                         )?;
                     }
                     Err(error) => {
+                        append_event(
+                            &storage,
+                            session_id,
+                            SessionEventKind::Note { text: error.to_string() },
+                        )?;
                         send_json(
                             &mut stream,
                             json!({"type":"error","sessionId":session_id,"message":error.to_string()}),
@@ -228,6 +305,39 @@ fn serve_connection(mut stream: TcpStream, config_path: &std::path::Path) -> Res
                     &mut stream,
                     json!({ "type": "chat_completed", "sessionId": session_id }),
                 )?;
+            }
+            Some("list_sessions" | "load_session") => {
+                let response = (|| -> Result<Value, String> {
+                    let id = project_id.as_deref().ok_or("请先选择项目")?;
+                    let registry = ProjectRegistry::load_or_default(
+                        config_path.with_file_name("projects.json"),
+                    )
+                    .map_err(|error| error.to_string())?;
+                    let root = registry.root_for(id).ok_or("项目未注册")?;
+                    let storage = ProjectStorage::open(root).map_err(|error| error.to_string())?;
+                    if storage.manifest().project.id != id {
+                        return Err("项目注册信息与目录不匹配".into());
+                    }
+                    if message["type"] == "load_session" {
+                        let session_id = message["sessionId"].as_str().ok_or("缺少会话标识")?;
+                        let replay =
+                            storage.load_session(session_id).map_err(|error| error.to_string())?;
+                        if replay.metadata.category != SessionCategory::Eda {
+                            return Err("此会话不属于 EDA 类别".into());
+                        }
+                        Ok(
+                            json!({"type":"session_loaded","projectId":id,"sessionId":session_id,"body":replay.body,"status":replay.metadata.status.as_str()}),
+                        )
+                    } else {
+                        let listing = storage
+                            .list_sessions_for(SessionCategory::Eda, None)
+                            .map_err(|error| error.to_string())?;
+                        let sessions = listing.sessions.iter().map(|row| json!({"sessionId":row.metadata.session_id,
+                            "startedAt":circuitfabric_project::rfc3339(row.metadata.started_at_unix_seconds),"status":row.metadata.status.as_str()})).collect::<Vec<_>>();
+                        Ok(json!({"type":"sessions","projectId":id,"sessions":sessions}))
+                    }
+                })();
+                send_json(&mut stream, response.unwrap_or_else(|error| json!({"type":"error","requestType":message["type"],"message":error})))?;
             }
             Some("ping") => send_json(&mut stream, json!({ "type": "pong" }))?,
             Some("status") => {
@@ -266,19 +376,29 @@ fn serve_connection(mut stream: TcpStream, config_path: &std::path::Path) -> Res
     Ok(())
 }
 
+fn append_event(
+    storage: &ProjectStorage,
+    session_id: &str,
+    kind: SessionEventKind,
+) -> Result<(), String> {
+    let timestamp_unix_seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    storage
+        .append_session_event(session_id, &SessionEvent { timestamp_unix_seconds, kind })
+        .map_err(|error| error.to_string())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn select_project(
     stream: &mut TcpStream,
     config_path: &std::path::Path,
     message: &Value,
     project_id: &mut Option<String>,
-    threads: &mut BTreeMap<String, String>,
-    previous_snapshot: &mut Option<Vec<Vec<u8>>>,
     ack_type: &str,
 ) -> Result<(), String> {
     *project_id = None;
-    threads.clear();
-    *previous_snapshot = None;
     let Some(requested_project) =
         message.get("projectId").and_then(Value::as_str).filter(|value| !value.trim().is_empty())
     else {
