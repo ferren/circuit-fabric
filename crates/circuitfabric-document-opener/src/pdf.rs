@@ -41,7 +41,7 @@ impl DocumentOpener for PdfOpener {
 
 /// The fallback view: page-wise text extraction.
 fn open_text(request: &DocumentOpenerRequest) -> DocumentOpenerOutcome {
-    let extracted = match pdf_extract::extract_text_from_mem_by_pages(request.managed_copy.data()) {
+    let extracted = match extract_pdf_text_pages(request.managed_copy.data()) {
         Ok(pages) => pages,
         Err(error) => {
             return DocumentOpenerOutcome::Failed {
@@ -150,6 +150,101 @@ pub fn pdf_locate_highlight(
     terms: &[String],
 ) -> Option<Result<(u32, Vec<crate::PdfHighlightRect>), String>> {
     raster::with_pdfium(|pdfium| raster::locate_highlight(pdfium, data, preferred, terms))
+}
+
+/// Plain text of the given 0-based pages (all pages when `None`) from pdfium's text layer,
+/// one string per page with lines separated by `\n`. `None` when pdfium is unavailable.
+#[cfg(feature = "raster-pdf")]
+fn pdfium_text_pages(data: &[u8], only: Option<&[usize]>) -> Option<Result<Vec<String>, String>> {
+    raster::with_pdfium(|pdfium| {
+        let document = pdfium
+            .load_pdf_from_byte_slice(data, None)
+            .map_err(|error| format!("the PDF could not be parsed: {error}"))?;
+        let pages = document.pages();
+        let indices: Vec<usize> =
+            only.map_or_else(|| (0..usize::from(pages.len())).collect(), <[usize]>::to_vec);
+        indices
+            .into_iter()
+            .map(|index| {
+                let index = u16::try_from(index).map_err(|error| error.to_string())?;
+                let page = pages.get(index).map_err(|error| error.to_string())?;
+                let text = page.text().map_err(|error| error.to_string())?;
+                Ok(text.all().replace("\r\n", "\n").replace('\r', "\n"))
+            })
+            .collect()
+    })
+}
+
+/// Pages compared between the two extractors before trusting `pdf-extract`.
+#[cfg(feature = "raster-pdf")]
+const TEXT_QUALITY_SAMPLE_PAGES: usize = 12;
+
+/// Whether `pdf-extract` silently lost glyphs: it drops characters whose font lacks a
+/// usable `ToUnicode` map (common for CJK fonts in Chinese datasheets) while still
+/// returning the Latin text, so the output looks fine but misses headings and table cells.
+/// Compares non-whitespace character counts on evenly spread sample pages against pdfium.
+#[cfg(feature = "raster-pdf")]
+fn primary_text_is_lossy(data: &[u8], primary: &[String]) -> bool {
+    let count = primary.len();
+    let samples = count.min(TEXT_QUALITY_SAMPLE_PAGES);
+    if samples == 0 {
+        return false;
+    }
+    let indices: Vec<usize> = (0..samples).map(|sample| sample * count / samples).collect();
+    let Some(Ok(reference)) = pdfium_text_pages(data, Some(&indices)) else {
+        return false;
+    };
+    let visible = |text: &str| text.chars().filter(|ch| !ch.is_whitespace()).count();
+    let primary_chars: usize = indices.iter().map(|&index| visible(&primary[index])).sum();
+    let reference_chars: usize = reference.iter().map(|page| visible(page)).sum();
+    reference_chars > primary_chars + primary_chars / 4 + 200
+}
+
+/// Page-wise PDF text for indexing, evidence checks and datasheet extraction.
+///
+/// `pdf-extract` is tried first because its layout is what existing evidence was verified
+/// against. It panics or fails on some malformed fonts and `CMaps` (e.g. a `ToUnicode`
+/// stream with trailing binary bytes, or an unparsable Type1 encoding), some files come
+/// out blank, and some silently lose most glyphs (see [`primary_text_is_lossy`]); those
+/// fall back to pdfium's text layer, which the preview already trusts. The panic is
+/// contained here because unwinding out of a GPUI background task aborts the whole
+/// process on Windows. The choice depends only on the bytes, so every caller sees the
+/// same text for the same document.
+///
+/// # Errors
+///
+/// Returns an error when neither extractor yields text.
+pub fn extract_pdf_text_pages(data: &[u8]) -> Result<Vec<String>, String> {
+    let primary = std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem_by_pages(data))
+        .map_err(|_| "the text parser rejected a malformed font or text map".to_owned())
+        .and_then(|result| result.map_err(|error| error.to_string()));
+    let primary_error = match primary {
+        Ok(pages) if pages.iter().any(|page| !page.trim().is_empty()) => {
+            #[cfg(feature = "raster-pdf")]
+            if primary_text_is_lossy(data, &pages)
+                && let Some(Ok(fallback)) = pdfium_text_pages(data, None)
+                && fallback.iter().any(|page| !page.trim().is_empty())
+            {
+                return Ok(fallback);
+            }
+            return Ok(pages);
+        }
+        Ok(_) => "no readable text".to_owned(),
+        Err(error) => error,
+    };
+    #[cfg(feature = "raster-pdf")]
+    if let Some(fallback) = pdfium_text_pages(data, None) {
+        return match fallback {
+            Ok(pages) if pages.iter().any(|page| !page.trim().is_empty()) => Ok(pages),
+            Ok(_) => {
+                Err(format!("PDF text extraction failed: {primary_error}; pdfium found no text"))
+            }
+            Err(error) => {
+                Err(format!("PDF text extraction failed: {primary_error}; pdfium: {error}"))
+            }
+        };
+    }
+    Err(format!("PDF text extraction failed: {primary_error}"))
 }
 
 /// Positioned text lines for the datasheet extractor; `None` when pdfium is unavailable.

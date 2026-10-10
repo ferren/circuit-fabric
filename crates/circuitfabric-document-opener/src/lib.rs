@@ -42,13 +42,14 @@ mod pdf_selection;
 mod word;
 
 pub use datasheet::{
-    extract_datasheet, extract_datasheet_by_category, extract_datasheet_with_agent,
-    extract_datasheet_with_agent_with_pages,
+    NO_EVIDENCE_ROWS, NOT_A_DATASHEET, datasheet_sections_found, extract_datasheet,
+    extract_datasheet_by_category, extract_datasheet_by_category_with_pages,
+    extract_datasheet_with_agent, extract_datasheet_with_agent_with_pages,
 };
 
 pub use excel::ExcelOpener;
 pub use markdown::MarkdownOpener;
-pub use pdf::PdfOpener;
+pub use pdf::{PdfOpener, extract_pdf_text_pages};
 #[cfg(feature = "raster-pdf")]
 pub use pdf::{
     pdf_highlight_regions, pdf_locate_highlight, pdf_page_sizes, pdf_page_text, render_pdf_pages,
