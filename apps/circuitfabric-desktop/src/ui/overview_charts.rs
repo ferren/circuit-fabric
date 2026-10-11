@@ -3,7 +3,7 @@ use super::*;
 use crate::application::overview::OverviewModel;
 use gpui_component::{
     chart::PieChart,
-    plot::{Grid, StrokeStyle, shape::Line},
+    plot::{Curve, Grid, shape::Line},
 };
 
 pub(super) const FACT_COLORS: [u32; 4] = [0x0016_a34a, 0x00b9_1c1c, 0x00b4_5309, 0x0047_5563];
@@ -193,7 +193,9 @@ pub(super) fn session_chart(model: &OverviewModel, language: UiLanguage) -> Div 
                             let height = bounds.size.height.as_f32();
                             let width = bounds.size.width.as_f32();
                             Grid::new()
-                                .y((0..=4).map(|i| 8. + (height - 16.) * i as f32 / 4.).collect())
+                                .y((0..=4)
+                                    .map(|i| px(8. + (height - 16.) * i as f32 / 4.))
+                                    .collect::<Vec<_>>())
                                 .stroke(rgb(BORDER))
                                 .paint(&bounds, window);
                             if known {
@@ -215,10 +217,10 @@ pub(super) fn session_chart(model: &OverviewModel, language: UiLanguage) -> Div 
                                     .y(|p| Some(p.1))
                                     .stroke(rgb(ACCENT))
                                     .stroke_width(2.)
-                                    .stroke_style(StrokeStyle::Linear)
+                                    .curve(Curve::Linear)
                                     .dot()
                                     .dot_size(6.)
-                                    .dot_fill_color(rgb(ACCENT))
+                                    .dot_fill(rgb(ACCENT))
                                     .paint(&bounds, window);
                             }
                         },
@@ -303,9 +305,9 @@ pub(super) fn resource_chart(model: &OverviewModel, language: UiLanguage) -> Div
                                             Grid::new()
                                                 .x((0..=4)
                                                     .map(|i| {
-                                                        2. + (width - 4.).max(0.) * i as f32 / 4.
+                                                        px(2. + (width - 4.).max(0.) * i as f32 / 4.)
                                                     })
-                                                    .collect())
+                                                    .collect::<Vec<_>>())
                                                 .stroke(rgb(BORDER))
                                                 .paint(&bounds, window);
                                             if let Some(counts) = counts {
@@ -350,8 +352,8 @@ pub(super) fn resource_chart(model: &OverviewModel, language: UiLanguage) -> Div
                         |bounds, (), window, _| {
                             Grid::new()
                                 .x((0..=4)
-                                    .map(|i| 2. + (bounds.size.width.as_f32() - 4.) * i as f32 / 4.)
-                                    .collect())
+                                    .map(|i| px(2. + (bounds.size.width.as_f32() - 4.) * i as f32 / 4.))
+                                    .collect::<Vec<_>>())
                                 .stroke(rgb(BORDER))
                                 .paint(&bounds, window);
                         },

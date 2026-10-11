@@ -3,7 +3,7 @@ use super::*;
 use crate::application::usage_audit::UsageRecord;
 use gpui_component::{
     chart::PieChart,
-    plot::{Grid, StrokeStyle, shape::Line},
+    plot::{Curve, Grid, shape::Line},
 };
 
 const OUTPUT_COLOR: u32 = 0x008b_5cf6;
@@ -143,8 +143,8 @@ pub(super) fn usage_trend_chart(
                                     let height = bounds.size.height.as_f32();
                                     Grid::new()
                                         .y((0..=4)
-                                            .map(|i| 8. + (height - 16.) * i as f32 / 4.)
-                                            .collect())
+                                            .map(|i| px(8. + (height - 16.) * i as f32 / 4.))
+                                            .collect::<Vec<_>>())
                                         .stroke(rgb(BORDER))
                                         .paint(&bounds, window);
                                     // Both series share one scale. A wide input stroke and smaller output
@@ -162,10 +162,10 @@ pub(super) fn usage_trend_chart(
                                             .y(|p| Some(p.1))
                                             .stroke(rgb(color))
                                             .stroke_width(stroke)
-                                            .stroke_style(StrokeStyle::Linear)
+                                            .curve(Curve::Linear)
                                             .dot()
                                             .dot_size(dot)
-                                            .dot_fill_color(rgb(color))
+                                            .dot_fill(rgb(color))
                                             .paint(&bounds, window);
                                     }
                                 },

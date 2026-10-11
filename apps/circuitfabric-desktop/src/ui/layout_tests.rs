@@ -53,7 +53,7 @@ fn mount_profile<'a>(
             view
         });
         view = Some(entity.clone());
-        gpui_component::Root::new(entity, window, cx).bordered(false)
+        gpui_component::Root::new(entity, window, cx)
     });
     (view.unwrap(), cx)
 }
@@ -1083,7 +1083,7 @@ fn session_scrollbar_uses_independent_message_blocks_and_keeps_its_extent(cx: &m
     let (_, cx) = cx.add_window_view(|window, cx| {
         let view = cx.new(|_| SessionScrollFixture { markdown: original.clone() });
         fixture = Some(view.clone());
-        gpui_component::Root::new(view, window, cx).bordered(false)
+        gpui_component::Root::new(view, window, cx)
     });
     cx.simulate_resize(gpui::size(px(900.), px(600.)));
     draw(cx);

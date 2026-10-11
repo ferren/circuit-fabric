@@ -75,7 +75,7 @@ mod selection_tests {
                 bounds: bounds.clone(),
                 pressed: Rc::new(Cell::new(false)),
             });
-            Root::new(view, window, cx).bordered(false)
+            Root::new(view, window, cx)
         });
         cx.update(|window, cx| {
             let _ = window.draw(cx);

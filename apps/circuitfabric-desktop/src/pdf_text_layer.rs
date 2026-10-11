@@ -358,7 +358,7 @@ mod tests {
         cx.update(gpui_component::init);
         let (_, cx) = cx.add_window_view(|window, cx| {
             let view = cx.new(|cx| SelectionView { focus: cx.focus_handle(), pages: 1 });
-            gpui_component::Root::new(view, window, cx).bordered(false)
+            gpui_component::Root::new(view, window, cx)
         });
         cx.update(|window, cx| {
             let _ = window.draw(cx);
@@ -388,7 +388,7 @@ mod tests {
         cx.update(gpui_component::init);
         let (_, cx) = cx.add_window_view(|window, cx| {
             let view = cx.new(|cx| SelectionView { focus: cx.focus_handle(), pages: 2 });
-            gpui_component::Root::new(view, window, cx).bordered(false)
+            gpui_component::Root::new(view, window, cx)
         });
         cx.update(|window, cx| {
             let _ = window.draw(cx);
@@ -493,7 +493,7 @@ mod tests {
                     pdf,
                     pressed: Rc::new(Cell::new(false)),
                 });
-                gpui_component::Root::new(view, window, cx).bordered(false)
+                gpui_component::Root::new(view, window, cx)
             });
             cx.update(|window, cx| {
                 let _ = window.draw(cx);
@@ -594,7 +594,7 @@ mod tests {
         cx.update(gpui_component::init);
         let (_, cx) = cx.add_window_view(|window, cx| {
             let view = cx.new(|cx| DataView { focus: cx.focus_handle() });
-            gpui_component::Root::new(view, window, cx).bordered(false)
+            gpui_component::Root::new(view, window, cx)
         });
         cx.update(|window, cx| {
             let _ = window.draw(cx);
