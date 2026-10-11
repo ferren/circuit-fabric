@@ -2,7 +2,7 @@
 
 [English](desktop-ui-design.md)
 
-> 本文件是桌面控制面（`apps/circuitfabric-desktop`，GPUI + `gpui-component`）的界面设计基线。它回答两个问题：**界面怎么分类**（信息架构）和**界面长什么样**（视觉与布局）。每个页面下带 `[TODO]` 标记的是"界面入口已规划、具体功能尚未实现"的部分——导航和布局先行，功能后置。
+> 本文件是桌面控制面（`apps/circuitfabric-desktop`，GPUI + GPUI Kit——crates.io 的 `gpui-component`/`gpui-base` 0.7，`gpui-pre` 0.3.8）的界面设计基线。它回答两个问题：**界面怎么分类**（信息架构）和**界面长什么样**（视觉与布局）。每个页面下带 `[TODO]` 标记的是"界面入口已规划、具体功能尚未实现"的部分——导航和布局先行，功能后置。
 
 ## 1. 设计定位与原则
 

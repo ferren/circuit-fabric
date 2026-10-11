@@ -2,7 +2,7 @@
 
 [简体中文](desktop-ui-design.zh-CN.md)
 
-> This file is the UI design baseline for the desktop control plane (`apps/circuitfabric-desktop`, GPUI + `gpui-component`). It answers two questions: **how the interface is categorized** (information architecture) and **what it looks like** (visuals and layout). Each page's `[TODO]` marks the "entry point planned, concrete function not yet implemented" parts — navigation and layout land first, function follows.
+> This file is the UI design baseline for the desktop control plane (`apps/circuitfabric-desktop`, GPUI + GPUI Kit — `gpui-component`/`gpui-base` 0.7 from crates.io, `gpui-pre` 0.3.8). It answers two questions: **how the interface is categorized** (information architecture) and **what it looks like** (visuals and layout). Each page's `[TODO]` marks the "entry point planned, concrete function not yet implemented" parts — navigation and layout land first, function follows.
 
 ## 1. Positioning and principles
 
