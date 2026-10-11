@@ -107,17 +107,28 @@ impl ControlPlaneView {
         let project = self.resource_granted(ToolScope::Project, kind, id);
         let effective =
             enabled && global && (self.navigation.selected_project.is_none() || project);
+        let language = self.language;
+        let (applied, not_applied) =
+            (language.choose("已应用", "granted"), language.choose("未应用", "not granted"));
+        let project_state = if self.navigation.selected_project.is_none() {
+            language.choose("未选择", "no project")
+        } else if project {
+            applied
+        } else {
+            not_applied
+        };
         format!(
-            "全局：{} · 当前项目：{} · 最终权限：{}",
-            if global { "已应用" } else { "未应用" },
-            if self.navigation.selected_project.is_none() {
-                "未选择"
-            } else if project {
-                "已应用"
+            "{}{} · {}{} · {}{}",
+            language.choose("全局：", "Global: "),
+            if global { applied } else { not_applied },
+            language.choose("当前项目：", "Project: "),
+            project_state,
+            language.choose("最终权限：", "Effective: "),
+            if effective {
+                language.choose("允许", "allowed")
             } else {
-                "未应用"
-            },
-            if effective { "允许" } else { "禁止" }
+                language.choose("禁止", "denied")
+            }
         )
     }
 
@@ -174,13 +185,16 @@ impl ControlPlaneView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let dialog =
-            rfd::AsyncFileDialog::new().set_title("选择技能目录或 SKILL.md").set_parent(window);
+        let language = self.language;
+        let dialog = rfd::AsyncFileDialog::new()
+            .set_title(language.choose("选择技能目录或 SKILL.md", "Choose skill folder or SKILL.md"))
+            .set_parent(window);
+        let filter_name = language.choose("技能说明", "Skill description");
         cx.spawn_in(window, async move |view, cx| {
             let selected = if folder {
                 dialog.pick_folder().await
             } else {
-                dialog.add_filter("技能说明", &["md"]).pick_file().await
+                dialog.add_filter(filter_name, &["md"]).pick_file().await
             };
             let Some(file) = selected else {
                 return;
@@ -205,7 +219,7 @@ impl ControlPlaneView {
             return;
         };
         self.catalog_error = None;
-        self.tool_feedback = "正在校验并保存…".into();
+        self.tool_feedback = self.language.choose("正在校验并保存…", "Validating and saving…").into();
         let result = (|| -> Result<(), String> {
             if let CatalogEditor::Delete(kind, id) = &editor {
                 // Prune every opened/registered project's grants. A failing project
@@ -222,7 +236,14 @@ impl ControlPlaneView {
                         continue;
                     }
                     ids.retain(|s| s != id);
-                    storage.save_configuration(&config).map_err(|e| format!("项目 {project_id} 撤销失败：{e}；已撤销的其他项目保持撤销，定义尚未删除"))?;
+                    storage.save_configuration(&config).map_err(|e| {
+                        self.language.choose_owned(
+                            format!("项目 {project_id} 撤销失败：{e}；已撤销的其他项目保持撤销，定义尚未删除"),
+                            format!(
+                                "Revocation failed for project {project_id}: {e}; other revocations stand, definition not yet deleted"
+                            ),
+                        )
+                    })?;
                     self.workspace
                         .set_configuration(&project_id, config)
                         .map_err(|e| e.to_string())?;
@@ -234,7 +255,12 @@ impl ControlPlaneView {
                         id: id.clone(),
                     },
                 )
-                .map_err(|e| format!("定义未删除：{e}；已保存的项目撤销保持生效"))?;
+                .map_err(|e| {
+                    self.language.choose_owned(
+                        format!("定义未删除：{e}；已保存的项目撤销保持生效"),
+                        format!("Definition not deleted: {e}; saved project revocations remain in effect"),
+                    )
+                })?;
                 self.catalog = self.saved_settings.catalog.clone();
                 self.tool_authorizations = self.saved_settings.tools.clone();
                 match kind {
@@ -257,7 +283,10 @@ impl ControlPlaneView {
                     }
                     let id = next.import_skill(&path).map_err(|e| e.to_string())?;
                     if original.as_ref().is_some_and(|old| old != &id) {
-                        return Err("编辑不能改变技能标识；请单独添加新技能，然后删除旧技能".into());
+                        return Err(self.language.choose(
+                            "编辑不能改变技能标识；请单独添加新技能，然后删除旧技能",
+                            "Editing cannot change the skill id; add the new skill separately, then delete the old one",
+                        ).into());
                     }
                     if let Some(skill) = next.skills.iter_mut().find(|s| s.id == id) {
                         skill.enabled = enabled;
@@ -271,14 +300,24 @@ impl ControlPlaneView {
                 CatalogEditor::Mcp(original) => {
                     let id = self.catalog_id.read(cx).value().trim().to_string();
                     if original.as_ref().is_some_and(|old| old != &id) {
-                        return Err("编辑不能改变标识；请新增一个 server 后删除旧项".into());
+                        return Err(self.language.choose(
+                            "编辑不能改变标识；请新增一个 server 后删除旧项",
+                            "Editing cannot change the id; add a new server, then delete the old one",
+                        ).into());
                     }
                     if original.is_none() && next.mcp_servers.iter().any(|s| s.id == id) {
-                        return Err("标识已存在，请选择列表中的条目编辑".into());
+                        return Err(self.language.choose(
+                            "标识已存在，请选择列表中的条目编辑",
+                            "Id already exists; pick the existing entry to edit",
+                        ).into());
                     }
                     let args =
                         serde_json::from_str::<Vec<String>>(&self.catalog_args.read(cx).value())
-                            .map_err(|_| "参数必须是字符串 JSON 数组".to_owned())?;
+                            .map_err(|_| {
+                                self.language
+                                    .choose("参数必须是字符串 JSON 数组", "Arguments must be a JSON array of strings")
+                                    .to_owned()
+                            })?;
                     let enabled =
                         next.mcp_servers.iter().find(|s| s.id == id).is_none_or(|s| s.enabled);
                     next.mcp_servers.retain(|s| s.id != id);
@@ -309,12 +348,16 @@ impl ControlPlaneView {
         match result {
             Ok(()) => {
                 self.catalog_editor = None;
-                self.tool_feedback =
-                    "操作已保存；定义和授权分别管理。旧操作已取消，下次任务使用新配置。".into();
+                self.tool_feedback = self.language.choose(
+                    "操作已保存；定义和授权分别管理。旧操作已取消，下次任务使用新配置。",
+                    "Saved; definitions and authorizations are managed separately. Previous operations were cancelled; the next task uses the new configuration.",
+                ).into();
             }
             Err(error) => {
                 self.catalog_error = Some(error.clone());
-                self.tool_feedback = format!("未保存：{error}");
+                self.tool_feedback = self
+                    .language
+                    .choose_owned(format!("未保存：{error}"), format!("Not saved: {error}"));
             }
         }
         self.status = self.tool_feedback.clone();
@@ -369,19 +412,26 @@ impl ControlPlaneView {
             let mut only = grants;
             only.authorized_skill_ids.retain(|s| s == &id);
             let result = if only.authorized_skill_ids.is_empty() {
-                Err("技能尚未获得最终生效权限，请检查全局、项目和启用状态".into())
+                Err(self.language.choose(
+                    "技能尚未获得最终生效权限，请检查全局、项目和启用状态",
+                    "Skill has no effective permission yet; check global, project, and enabled state",
+                ).into())
             } else {
                 self.catalog
                     .skill_instructions(&only)
                     .map(|text| {
-                        format!(
-                            "已实际读取并加载 {} 字节技能指令；下次任务会注入运行时。",
-                            text.len()
+                        self.language.choose_owned(
+                            format!("已实际读取并加载 {} 字节技能指令；下次任务会注入运行时。", text.len()),
+                            format!(
+                                "Read and loaded {} bytes of skill instructions; injected into the runtime on the next task.",
+                                text.len()
+                            ),
                         )
                     })
                     .map_err(|e| e.to_string())
             };
-            self.tool_feedback = result.unwrap_or_else(|e| format!("加载失败：{e}"));
+            self.tool_feedback = result
+                .unwrap_or_else(|e| self.language.choose_owned(format!("加载失败：{e}"), format!("Load failed: {e}")));
             self.tool_reports.insert(
                 format!("skill:{id}"),
                 ToolReport { text: self.tool_feedback.clone(), tools: None, cancel: None },
@@ -402,19 +452,28 @@ impl ControlPlaneView {
                 .and_then(|v| v["tools"].as_array())
                 .is_some_and(|tools| tools.iter().any(|t| t["name"] == name))
             {
-                self.tool_feedback = "调用失败：请先发现工具，并选择真实工具名称".into();
+                self.tool_feedback = self.language.choose(
+                    "调用失败：请先发现工具，并选择真实工具名称",
+                    "Call failed: discover tools first and pick a real tool name",
+                ).into();
                 cx.notify();
                 return;
             }
             let Ok(arguments) =
                 serde_json::from_str::<serde_json::Value>(&self.tool_call_args.read(cx).value())
             else {
-                self.tool_feedback = "调用失败：参数必须是 JSON 对象".into();
+                self.tool_feedback = self
+                    .language
+                    .choose("调用失败：参数必须是 JSON 对象", "Call failed: arguments must be a JSON object")
+                    .into();
                 cx.notify();
                 return;
             };
             if !arguments.is_object() {
-                self.tool_feedback = "调用失败：参数必须是 JSON 对象".into();
+                self.tool_feedback = self
+                    .language
+                    .choose("调用失败：参数必须是 JSON 对象", "Call failed: arguments must be a JSON object")
+                    .into();
                 cx.notify();
                 return;
             }
@@ -424,8 +483,12 @@ impl ControlPlaneView {
         };
         let tools = self.tool_reports.get(&key).and_then(|r| r.tools.clone());
         let cancel = circuitfabric_codex_runtime::execution::Cancellation::default();
-        self.tool_feedback =
-            if call { "正在调用工具…" } else { "正在连接并发现工具…" }.into();
+        self.tool_feedback = if call {
+            self.language.choose("正在调用工具…", "Calling tool…")
+        } else {
+            self.language.choose("正在连接并发现工具…", "Connecting and discovering tools…")
+        }
+        .into();
         self.tool_reports.insert(
             key.clone(),
             ToolReport { text: self.tool_feedback.clone(), tools, cancel: Some(cancel.clone()) },
@@ -456,18 +519,37 @@ impl ControlPlaneView {
                     };
                     report.cancel = None;
                     report.text = match result {
-                        Ok(value) if call => format!(
-                            "调用成功：{}",
-                            serde_json::to_string_pretty(&value).unwrap_or_default()
-                        ),
+                        Ok(value) if call => {
+                            let payload =
+                                serde_json::to_string_pretty(&value).unwrap_or_default();
+                            view.language.choose_owned(
+                                format!("调用成功：{payload}"),
+                                format!("Call succeeded: {payload}"),
+                            )
+                        }
                         Ok(value) => {
                             let count = value["tools"].as_array().map_or(0, Vec::len);
                             report.tools = Some(value);
-                            format!("连接验证成功，发现 {count} 个真实工具（每次操作重新连接）")
+                            view.language.choose_owned(
+                                format!("连接验证成功，发现 {count} 个真实工具（每次操作重新连接）"),
+                                format!(
+                                    "Connection verified; {count} real tools discovered (each operation reconnects)"
+                                ),
+                            )
                         }
                         Err(error) => {
                             report.tools = None;
-                            format!("{}失败：{error}", if call { "调用" } else { "连接" })
+                            if call {
+                                view.language.choose_owned(
+                                    format!("调用失败：{error}"),
+                                    format!("Call failed: {error}"),
+                                )
+                            } else {
+                                view.language.choose_owned(
+                                    format!("连接失败：{error}"),
+                                    format!("Connect failed: {error}"),
+                                )
+                            }
                         }
                     };
                     view.tool_feedback = report.text.clone();
@@ -483,6 +565,7 @@ impl ControlPlaneView {
 
     pub(super) fn render_tool_management(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity().clone();
+        let language = self.language;
         let kind = self.new_tool_kind;
         let selected = self.selected_resource();
         let search = self.catalog_search.read(cx).value().to_lowercase();
@@ -543,16 +626,22 @@ impl ControlPlaneView {
                                     view.selected_mcp = Some(choose_id.clone())
                                 }
                             }
-                            view.tool_feedback = "已选择；列表及详情显示已保存内容。".into();
+                            view.tool_feedback = view
+                                .language
+                                .choose(
+                                    "已选择；列表及详情显示已保存内容。",
+                                    "Selected; list and detail show saved state.",
+                                )
+                                .into();
                             cx.notify();
                         });
                     })
                     .child(div().text_sm().truncate().child(format!("{name} · {id}")))
                     .child(div().text_xs().truncate().text_color(rgb(TEXT_MUTED)).child(source))
                     .child(div().text_xs().child(if enabled {
-                        "已保存 · 已启用"
+                        language.choose("已保存 · 已启用", "Saved · enabled")
                     } else {
-                        "已保存 · 已停用"
+                        language.choose("已保存 · 已停用", "Saved · disabled")
                     }))
                     .child(
                         div()
@@ -563,7 +652,8 @@ impl ControlPlaneView {
             );
         }
         if total == 0 {
-            rows = rows.child("列表为空，点击添加导入第一个资源。");
+            rows = rows
+                .child(language.choose("列表为空，点击添加导入第一个资源。", "List is empty — click Add to import the first resource."));
         }
         let add = entity.clone();
         let mut list = div()
@@ -578,7 +668,9 @@ impl ControlPlaneView {
                     action_button("resource-add")
                         .primary()
                         .label(match kind {
-                            ToolAuthorizationKind::Skill => "添加技能",
+                            ToolAuthorizationKind::Skill => {
+                                language.choose("添加技能", "Add skill")
+                            }
                             ToolAuthorizationKind::McpServer => "添加 MCP server",
                         })
                         .on_click(move |_, window, cx| {
@@ -597,8 +689,16 @@ impl ControlPlaneView {
                         }),
                 ),
             )
-            .child(Self::resource_field("搜索", "resource-search", None, &self.catalog_search))
-            .child(div().text_xs().child(format!("共 {total} 项；无匹配时可清空搜索")))
+            .child(Self::resource_field(
+                language.choose("搜索", "Search"),
+                "resource-search",
+                None,
+                &self.catalog_search,
+            ))
+            .child(div().text_xs().child(language.choose_owned(
+                format!("共 {total} 项；无匹配时可清空搜索"),
+                format!("{total} total; clear the search when nothing matches"),
+            )))
             .child(
                 div()
                     .id(if kind == ToolAuthorizationKind::Skill {
@@ -650,7 +750,7 @@ impl ControlPlaneView {
                     .flex()
                     .flex_wrap()
                     .gap_2()
-                    .child(action_button("resource-edit").label("编辑").on_click(
+                    .child(action_button("resource-edit").label(language.choose("编辑", "Edit")).on_click(
                         move |_, window, cx| {
                             edit.update(cx, |view, cx| {
                                 if bundled {
@@ -677,12 +777,16 @@ impl ControlPlaneView {
                     ))
                     .child(
                         action_button("resource-toggle")
-                            .label(if enabled { "停用" } else { "启用" })
+                            .label(if enabled {
+                                language.choose("停用", "Disable")
+                            } else {
+                                language.choose("启用", "Enable")
+                            })
                             .on_click(move |_, _, cx| {
                                 toggle.update(cx, |view, cx| view.toggle_selected_resource(cx));
                             }),
                     )
-                    .child(action_button("resource-delete").label("删除").on_click(
+                    .child(action_button("resource-delete").label(language.choose("删除", "Delete")).on_click(
                         move |_, window, cx| {
                             delete.update(cx, |view, cx| {
                                 view.open_catalog_editor(
@@ -695,7 +799,10 @@ impl ControlPlaneView {
                     )),
             );
             let mut scopes = div().flex().flex_wrap().gap_2();
-            for (scope, label) in [(ToolScope::Global, "全局"), (ToolScope::Project, "当前项目")]
+            for (scope, label) in [
+                (ToolScope::Global, language.choose("全局", "Global")),
+                (ToolScope::Project, language.choose("当前项目", "Current project")),
+            ]
             {
                 let chooser = entity.clone();
                 scopes = scopes.child(
@@ -715,7 +822,11 @@ impl ControlPlaneView {
             scopes = scopes.child(
                 action_button("resource-apply")
                     .primary()
-                    .label(if granted { "撤销所选范围" } else { "应用到所选范围" })
+                    .label(if granted {
+                        language.choose("撤销所选范围", "Revoke for scope")
+                    } else {
+                        language.choose("应用到所选范围", "Apply to scope")
+                    })
                     .on_click(move |_, window, cx| {
                         apply.update(cx, |view, cx| view.apply_selected_resource(window, cx));
                     }),
@@ -725,9 +836,9 @@ impl ControlPlaneView {
             detail = detail.child(
                 action_button("resource-verify")
                     .label(if kind == ToolAuthorizationKind::Skill {
-                        "验证加载"
+                        language.choose("验证加载", "Verify loading")
                     } else {
-                        "连接并发现工具"
+                        language.choose("连接并发现工具", "Connect & discover tools")
                     })
                     .on_click(move |_, window, cx| {
                         verify.update(cx, |view, cx| {
@@ -738,14 +849,25 @@ impl ControlPlaneView {
             match kind {
                 ToolAuthorizationKind::Skill => {
                     if let Some(skill) = self.catalog.skills.iter().find(|s| s.id == id) {
-                        detail = detail
-                            .child(settings_summary_row("来源", skill.path.display().to_string()));
+                        detail = detail.child(settings_summary_row(
+                            language.choose("来源", "Source"),
+                            skill.path.display().to_string(),
+                        ));
                         match skill.preview() {
                             Ok(preview) => {
                                 detail = detail
-                                    .child(settings_summary_row("名称", preview.name))
-                                    .child(settings_summary_row("说明", preview.description))
-                                    .child("内容预览（仅查看，不授予使用权限）")
+                                    .child(settings_summary_row(
+                                        language.choose("名称", "Name"),
+                                        preview.name,
+                                    ))
+                                    .child(settings_summary_row(
+                                        language.choose("说明", "Description"),
+                                        preview.description,
+                                    ))
+                                    .child(language.choose(
+                                        "内容预览（仅查看，不授予使用权限）",
+                                        "Content preview (view only; grants no permission)",
+                                    ))
                                     .child(
                                         div()
                                             .w_full()
@@ -756,27 +878,43 @@ impl ControlPlaneView {
                                     );
                             }
                             Err(error) => {
-                                detail = detail.child(format!("配置无效或来源不可读：{error}"))
+                                detail = detail.child(language.choose_owned(
+                                    format!("配置无效或来源不可读：{error}"),
+                                    format!("Invalid configuration or unreadable source: {error}"),
+                                ))
                             }
                         }
-                        detail = detail.child(div().text_xs().whitespace_normal().child("当前仅将 SKILL.md 指令注入运行时；附属脚本和资源不复制、不自动运行，相对资源没有通用加载保证。"));
+                        detail = detail.child(div().text_xs().whitespace_normal().child(
+                            language.choose(
+                                "当前仅将 SKILL.md 指令注入运行时；附属脚本和资源不复制、不自动运行，相对资源没有通用加载保证。",
+                                "Only SKILL.md instructions are injected into the runtime; sidecar scripts and assets are neither copied nor auto-run, and relative assets have no generic loading guarantee.",
+                            ),
+                        ));
                     }
                 }
                 ToolAuthorizationKind::McpServer => {
                     if let Some(server) = self.catalog.mcp_servers.iter().find(|s| s.id == id) {
                         detail = detail
                             .child(settings_summary_row(
-                                "传输",
-                                "stdio（当前唯一支持的方式）".into(),
+                                language.choose("传输", "Transport"),
+                                language
+                                    .choose("stdio（当前唯一支持的方式）", "stdio (the only transport currently supported)")
+                                    .to_owned(),
                             ))
-                            .child(settings_summary_row("名称", server.display_name.clone()))
-                            .child(settings_summary_row("命令", server.command.clone()))
                             .child(settings_summary_row(
-                                "参数",
+                                language.choose("名称", "Name"),
+                                server.display_name.clone(),
+                            ))
+                            .child(settings_summary_row(
+                                language.choose("命令", "Command"),
+                                server.command.clone(),
+                            ))
+                            .child(settings_summary_row(
+                                language.choose("参数", "Arguments"),
                                 serde_json::to_string(&server.args).unwrap_or_default(),
                             ))
                             .child(settings_summary_row(
-                                "认证变量",
+                                language.choose("认证变量", "Auth variables"),
                                 server.environment_variables.join(", "),
                             ));
                         for name in &server.environment_variables {
@@ -820,18 +958,18 @@ impl ControlPlaneView {
                         let caller = entity.clone();
                         detail = detail
                             .child(Self::resource_field(
-                                "已发现工具名称",
+                                language.choose("已发现工具名称", "Discovered tool name"),
                                 "tool-call-name",
                                 None,
                                 &self.tool_call_name,
                             ))
                             .child(Self::resource_field(
-                                "调用参数（JSON 对象）",
+                                language.choose("调用参数（JSON 对象）", "Call arguments (JSON object)"),
                                 "tool-call-args",
                                 None,
                                 &self.tool_call_args,
                             ))
-                            .child(action_button("resource-call").label("调用工具").on_click(
+                            .child(action_button("resource-call").label(language.choose("调用工具", "Call tool")).on_click(
                                 move |_, window, cx| {
                                     caller.update(cx, |view, cx| {
                                         view.verify_selected_resource(true, window, cx)
@@ -847,29 +985,21 @@ impl ControlPlaneView {
             );
             detail = detail.child(
                 div().text_sm().whitespace_normal().child(
-                    self.tool_reports
-                        .get(&key)
-                        .map_or_else(|| "尚未加载 / 尚未验证连接".into(), |r| r.text.clone()),
+                    self.tool_reports.get(&key).map_or_else(
+                        || self.language.choose("尚未加载 / 尚未验证连接", "Not loaded / connection not verified").into(),
+                        |r| r.text.clone(),
+                    ),
                 ),
             );
         } else {
-            detail = detail.child("尚未选择资源；在左侧选择一项查看详情和应用授权。");
+            detail = detail.child(self.language.choose(
+                "尚未选择资源；在左侧选择一项查看详情和应用授权。",
+                "No resource selected; pick one on the left to see details and apply authorizations.",
+            ));
         }
-        let back = entity.clone();
-        let breadcrumb = div().flex_none().child(
-            Breadcrumb::new().child(
-                BreadcrumbItem::new("运行时与 Provider").on_click(move |_, _, cx| {
-                    back.update(cx, |view, cx| {
-                        view.agents_selection =
-                            AgentsSelection::Runtime(RuntimeAdapter::CodexAppServer);
-                        cx.notify();
-                    });
-                }),
-            ),
-        );
         let mut tabs = TabBar::new("tool-kind").underline().flex_none();
         for (tab, label) in [
-            (ToolAuthorizationKind::Skill, "技能"),
+            (ToolAuthorizationKind::Skill, language.choose("技能", "Skills")),
             (ToolAuthorizationKind::McpServer, "MCP server"),
         ] {
             let chooser = entity.clone();
@@ -880,17 +1010,24 @@ impl ControlPlaneView {
                     .on_click(move |_, _, cx| {
                         chooser.update(cx, |view, cx| {
                             view.new_tool_kind = tab;
-                            view.tool_feedback =
-                                "已切换列表；请选择资源查看已保存配置和验证状态。".into();
+                            view.tool_feedback = view
+                                .language
+                                .choose(
+                                    "已切换列表；请选择资源查看已保存配置和验证状态。",
+                                    "List switched; pick a resource to see saved configuration and verification status.",
+                                )
+                                .into();
                             cx.notify();
                         });
                     }),
             );
         }
         div().flex_1().h_full().min_h(px(0.)).min_w(px(0.)).v_flex().gap_2().p_3().overflow_hidden()
-            .child(breadcrumb)
             .child(tabs)
-            .child(div().flex_none().text_xs().whitespace_normal().child("应用 = 保存所选范围的授权，并在下次任务生成运行时配置。项目最终权限为全局与当前项目的交集，再过滤停用/缺失定义。保存、启用、授权、加载/连接分别显示。配置、权限或项目变化会取消既有操作；已完成的外部副作用无法回滚。"))
+            .child(div().flex_none().text_xs().whitespace_normal().child(language.choose(
+                "应用 = 保存所选范围的授权，并在下次任务生成运行时配置。项目最终权限为全局与当前项目的交集，再过滤停用/缺失定义。保存、启用、授权、加载/连接分别显示。配置、权限或项目变化会取消既有操作；已完成的外部副作用无法回滚。",
+                "Apply = save the authorization for the chosen scope and generate the runtime configuration for the next task. The project's effective permission is the intersection of global and current project, then filtered by disabled or missing definitions. Save, enable, authorize, and load/connect are reported separately. Configuration, permission, or project changes cancel in-flight operations; completed external side effects cannot be rolled back.",
+            )))
             .child(div().flex_1().min_h(px(0.)).min_w(px(0.)).flex().gap_3().overflow_hidden().child(list).child(detail))
             .child(div().id("resource-operation-feedback").flex_none().max_h(px(60.)).scroll_y().text_xs().whitespace_normal().child(self.tool_feedback.clone()))
     }
@@ -898,27 +1035,33 @@ impl ControlPlaneView {
     pub(super) fn render_catalog_modal(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let editor = self.catalog_editor.clone().expect("open catalog editor");
         let entity = cx.entity().clone();
+        let language = self.language;
         let skill = matches!(editor, CatalogEditor::Skill(_));
         let delete = matches!(editor, CatalogEditor::Delete(..));
         let title = if delete {
-            "删除资源"
+            language.choose("删除资源", "Delete resource")
         } else if skill {
-            "导入 / 编辑技能"
+            language.choose("导入 / 编辑技能", "Import / edit skill")
         } else {
-            "新增 / 编辑 MCP server"
+            language.choose("新增 / 编辑 MCP server", "Add / edit MCP server")
         };
         let mut fields =
             div().id("catalog-editor-fields").flex_1().min_h(px(0.)).scroll_y().v_flex().gap_3();
         match editor {
             CatalogEditor::Delete(_, id) => {
-                fields = fields.child(format!("删除 {id} 的定义及全局和已打开项目授权；保留源文件。其他未打开项目的旧引用不会获得全局权限。内置 Jev 删除后也不会在重启时自动恢复。"));
+                fields = fields.child(language.choose_owned(
+                    format!("删除 {id} 的定义及全局和已打开项目授权；保留源文件。其他未打开项目的旧引用不会获得全局权限。内置 Jev 删除后也不会在重启时自动恢复。"),
+                    format!(
+                        "Deletes the definition of {id} plus its global and opened-project authorizations; source files are kept. Stale references in unopened projects gain no global permission. The bundled Jev is not restored on restart after deletion."
+                    ),
+                ));
             }
             CatalogEditor::Skill(_) => {
                 let folder = entity.clone();
                 let file = entity.clone();
                 fields = fields
                     .child(Self::resource_field(
-                        "实际技能目录或 SKILL.md",
+                        language.choose("实际技能目录或 SKILL.md", "Skill folder or SKILL.md"),
                         "catalog-source",
                         None,
                         &self.catalog_source,
@@ -928,7 +1071,7 @@ impl ControlPlaneView {
                             .flex()
                             .flex_wrap()
                             .gap_2()
-                            .child(action_button("skill-pick-folder").label("选择目录").on_click(
+                            .child(action_button("skill-pick-folder").label(language.choose("选择目录", "Choose folder")).on_click(
                                 move |_, window, cx| {
                                     folder.update(cx, |view, cx| {
                                         view.pick_skill_source(true, window, cx)
@@ -936,7 +1079,7 @@ impl ControlPlaneView {
                                 },
                             ))
                             .child(
-                                action_button("skill-pick-file").label("选择 SKILL.md").on_click(
+                                action_button("skill-pick-file").label(language.choose("选择 SKILL.md", "Choose SKILL.md")).on_click(
                                     move |_, window, cx| {
                                         file.update(cx, |view, cx| {
                                             view.pick_skill_source(false, window, cx)
@@ -945,7 +1088,10 @@ impl ControlPlaneView {
                                 ),
                             ),
                     )
-                    .child("保存时校验文件、标识和 256 KiB 大小限制。仅保存定义，不自动授权。");
+                    .child(language.choose(
+                        "保存时校验文件、标识和 256 KiB 大小限制。仅保存定义，不自动授权。",
+                        "Validated on save: file, id, and the 256 KiB size limit. Saves the definition only; no automatic authorization.",
+                    ));
                 let source = PathBuf::from(self.catalog_source.read(cx).value().trim().to_string());
                 let mut preview_catalog =
                     circuitfabric_codex_runtime::tools::ToolCatalog::default();
@@ -954,53 +1100,68 @@ impl ControlPlaneView {
                         Ok(id) => {
                             if let Some(preview) = preview_catalog.skills[0].preview().ok() {
                                 fields = fields
-                                    .child(format!(
-                                        "技能标识：{id}\n名称：{}\n说明：{}",
-                                        preview.name, preview.description
+                                    .child(language.choose_owned(
+                                        format!(
+                                            "技能标识：{id}\n名称：{}\n说明：{}",
+                                            preview.name, preview.description
+                                        ),
+                                        format!(
+                                            "Skill id: {id}\nName: {}\nDescription: {}",
+                                            preview.name, preview.description
+                                        ),
                                     ))
                                     .child(
                                         div().text_xs().whitespace_normal().child(preview.content),
                                     );
                             }
                         }
-                        Err(error) => fields = fields.child(format!("校验未通过：{error}")),
+                        Err(error) => fields = fields.child(language.choose_owned(
+                            format!("校验未通过：{error}"),
+                            format!("Validation failed: {error}"),
+                        )),
                     }
                 }
             }
             CatalogEditor::Mcp(_) => {
                 fields = fields
                     .child(Self::resource_field(
-                        "显示名称",
+                        language.choose("显示名称", "Display name"),
                         "catalog-name",
                         None,
                         &self.catalog_name,
                     ))
                     .child(Self::resource_field(
-                        "唯一标识（编辑时保留）",
+                        language.choose("唯一标识（编辑时保留）", "Unique id (kept when editing)"),
                         "catalog-id",
                         None,
                         &self.catalog_id,
                     ))
-                    .child("传输方式：stdio（当前唯一支持，不支持 HTTP/SSE 端点）")
+                    .child(language.choose(
+                        "传输方式：stdio（当前唯一支持，不支持 HTTP/SSE 端点）",
+                        "Transport: stdio (the only one supported; HTTP/SSE endpoints are not supported)",
+                    ))
                     .child(Self::resource_field(
-                        "启动程序（不经过 shell）",
+                        language.choose("启动程序（不经过 shell）", "Launch program (not run through a shell)"),
                         "catalog-source",
                         None,
                         &self.catalog_source,
                     ))
                     .child(Self::resource_field(
-                        "参数（字符串 JSON 数组）",
+                        language.choose("参数（字符串 JSON 数组）", "Arguments (JSON array of strings)"),
                         "catalog-args",
                         None,
                         &self.catalog_args,
                     ))
                     .child(Self::resource_field(
-                        "认证变量名（逗号分隔）",
+                        language.choose("认证变量名（逗号分隔）", "Auth variable names (comma-separated)"),
                         "catalog-env",
                         None,
                         &self.catalog_env,
                     ))
-                    .child("密钥只从保险库或环境变量获取；不要将密钥写入名称、命令或参数。");
+                    .child(language.choose(
+                        "密钥只从保险库或环境变量获取；不要将密钥写入名称、命令或参数。",
+                        "Secrets come only from the vault or environment variables; never put secrets in names, commands, or arguments.",
+                    ));
                 for name in Self::parse_tool_ids(&self.catalog_env.read(cx).value()) {
                     if let Some(hint) = self.secret_source_hint(&name, &entity) {
                         fields = fields.child(hint);
@@ -1053,7 +1214,10 @@ impl ControlPlaneView {
                                 .text_sm()
                                 .whitespace_normal()
                                 .text_color(rgb(0x00b4_5309))
-                                .child(format!("未保存：{error}")),
+                                .child(language.choose_owned(
+                                    format!("未保存：{error}"),
+                                    format!("Not saved: {error}"),
+                                )),
                         )
                     })
                     .child(
@@ -1064,13 +1228,18 @@ impl ControlPlaneView {
                             .gap_2()
                             .child(
                                 action_button("catalog-editor-cancel")
-                                    .label("取消（丢弃草稿）")
+                                    .label(language.choose("取消（丢弃草稿）", "Cancel (discard draft)"))
                                     .on_click(move |_, _, cx| {
                                         cancel.update(cx, |view, cx| {
                                             view.catalog_editor = None;
                                             view.catalog_error = None;
-                                            view.tool_feedback =
-                                                "已取消；已保存定义保持原值。".into();
+                                            view.tool_feedback = view
+                                                .language
+                                                .choose(
+                                                    "已取消；已保存定义保持原值。",
+                                                    "Cancelled; saved definitions keep their values.",
+                                                )
+                                                .into();
                                             cx.notify();
                                         });
                                     }),
@@ -1078,7 +1247,11 @@ impl ControlPlaneView {
                             .child(
                                 action_button("catalog-editor-save")
                                     .primary()
-                                    .label(if delete { "确认删除" } else { "保存" })
+                                    .label(if delete {
+                                        language.choose("确认删除", "Confirm delete")
+                                    } else {
+                                        language.choose("保存", "Save")
+                                    })
                                     .on_click(move |_, _, cx| {
                                         save.update(cx, |view, cx| view.save_catalog_editor(cx));
                                     }),

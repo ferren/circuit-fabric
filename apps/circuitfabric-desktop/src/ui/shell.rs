@@ -296,13 +296,58 @@ impl Render for ControlPlaneView {
                                     .min_w(px(0.))
                                     .v_flex()
                                     .gap_0p5()
-                                    .child(
-                                        div()
-                                            .text_base()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(rgb(TEXT_PRIMARY))
-                                            .child(language.screen_label(active_screen)),
-                                    )
+                                    .child({
+                                        // Level 1 is the current function page; a second
+                                        // level appears for drill-in detail panes and makes
+                                        // level 1 clickable to navigate back.
+                                        let level1 = language.screen_label(active_screen);
+                                        let level2 = match (active_screen, self.agents_selection)
+                                        {
+                                            (
+                                                ControlPlaneScreen::AgentsAndMcp,
+                                                AgentsSelection::Provider,
+                                            ) => Some(language.choose("LLM Provider", "LLM Provider")),
+                                            (
+                                                ControlPlaneScreen::AgentsAndMcp,
+                                                AgentsSelection::SkillsAndMcp,
+                                            ) => Some(language.choose(
+                                                "技能与 MCP 授权",
+                                                "Skills & MCP",
+                                            )),
+                                            (
+                                                ControlPlaneScreen::AgentsAndMcp,
+                                                AgentsSelection::BundledJev,
+                                            ) => Some(language.choose(
+                                                "Jev 判断工具",
+                                                "Jev judgments",
+                                            )),
+                                            _ => None,
+                                        };
+                                        let mut breadcrumb =
+                                            Breadcrumb::new().text_base().min_w(px(0.));
+                                        breadcrumb = match level2 {
+                                            Some(level2) => {
+                                                let nav_back = entity.clone();
+                                                breadcrumb
+                                                    .child(
+                                                        BreadcrumbItem::new(level1).on_click(
+                                                            move |_, _, cx| {
+                                                                nav_back.update(cx, |view, cx| {
+                                                                    view.agents_selection =
+                                                                        AgentsSelection::Runtime(
+                                                                            RuntimeAdapter::CodexAppServer,
+                                                                        );
+                                                                    cx.notify();
+                                                                });
+                                                            },
+                                                        ),
+                                                    )
+                                                    .child(BreadcrumbItem::new(level2))
+                                            }
+                                            None => breadcrumb.child(BreadcrumbItem::new(level1)),
+                                        };
+                                        breadcrumb
+                                    })
                                     .child(
                                         div()
                                             .min_w(px(0.))
