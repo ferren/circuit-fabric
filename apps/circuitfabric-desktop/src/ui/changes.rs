@@ -373,7 +373,7 @@ impl ControlPlaneView {
 
         let mut page = page("changes-approvals-page")
             .child(div().flex().items_center().justify_between().child(
-                div().v_flex().gap_1().child(div().text_xl().font_weight(FontWeight::SEMIBOLD).child("Changes & approvals"))
+                div().v_flex().gap_1()
                     .child(div().text_sm().text_color(rgb(TEXT_SECONDARY)).child("Approval is guarded by current observed state, baseline, and verification."))
             ).child({ let refresher = entity.clone(); let refresh_project = project_id.clone(); action_button("refresh-change-sets").label("Refresh").on_click(move |_, _, cx| refresher.update(cx, |view, cx| { view.status = view.refresh_project_data(&refresh_project).map_or_else(|error| format!("Refresh failed: {error}"), |_| "ChangeSets refreshed.".to_owned()); cx.notify(); })) }))
             .child(div().flex().gap_4().items_start().child(div().w(px(250.)).flex_none().v_flex().gap_2().child(div().text_base().font_weight(FontWeight::SEMIBOLD).child("ChangeSets")).child(change_set_rows)).child(div().flex_1().min_w(px(420.)).child(details)));

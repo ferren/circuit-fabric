@@ -907,9 +907,6 @@ impl ControlPlaneView {
                 div()
                     .v_flex()
                     .gap_1()
-                    .child(div().text_xl().font_weight(FontWeight::SEMIBOLD).child(
-                        language.choose("Jev 判断工具", "Jev judgment tool"),
-                    ))
                     .child(div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(
                         language.choose(
                             "各配置项以列表呈现，列表值始终等于已保存状态；「判断后端」与「API 密钥」通过弹窗修改。evaluate 始终以相同接口返回类型化判断，供智能体和数据手册复核调用。",

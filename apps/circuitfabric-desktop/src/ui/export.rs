@@ -44,12 +44,6 @@ impl ControlPlaneView {
                                 .gap_1()
                                 .child(
                                     div()
-                                        .text_xl()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .child(language.choose("BOM 与导出", "BOM & export")),
-                                )
-                                .child(
-                                    div()
                                         .text_sm()
                                         .text_color(rgb(TEXT_SECONDARY))
                                         .child(language.choose(
@@ -231,12 +225,6 @@ impl ControlPlaneView {
                         div()
                             .v_flex()
                             .gap_1()
-                            .child(
-                                div()
-                                    .text_xl()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(language.choose("BOM 与工程导出", "BOM & project export")),
-                            )
                             .child(
                                 div()
                                     .text_sm()

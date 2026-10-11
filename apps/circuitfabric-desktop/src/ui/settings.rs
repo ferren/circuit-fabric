@@ -1502,12 +1502,6 @@ impl ControlPlaneView {
                     language.choose("本地优先、密钥隔离", "local-first, secret-isolated")
                 )));
         page("global-settings-page")
-            .child(
-                div()
-                    .text_xl()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(language.choose("全局设置", "Global settings")),
-            )
             .child(div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(language.choose(
                 "这些偏好会立即应用，并在下次启动时恢复。",
                 "These preferences apply immediately and are restored on the next launch.",

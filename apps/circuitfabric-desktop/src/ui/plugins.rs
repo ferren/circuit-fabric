@@ -309,7 +309,6 @@ impl ControlPlaneView {
         }
 
         page("plugins-governance-page")
-            .child(div().text_xl().font_weight(FontWeight::SEMIBOLD).child("Plugin governance"))
             .child(div().text_sm().text_color(rgb(TEXT_SECONDARY)).child("Manifest inventory, trust, permissions, health, isolation, lifecycle controls, and an append-only local audit view."))
             .child(manifest_source)
             .child(div().text_base().font_weight(FontWeight::SEMIBOLD).child("Validated manifest inventory"))

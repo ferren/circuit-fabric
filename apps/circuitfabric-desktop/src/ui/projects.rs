@@ -771,12 +771,6 @@ impl ControlPlaneView {
                             .v_flex()
                             .gap_1()
                             .child(
-                                div()
-                                    .text_xl()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(language.choose("项目工作区", "Project workspaces")),
-                            )
-                            .child(
                                 div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(
                                     language.choose(
                                         "将项目资料、会话和授权配置限定在同一个设计工作区。",

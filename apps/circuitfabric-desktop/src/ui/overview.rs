@@ -338,12 +338,6 @@ impl ControlPlaneView {
         }
         page("overview-page")
             .gap_4()
-            .child(
-                div()
-                    .text_xl()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(language.choose("总览", "Overview")),
-            )
             .child(div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(format!(
                 "{} · {}/{} {}",
                 language.choose(

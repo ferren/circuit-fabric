@@ -486,12 +486,6 @@ impl ControlPlaneView {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .child(
-                        div()
-                            .text_xl()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(language.choose("会话与任务", "Sessions & tasks")),
-                    )
                     .when(self.task_cancel.is_some(), |this| {
                         this.child(
                             action_button("sessions-cancel-task")

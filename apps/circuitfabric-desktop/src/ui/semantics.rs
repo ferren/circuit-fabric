@@ -49,10 +49,6 @@ impl ControlPlaneView {
                 .child(
                     div().flex().items_center().justify_between().child(
                         div().v_flex().gap_1().child(
-                            div().text_xl().font_weight(FontWeight::SEMIBOLD).child(
-                                language.choose("电路语义", "Circuit semantics"),
-                            ),
-                        ).child(
                             div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(
                                 language.choose("项目语义快照", "Project semantic snapshots"),
                             ),
@@ -478,7 +474,7 @@ impl ControlPlaneView {
 
         page("semantic-browser-body")
             .child(div().flex().items_start().justify_between().gap_3().child(
-                div().v_flex().gap_1().child(div().text_xl().font_weight(FontWeight::SEMIBOLD).child(language.choose("电路语义", "Circuit semantics")))
+                div().v_flex().gap_1()
                     .child(div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(language.choose("只读项目快照、验证事实与可追溯证据。", "Read-only project snapshots, verification facts, and traceable evidence."))),
             ).child({ let refresher = entity.clone(); action_button("refresh-semantic-snapshots").label(language.choose("刷新快照", "Refresh snapshots")).on_click(move |_, _, cx| { refresher.update(cx, |view, cx| { view.status = match view.refresh_project_data(&project_id) { Ok(()) => language.choose("语义快照已刷新", "Semantic snapshots refreshed").to_owned(), Err(error) => format!("{}: {error}", language.choose("语义快照未刷新", "Semantic snapshots not refreshed")), }; cx.notify(); }); }) }))
             .child(div().v_flex().gap_2().p_3().rounded_lg().border_1().border_color(rgb(BORDER)).bg(rgb(CARD_BG)).child(div().text_sm().font_weight(FontWeight::MEDIUM).child(language.choose("快照谱系", "Snapshot lineage"))).child(lineage))

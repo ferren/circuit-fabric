@@ -694,13 +694,6 @@ impl ControlPlaneView {
                             .v_flex()
                             .gap_1()
                             .child(
-                                div()
-                                    .text_xl()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(language
-                                        .choose("智能体与工具", "Agents & tools")),
-                            )
-                            .child(
                                 div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(
                                     language.choose(
                                         "在各详情页保存对应配置；技能/MCP 启停与授权即时保存。API Key 以变量名引用。",
@@ -867,12 +860,6 @@ impl ControlPlaneView {
                 div()
                     .v_flex()
                     .gap_1()
-                    .child(
-                        div()
-                            .text_xl()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(language.choose("EDA 服务", "EDA services")),
-                    )
                     .child(
                         div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(
                             language.choose(

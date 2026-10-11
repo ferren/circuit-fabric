@@ -804,12 +804,6 @@ impl ControlPlaneView {
                     .v_flex()
                     .gap_1()
                     .child(
-                        div()
-                            .text_xl()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(language.choose("密钥保险库", "Secrets vault")),
-                    )
-                    .child(
                         div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(
                             language.choose(
                                 "API Key 加密保存在本机保险库文件中，仅解锁期间驻留内存；同名进程环境变量仍是后备来源。",

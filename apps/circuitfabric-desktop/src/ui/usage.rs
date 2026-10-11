@@ -248,11 +248,8 @@ impl ControlPlaneView {
         }
 
         page("usage-audit-page")
-            .child(div().v_flex().gap_1().child(
-                div().text_xl().font_weight(FontWeight::SEMIBOLD).child(
-                    language.choose("用量与不可变审计", "Usage & immutable audit"),
-                ),
-            ).child(
+            .child(div().v_flex().gap_1()
+            .child(
                 div().text_sm().text_color(rgb(TEXT_SECONDARY)).whitespace_normal().child(
                     language.choose(
                         "用量汇总和审计事件是分离的只读投影；审计行始终保留项目、Provider、运行时和会话来源。",
