@@ -74,12 +74,14 @@ use gpui::{
     ParentElement, Render, Size, StatefulInteractiveElement, StrikethroughStyle, Styled,
     StyledText, Window, WindowOptions, div, img, prelude::FluentBuilder as _, px, rgba,
 };
-use gpui_base::{InputBase, input::InputEditorStyle};
+use gpui_base::{InputBase, Selectable, input::InputEditorStyle};
 use gpui_component::{
     Disableable, IconName, Root, StyledExt,
+    breadcrumb::{Breadcrumb, BreadcrumbItem},
     button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState},
     scroll::ScrollableElement as _,
+    tab::{Tab, TabBar},
 };
 use jlcircuit_eda_bridge::{
     probe::{self, BridgeStatusReport},

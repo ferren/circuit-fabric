@@ -855,16 +855,28 @@ impl ControlPlaneView {
         } else {
             detail = detail.child("尚未选择资源；在左侧选择一项查看详情和应用授权。");
         }
-        let mut tabs = div().flex_none().flex().flex_wrap().gap_2();
+        let back = entity.clone();
+        let breadcrumb = div().flex_none().child(
+            Breadcrumb::new().child(
+                BreadcrumbItem::new("运行时与 Provider").on_click(move |_, _, cx| {
+                    back.update(cx, |view, cx| {
+                        view.agents_selection =
+                            AgentsSelection::Runtime(RuntimeAdapter::CodexAppServer);
+                        cx.notify();
+                    });
+                }),
+            ),
+        );
+        let mut tabs = TabBar::new("tool-kind").underline().flex_none();
         for (tab, label) in [
             (ToolAuthorizationKind::Skill, "技能"),
             (ToolAuthorizationKind::McpServer, "MCP server"),
         ] {
             let chooser = entity.clone();
             tabs = tabs.child(
-                action_button(format!("resource-tab-{label}"))
+                Tab::new()
                     .label(label)
-                    .when(kind == tab, ButtonVariants::primary)
+                    .selected(kind == tab)
                     .on_click(move |_, _, cx| {
                         chooser.update(cx, |view, cx| {
                             view.new_tool_kind = tab;
@@ -875,17 +887,8 @@ impl ControlPlaneView {
                     }),
             );
         }
-        let back = entity;
-        tabs = tabs.child(action_button("resource-back").label("返回运行时与 Provider").on_click(
-            move |_, _, cx| {
-                back.update(cx, |view, cx| {
-                    view.agents_selection =
-                        AgentsSelection::Runtime(RuntimeAdapter::CodexAppServer);
-                    cx.notify();
-                });
-            },
-        ));
         div().flex_1().h_full().min_h(px(0.)).min_w(px(0.)).v_flex().gap_2().p_3().overflow_hidden()
+            .child(breadcrumb)
             .child(tabs)
             .child(div().flex_none().text_xs().whitespace_normal().child("应用 = 保存所选范围的授权，并在下次任务生成运行时配置。项目最终权限为全局与当前项目的交集，再过滤停用/缺失定义。保存、启用、授权、加载/连接分别显示。配置、权限或项目变化会取消既有操作；已完成的外部副作用无法回滚。"))
             .child(div().flex_1().min_h(px(0.)).min_w(px(0.)).flex().gap_3().overflow_hidden().child(list).child(detail))
