@@ -218,26 +218,32 @@ impl ControlPlaneView {
                 ));
             }
         }
-        let current_task = self
-            .task_identity
-            .as_ref()
-            .map(|(project, session, runtime)| {
-                format!(
-                    "{} · {runtime} · {} / {}",
-                    if self
-                        .task_cancel
-                        .as_ref()
-                        .is_some_and(|cancel| cancel.0.load(Ordering::SeqCst))
-                    {
+        let current_task = {
+            let active: Vec<String> = self
+                .quick_tasks
+                .values()
+                .filter_map(|task| {
+                    let (project, session, runtime) = task.identity.as_ref()?;
+                    let phase = if task.cancel.as_ref().is_some_and(|cancel| {
+                        cancel.0.load(Ordering::SeqCst)
+                    }) {
                         language.choose("正在取消", "Cancelling")
                     } else {
                         language.choose("运行中", "Running")
-                    },
-                    project.as_deref().unwrap_or("no project"),
-                    session.as_deref().unwrap_or("not persisted")
-                )
-            })
-            .unwrap_or_else(|| language.choose("无运行任务", "Idle").into());
+                    };
+                    Some(format!(
+                        "{phase} · {runtime} · {} / {}",
+                        project.as_deref().unwrap_or("no project"),
+                        session.as_deref().unwrap_or("not persisted")
+                    ))
+                })
+                .collect();
+            if active.is_empty() {
+                language.choose("无运行任务", "Idle").into()
+            } else {
+                active.join("；")
+            }
+        };
         let health = panel(language.choose("运行时健康", "Runtime health"))
             .child(format!("Codex App Server · {}", self.codex_check_label(language)))
             .child(format!("EDA bridge · {}", self.bridge_health.label(language)))

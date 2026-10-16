@@ -168,6 +168,108 @@ fn datasheet_stream_follows_only_at_bottom_and_expands_live(cx: &mut TestAppCont
 }
 
 #[gpui::test]
+fn session_followup_composer_is_scoped_and_missing_history_keeps_the_draft(
+    cx: &mut TestAppContext,
+) {
+    use circuitfabric_project::{ProjectStorage, SessionCategory};
+    let profile = Profile::new();
+    let root = profile.0.join("project");
+    std::fs::create_dir_all(&root).unwrap();
+    let store = ProjectStorage::create(
+        &root,
+        circuitfabric_contracts::Project {
+            id: "p-original".into(),
+            name: "Original".into(),
+            description: None,
+        },
+    )
+    .unwrap();
+    let settings = circuitfabric_codex_runtime::RuntimeSettings::default();
+    let id = crate::application::runtime_session::start_for(
+        &store,
+        &settings.providers[0].id,
+        "codex",
+        SessionCategory::Datasheet,
+        Some("original-document".into()),
+    )
+    .unwrap();
+    crate::application::runtime_session::finish(
+        &store,
+        &id,
+        "original prompt",
+        Ok("original reply"),
+        None,
+    )
+    .unwrap();
+    let history = store.session_runtime_directory(&id).unwrap();
+    std::fs::create_dir_all(&history).unwrap();
+    let binding = history.join("circuitfabric-thread.json");
+    std::fs::write(&binding, "{}").unwrap();
+    let (view, cx) = mount_profile(cx, &profile, ControlPlaneScreen::SessionsAndTasks);
+    cx.simulate_resize(gpui::size(px(1400.), px(900.)));
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            crate::application::project_data::attach_project_storage(
+                &mut view.workspace,
+                &mut view.project_storages,
+                &mut view.project_data,
+                store.clone(),
+            )
+            .unwrap();
+            view.navigation.selected_project = Some("different-project".into());
+            view.open_session_replay("p-original".into(), id.clone(), cx);
+        })
+    });
+    draw(cx);
+    let input_bounds = cx.debug_bounds("session-followup-input").expect("composer");
+    let modal = cx.debug_bounds("session-detail-modal").unwrap();
+    assert!(input_bounds.bottom() < modal.bottom());
+    let prompt = view
+        .read_with(cx, |v, _| v.session_replay.as_ref().unwrap().followup_prompt.clone().unwrap());
+    cx.update(|window, cx| {
+        prompt.update(cx, |p, cx| p.set_value("human supplement\nmore details", window, cx))
+    });
+    draw(cx);
+    // Busy extraction must prevent continuation even if invoked programmatically.
+    cx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.datasheet_extracting = true;
+            v.send_session_followup(window, cx);
+            assert!(v.session_followup.is_none());
+            v.datasheet_extracting = false;
+            cx.notify();
+        })
+    });
+    std::fs::remove_file(&binding).unwrap();
+    draw(cx);
+    let send = cx.debug_bounds("action-button-send-session-followup").unwrap();
+    cx.simulate_click(send.center(), Default::default());
+    draw(cx);
+    view.read_with(cx, |v, cx| {
+        let (project, session, feedback) = v.session_followup_feedback.as_ref().unwrap();
+        assert_eq!(project, "p-original");
+        assert_eq!(session, &id);
+        assert!(feedback.contains("原生会话历史"));
+        assert!(v.session_followup.is_none());
+        assert_eq!(prompt.read(cx).value().as_str(), "human supplement\nmore details");
+    });
+    assert!(!binding.exists(), "no replacement thread");
+    assert_eq!(store.list_sessions().unwrap().sessions.len(), 1);
+    assert!(!store.load_session(&id).unwrap().body.contains("human supplement"));
+    // Reopening re-evaluates eligibility and never leaks a draft to a different session.
+    cx.update(|_, cx| {
+        view.update(cx, |v, cx| v.open_session_replay("p-original".into(), id.clone(), cx))
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("session-followup-input").is_none());
+    assert!(cx.debug_bounds("session-conversation-body").is_some());
+}
+
+#[cfg(windows)]
+#[path = "session_followup_tests.rs"]
+mod session_followup_tests;
+
+#[gpui::test]
 fn session_entry_renders_only_selected_category_and_opens_the_original_category(
     cx: &mut TestAppContext,
 ) {
@@ -246,7 +348,14 @@ fn session_entry_renders_only_selected_category_and_opens_the_original_category(
     });
     assert_eq!(view.update(cx, |view, _| view.session_category_filter), SessionCategory::Runtime);
     draw(cx);
+    // The detail modal opens on the readable conversation tab; the raw record is one tab away.
+    assert!(cx.debug_bounds("session-conversation-body").is_some());
+    assert!(cx.debug_bounds("session-replay-body").is_none());
+    let raw_tab = cx.debug_bounds("session-tab-raw").expect("raw data tab");
+    cx.simulate_click(raw_tab.center(), Default::default());
+    draw(cx);
     assert!(cx.debug_bounds("session-replay-body").is_some());
+    assert!(cx.debug_bounds("session-conversation-body").is_none());
     cx.update(|_, cx| view.update(cx, ControlPlaneView::close_session_replay));
     draw(cx);
     assert!(cx.debug_bounds("session-detail-modal").is_none());
@@ -264,6 +373,147 @@ fn session_entry_renders_only_selected_category_and_opens_the_original_category(
     );
 }
 
+#[gpui::test]
+fn runtime_history_only_shows_its_own_project_category_and_backend(cx: &mut TestAppContext) {
+    use circuitfabric_project::{ProjectStorage, SessionCategory, SessionSeed};
+    let profile = Profile::new();
+    let records = [
+        ("codex-current", "session-row-codex-current", SessionCategory::Runtime, Some("codex")),
+        ("codex-old", "session-row-codex-old", SessionCategory::Runtime, Some("codex-app-server")),
+        (
+            "claude-current",
+            "session-row-claude-current",
+            SessionCategory::Runtime,
+            Some("claude-code"),
+        ),
+        ("claude-old", "session-row-claude-old", SessionCategory::Runtime, Some("claude")),
+        ("kimi-current", "session-row-kimi-current", SessionCategory::Runtime, Some("kimi-code")),
+        ("dsh-current", "session-row-dsh-current", SessionCategory::Runtime, Some("dsh")),
+        // Pre-category files load as `Legacy` but are the same runtimes'
+        // sessions; they must appear on their own runtime's page, not vanish.
+        ("codex-legacy", "session-row-codex-legacy", SessionCategory::Legacy, Some("codex")),
+        ("kimi-legacy", "session-row-kimi-legacy", SessionCategory::Legacy, Some("kimi-code")),
+        ("eda-legacy", "session-row-eda-legacy", SessionCategory::Legacy, Some("jlcircuit")),
+        ("no-backend", "session-row-no-backend", SessionCategory::Runtime, None),
+        (
+            "unknown-backend",
+            "session-row-unknown-backend",
+            SessionCategory::Runtime,
+            Some("unknown"),
+        ),
+        (
+            "datasheet-codex",
+            "session-row-datasheet-codex",
+            SessionCategory::Datasheet,
+            Some("codex"),
+        ),
+    ];
+    let make_store = |id: &str| {
+        let root = profile.0.join(id);
+        std::fs::create_dir_all(&root).unwrap();
+        ProjectStorage::create(
+            &root,
+            circuitfabric_contracts::Project { id: id.into(), name: id.into(), description: None },
+        )
+        .unwrap()
+    };
+    let store = make_store("p");
+    for (id, _, category, backend) in records {
+        store
+            .start_categorized_session(
+                SessionSeed {
+                    session_id: id.into(),
+                    runtime_profile_id: "zai".into(),
+                    backend_id: backend.map(str::to_owned),
+                },
+                category,
+                None,
+            )
+            .unwrap();
+    }
+    let other = make_store("other");
+    other
+        .start_categorized_session(
+            SessionSeed {
+                session_id: "other-project".into(),
+                runtime_profile_id: "zai".into(),
+                backend_id: Some("codex".into()),
+            },
+            SessionCategory::Runtime,
+            None,
+        )
+        .unwrap();
+    let (view, cx) = mount_profile(cx, &profile, ControlPlaneScreen::AgentsAndMcp);
+    cx.simulate_resize(gpui::size(px(1400.), px(2200.)));
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            for storage in [store.clone(), other] {
+                crate::application::project_data::attach_project_storage(
+                    &mut view.workspace,
+                    &mut view.project_storages,
+                    &mut view.project_data,
+                    storage,
+                )
+                .unwrap();
+            }
+            view.navigation.selected_project = Some("p".into());
+            cx.notify();
+        })
+    });
+    for (adapter, expected) in [
+        (RuntimeAdapter::CodexAppServer, vec!["codex-current", "codex-old", "codex-legacy"]),
+        (RuntimeAdapter::ClaudeCode, vec!["claude-current", "claude-old"]),
+        (RuntimeAdapter::Dsh, vec!["dsh-current"]),
+        (RuntimeAdapter::KimiCode, vec!["kimi-current", "kimi-legacy"]),
+    ] {
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.agents_selection = super::AgentsSelection::Runtime(adapter);
+                cx.notify();
+            })
+        });
+        draw(cx);
+        for (id, selector, _, _) in records {
+            assert_eq!(
+                cx.debug_bounds(selector).is_some(),
+                expected.contains(&id),
+                "{} history must only show its own runtime records: {id}",
+                adapter.label()
+            );
+        }
+        assert!(cx.debug_bounds("session-row-other-project").is_none());
+        let selector = records.iter().find(|(id, _, _, _)| *id == expected[0]).unwrap().1;
+        let row = cx.debug_bounds(selector).unwrap();
+        cx.simulate_click(row.center(), Default::default());
+        draw(cx);
+        assert!(cx.debug_bounds("session-detail-modal").is_some());
+        view.read_with(cx, |view, _| {
+            let selection = view.session_replay.as_ref().unwrap();
+            assert_eq!(selection.project_id, "p");
+            assert_eq!(selection.replay.metadata.session_id, expected[0]);
+            let reason = selection.followup_unavailable.as_deref().unwrap();
+            assert!(!reason.contains("此入口目前支持"));
+            if adapter != RuntimeAdapter::CodexAppServer {
+                assert!(reason.contains(adapter.label()) && reason.contains("尚未接入"));
+            }
+        });
+        cx.update(|_, cx| view.update(cx, ControlPlaneView::close_session_replay));
+        draw(cx);
+    }
+    // The project-wide runtime category intentionally remains cross-runtime.
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.navigation.screen = ControlPlaneScreen::SessionsAndTasks;
+            view.session_category_filter = SessionCategory::Runtime;
+            cx.notify();
+        })
+    });
+    draw(cx);
+    for (_, selector, category, _) in records {
+        assert_eq!(cx.debug_bounds(selector).is_some(), category == SessionCategory::Runtime);
+    }
+    assert!(cx.debug_bounds("session-row-other-project").is_none());
+}
 #[gpui::test]
 fn document_session_history_opens_formatted_scrollable_modal_without_changing_document(
     cx: &mut TestAppContext,
@@ -349,6 +599,33 @@ fn document_session_history_opens_formatted_scrollable_modal_without_changing_do
         modal.size.width > px(800.),
         "modal must provide more reading width than the document pane"
     );
+
+    // The default tab organizes the audit as a chat: the agent's message is a bubble
+    // on the left, and the virtualized list scrolls the long turn in chunks.
+    let conversation = cx.debug_bounds("session-conversation-body").expect("conversation tab");
+    assert!(cx.debug_bounds("session-replay-body").is_none());
+    let bubble = cx.debug_bounds("session-chat-bubble-0").expect("agent bubble");
+    assert!(
+        bubble.left() - conversation.left() < conversation.right() - bubble.right(),
+        "agent bubbles hug the left edge: bubble={bubble:?} body={conversation:?}"
+    );
+    assert!(bubble.size.width <= conversation.size.width * 0.8);
+    let conversation_list = view
+        .read_with(cx, |view, _| view.session_replay.as_ref().unwrap().conversation_list.clone());
+    let chat_before = conversation_list.logical_scroll_top();
+    scroll(cx, conversation.center().x.as_f32(), conversation.center().y.as_f32());
+    let chat_after = conversation_list.logical_scroll_top();
+    assert!(
+        chat_after.item_ix > chat_before.item_ix
+            || chat_after.offset_in_item > chat_before.offset_in_item,
+        "wheel must scroll the conversation list"
+    );
+
+    // The raw tab keeps the full audit record with parsed Markdown and full-text copy.
+    let raw_tab = cx.debug_bounds("session-tab-raw").expect("raw data tab");
+    cx.simulate_click(raw_tab.center(), Default::default());
+    draw(cx);
+    assert!(cx.debug_bounds("session-conversation-body").is_none());
     let body = cx.debug_bounds("session-replay-body").unwrap();
     let header = cx.debug_bounds("session-modal-header").unwrap();
     let markdown =
@@ -444,8 +721,12 @@ fn real_vault_page_allocates_height_to_its_panels(cx: &mut TestAppContext) {
 fn real_runtime_settings_dialogs_show_their_form_body(cx: &mut TestAppContext) {
     let profile = Profile::new();
     let (view, cx) = mount_profile(cx, &profile, ControlPlaneScreen::AgentsAndMcp);
-    for adapter in [RuntimeAdapter::CodexAppServer, RuntimeAdapter::ClaudeCode, RuntimeAdapter::Dsh]
-    {
+    for adapter in [
+        RuntimeAdapter::CodexAppServer,
+        RuntimeAdapter::ClaudeCode,
+        RuntimeAdapter::Dsh,
+        RuntimeAdapter::KimiCode,
+    ] {
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.adapter_settings_open = Some(adapter);
@@ -477,6 +758,597 @@ fn real_runtime_settings_dialogs_show_their_form_body(cx: &mut TestAppContext) {
     assert!(
         field.size.height > px(30.) && field.top() >= card.top() && field.bottom() <= card.bottom(),
         "provider field must be visible inside the dialog: {field:?}"
+    );
+}
+
+#[gpui::test]
+fn provider_editor_model_dropdown_filters_and_never_takes_layout_space(cx: &mut TestAppContext) {
+    use circuitfabric_codex_runtime::ProviderConnection;
+    use circuitfabric_codex_runtime::models::ModelChoice;
+    let profile = Profile::new();
+    let (view, cx) = mount_profile(cx, &profile, ControlPlaneScreen::AgentsAndMcp);
+    // Forty choices prove the windowed dropdown: it opens holding one page
+    // of fifteen (ten visible, the rest behind the scrollbar), and paging
+    // reveals the rest.
+    let choices: Vec<ModelChoice> = (0..40)
+        .map(|index| ModelChoice {
+            id: format!("m{index:02}"),
+            display_name: (index == 5).then(|| "GLM 5.3 Flash".to_owned()),
+            is_default: index == 0,
+            supports_vision: (index == 5).then_some(true),
+        })
+        .collect();
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.provider_editor_open = true;
+            // The mounted profile's first draft provider is the default `zai`
+            // API-key provider; sign the catalog with its current draft.
+            let signature = ControlPlaneView::model_catalog_signature(&view.providers[0], cx);
+            view.model_choices = super::ModelChoicesState {
+                pending: false,
+                fetched_for: Some(signature),
+                dropdown_open: false,
+                generation: 0,
+                choices,
+                error: None,
+                window: super::MODEL_PAGE_SIZE,
+            };
+            cx.notify();
+        })
+    });
+    draw(cx);
+    let card = cx.debug_bounds("provider-settings-card").expect("provider dialog rendered");
+    let wire =
+        cx.debug_bounds("action-button-provider-wire-chat").expect("wire protocol control rendered");
+    assert!(
+        wire.size.height > px(20.) && wire.top() >= card.top() && wire.bottom() <= card.bottom(),
+        "wire protocol control must stay inside the dialog: {wire:?}"
+    );
+    assert!(
+        cx.debug_bounds("provider-model-dropdown").is_none(),
+        "dropdown stays closed until the model field is focused"
+    );
+    let caret = cx.debug_bounds("provider-model-caret").expect("caret rendered in the field");
+    let field_box = cx.debug_bounds("provider-model-box").expect("input box rendered");
+    assert!(
+        caret.left() >= field_box.left() && caret.right() <= field_box.right(),
+        "the caret sits inside the input box: {caret:?} vs {field_box:?}"
+    );
+
+    // The caret opens the dropdown; the overlay must not move the dialog.
+    cx.simulate_click(caret.center(), Default::default());
+    draw(cx);
+    let card_open = cx.debug_bounds("provider-settings-card").expect("provider dialog rendered");
+    assert_eq!(card, card_open, "the floating dropdown takes no layout space");
+    let panel = cx.debug_bounds("provider-model-dropdown").expect("dropdown panel rendered");
+    let field_box = cx.debug_bounds("provider-model-box").expect("input box rendered");
+    let top_gap: f32 = (panel.top() - field_box.bottom()).into();
+    let left_gap: f32 = (panel.left() - field_box.left()).into();
+    let width_gap: f32 = (panel.size.width - field_box.size.width).into();
+    assert!(
+        top_gap.abs() < 1. && left_gap.abs() < 1. && width_gap.abs() < 1.,
+        "panel top edge aligns to the box's bottom-left at field width: {panel:?} vs {field_box:?}"
+    );
+    assert!(
+        cx.debug_bounds("model-dropdown-backdrop").is_some(),
+        "an outside-click backdrop exists while the dropdown is open"
+    );
+    // The field still holds the saved model `glm-5.3-flash`, which is not a
+    // catalog id here, so it filters: nothing matches yet.
+    assert!(cx.debug_bounds("model-choice-row-m00").is_none());
+
+    // Clearing the field shows the first page: fifteen rows are loaded (ten
+    // visible behind the scrollbar), the rest wait for paging.
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            let state = view.providers[0].model.clone();
+            state.update(cx, |state, cx| state.set_value("", window, cx));
+            cx.notify();
+        })
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("model-choice-row-m00").is_some());
+    assert!(cx.debug_bounds("model-choice-row-m09").is_some());
+    assert!(cx.debug_bounds("model-choice-row-m14").is_some());
+    assert!(
+        cx.debug_bounds("model-choice-row-m15").is_none(),
+        "the dropdown opens holding one page of fifteen rows"
+    );
+    assert!(
+        cx.debug_bounds("provider-model-more").is_some(),
+        "a load-more affordance exists while matches remain"
+    );
+    let list = view.read_with(cx, |view, _| view.model_list_scroll.clone());
+    let panel = cx.debug_bounds("provider-model-dropdown").unwrap();
+    assert!(list.max_offset().y > px(160.), "model rows must belong to the scroll container");
+    let first = cx.debug_bounds("model-choice-row-m00").unwrap();
+    let tenth = cx.debug_bounds("model-choice-row-m09").unwrap();
+    assert_eq!(tenth.bottom() - first.top(), px(320.), "ten full-height rows fit the viewport");
+    let viewport = cx.debug_bounds("provider-model-list").expect("scroll viewport");
+    assert_eq!(viewport.size.height, px(320.));
+    assert!(
+        cx.debug_bounds("provider-model-scrollbar").is_some(),
+        "overflow has a visible scrollbar"
+    );
+
+    // Dispatch a real wheel event over a row: it moves the list without
+    // moving the floating panel or the dialog.
+    scroll(cx, viewport.center().x.as_f32(), viewport.center().y.as_f32());
+    draw(cx);
+    assert!(list.offset().y < px(0.), "wheel must move model rows");
+    assert!(cx.debug_bounds("model-choice-row-m00").unwrap().top() < first.top());
+    assert_eq!(cx.debug_bounds("provider-model-dropdown").unwrap(), panel);
+    assert_eq!(cx.debug_bounds("provider-settings-card").unwrap(), card);
+    assert_eq!(view.read_with(cx, |view, _| view.model_choices.window), 15);
+    for _ in 0..3 {
+        scroll(cx, viewport.center().x.as_f32(), viewport.center().y.as_f32());
+        draw(cx);
+    }
+    draw(cx);
+    assert_eq!(
+        view.read_with(cx, |view, _| view.model_choices.window),
+        30,
+        "wheeling to the loaded bottom must load the next fifteen rows"
+    );
+    assert!(cx.debug_bounds("model-choice-row-m29").is_some());
+    assert!(cx.debug_bounds("model-choice-row-m30").is_none());
+
+    // Drag the actual scrollbar thumb to the bottom to load the final page.
+    let viewport = cx.debug_bounds("provider-model-list").unwrap();
+    let content_height = viewport.size.height + list.max_offset().y;
+    let thumb_top = viewport.top() + (-list.offset().y / content_height) * viewport.size.height;
+    let start = point(viewport.right() - px(5.), thumb_top + px(12.));
+    cx.simulate_mouse_down(start, gpui::MouseButton::Left, Default::default());
+    draw(cx);
+    let end = point(start.x, viewport.bottom() - px(2.));
+    cx.simulate_mouse_move(end, Some(gpui::MouseButton::Left), Default::default());
+    draw(cx);
+    cx.simulate_mouse_up(end, gpui::MouseButton::Left, Default::default());
+    draw(cx);
+    draw(cx);
+    assert!(list.offset().y < px(-500.), "dragging the thumb must scroll the list");
+    assert_eq!(
+        view.read_with(cx, |view, _| view.model_choices.window),
+        45,
+        "dragging to the loaded bottom must load the next fifteen rows"
+    );
+    draw(cx);
+    assert!(cx.debug_bounds("model-choice-row-m15").is_some());
+    assert!(cx.debug_bounds("model-choice-row-m39").is_some());
+    assert!(
+        cx.debug_bounds("provider-model-more").is_none(),
+        "no load-more affordance once every match is loaded"
+    );
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            let state = view.providers[0].model.clone();
+            state.update(cx, |state, cx| state.set_value("m1", window, cx));
+            cx.notify();
+        })
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("model-choice-row-m10").is_some()
+            && cx.debug_bounds("model-choice-row-m11").is_some(),
+        "matching models stay visible while filtering"
+    );
+    assert!(
+        cx.debug_bounds("model-choice-row-m00").is_none(),
+        "non-matching models are filtered out"
+    );
+    assert_eq!(list.offset().y, px(0.), "a new search starts at the top");
+    assert_eq!(list.max_offset().y, px(0.), "ten matches fit without scrolling");
+    assert!(cx.debug_bounds("provider-model-scrollbar").is_none());
+
+    // Picking a row fills the field and closes the dropdown.
+    let row = cx.debug_bounds("model-choice-row-m10").expect("row rendered");
+    cx.simulate_click(row.center(), Default::default());
+    draw(cx);
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            assert_eq!(view.providers[0].model.read(cx).value().as_ref(), "m10");
+            assert!(!view.model_choices.dropdown_open, "a picked row closes the dropdown");
+        })
+    });
+    assert!(cx.debug_bounds("provider-model-dropdown").is_none());
+
+    // Reopening with an exact catalog id in the field shows the catalog's
+    // first rows again instead of filtering down to the selection.
+    let caret = cx.debug_bounds("provider-model-caret").expect("caret rendered");
+    cx.simulate_click(caret.center(), Default::default());
+    draw(cx);
+    assert!(
+        cx.debug_bounds("model-choice-row-m00").is_some(),
+        "an exact selection reopens to the catalog's first rows"
+    );
+    assert_eq!(view.read_with(cx, |view, _| view.model_choices.window), 15);
+    assert_eq!(list.offset().y, px(0.), "reopening starts on the first page");
+
+    // A click anywhere outside the panel closes the dropdown.
+    let card = cx.debug_bounds("provider-settings-card").expect("provider dialog rendered");
+    cx.simulate_click(point(card.left() + px(100.), card.top() + px(20.)), Default::default());
+    draw(cx);
+    assert!(
+        cx.debug_bounds("provider-model-dropdown").is_none(),
+        "clicking outside the dropdown closes it"
+    );
+
+    // Switching the connection mode invalidates the fetch signature: the list
+    // from the API-key fetch must not offer picks into a direct-mode provider.
+    let caret = cx.debug_bounds("provider-model-caret").expect("caret rendered");
+    cx.simulate_click(caret.center(), Default::default());
+    draw(cx);
+    assert!(cx.debug_bounds("provider-model-dropdown").is_some());
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.set_provider_connection(ProviderConnection::CodexAccount, cx);
+            cx.notify();
+        })
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("provider-model-dropdown").is_none(),
+        "stale model choices must disappear when the connection changes"
+    );
+}
+
+#[gpui::test]
+fn provider_editor_cancel_restores_fields_for_every_dismissal(cx: &mut TestAppContext) {
+    use circuitfabric_codex_runtime::{ProviderConnection, ProviderWireApi, RuntimeSettings};
+    let profile = Profile::new();
+    let settings_path = profile.0.join("runtime.json");
+    let mut settings = RuntimeSettings::default();
+    settings.providers[0].api_key_environment_variable = "CF_CANCEL_TEST_UNUSED_KEY".into();
+    settings.save(&settings_path).unwrap();
+    let file_before = std::fs::read(&settings_path).unwrap();
+    let (view, cx) = mount_profile(cx, &profile, ControlPlaneScreen::AgentsAndMcp);
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.agents_selection = super::AgentsSelection::Provider;
+            cx.notify();
+        })
+    });
+    draw(cx);
+    let original = cx.update(|_, cx| view.update(cx, |view, cx| view.provider_values(cx)));
+    for dismissal in [
+        "action-button-provider-editor-cancel-top",
+        "action-button-provider-editor-cancel",
+        "backdrop",
+    ] {
+        let open = cx.debug_bounds("action-button-open-provider-editor").unwrap();
+        cx.simulate_click(open.center(), Default::default());
+        draw(cx);
+        let generation = view.read_with(cx, |view, _| view.model_choices.generation);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                let fields = &mut view.providers[0];
+                for (input, value) in [
+                    (&fields.id, "cancelled-id"),
+                    (&fields.name, "cancelled-name"),
+                    (&fields.base_url, "https://cancelled.example/v1"),
+                    (&fields.model, "cancelled-model"),
+                    (&fields.api_key_environment_variable, "CANCELLED_KEY"),
+                    (&fields.vision_base_url, "https://cancelled.example/vision"),
+                    (&fields.vision_model, "cancelled-vision"),
+                    (&fields.vision_api_key_environment_variable, "CANCELLED_VISION_KEY"),
+                ] {
+                    input.update(cx, |state, cx| state.set_value(value, window, cx));
+                }
+                fields.wire_api = ProviderWireApi::Chat;
+                fields.native_vision = true;
+                fields.enabled = false;
+                view.set_provider_connection(ProviderConnection::CodexAccount, cx);
+                view.model_catalogs.insert("cancelled-id".into(), vec![]);
+                cx.notify();
+            })
+        });
+        draw(cx);
+        cx.update(|_, cx| view.update(cx, |view, cx| view.close_model_dropdown(cx)));
+        draw(cx);
+        let target = if dismissal == "backdrop" {
+            let card = cx.debug_bounds("provider-settings-card").unwrap();
+            point(card.left() - px(10.), card.top())
+        } else {
+            cx.debug_bounds(dismissal).unwrap().center()
+        };
+        cx.simulate_click(target, Default::default());
+        draw(cx);
+        assert!(cx.debug_bounds("provider-settings-card").is_none());
+        assert_eq!(
+            cx.update(|_, cx| view.update(cx, |view, cx| view.provider_values(cx))),
+            original,
+            "{dismissal} must restore the values used by cards and details"
+        );
+        assert!(
+            view.read_with(cx, |view, _| view.model_choices.generation) > generation,
+            "cancel must invalidate outstanding draft model fetches"
+        );
+        assert!(
+            view.read_with(cx, |view, _| view.model_catalogs.is_empty()),
+            "cancel must discard catalogs fetched for draft endpoints"
+        );
+        assert!(
+            view.read_with(cx, |view, cx| view.providers[0].base_url.read(cx).is_editable()),
+            "cancel must restore field editability after changing the connection mode"
+        );
+        assert_eq!(
+            std::fs::read(&settings_path).unwrap(),
+            file_before,
+            "cancel must never write settings"
+        );
+    }
+}
+
+#[gpui::test]
+fn provider_editor_save_commits_and_failed_save_can_be_cancelled(cx: &mut TestAppContext) {
+    use circuitfabric_codex_runtime::RuntimeSettings;
+    let profile = Profile::new();
+    let settings_path = profile.0.join("runtime.json");
+    let mut settings = RuntimeSettings::default();
+    settings.providers[0].api_key_environment_variable = "CF_CANCEL_TEST_UNUSED_KEY".into();
+    settings.save(&settings_path).unwrap();
+    let (view, cx) = mount_profile(cx, &profile, ControlPlaneScreen::AgentsAndMcp);
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.agents_selection = super::AgentsSelection::Provider;
+            cx.notify();
+        })
+    });
+    draw(cx);
+    let open = cx.debug_bounds("action-button-open-provider-editor").unwrap();
+    cx.simulate_click(open.center(), Default::default());
+    draw(cx);
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.providers[0]
+                .name
+                .update(cx, |state, cx| state.set_value("Saved name", window, cx));
+            cx.notify();
+        })
+    });
+    draw(cx);
+    let save = cx.debug_bounds("action-button-provider-editor-save").unwrap();
+    cx.simulate_click(save.center(), Default::default());
+    draw(cx);
+    assert!(cx.debug_bounds("provider-settings-card").is_none());
+    assert!(view.read_with(cx, |view, _| view.provider_editor_snapshot.is_none()));
+    assert_eq!(
+        RuntimeSettings::load_or_default(&settings_path).unwrap().providers[0].name,
+        "Saved name"
+    );
+    let saved_bytes = std::fs::read(&settings_path).unwrap();
+
+    // A failed validation keeps the edited fields and the original snapshot.
+    // Cancelling afterward restores the latest successful save, not startup values.
+    let open = cx.debug_bounds("action-button-open-provider-editor").unwrap();
+    cx.simulate_click(open.center(), Default::default());
+    draw(cx);
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.providers[0].id.update(cx, |state, cx| state.set_value("", window, cx));
+            view.providers[0]
+                .name
+                .update(cx, |state, cx| state.set_value("Failed draft", window, cx));
+            cx.notify();
+        })
+    });
+    draw(cx);
+    let save = cx.debug_bounds("action-button-provider-editor-save").unwrap();
+    cx.simulate_click(save.center(), Default::default());
+    draw(cx);
+    assert!(cx.debug_bounds("provider-settings-card").is_some());
+    assert!(view.read_with(cx, |view, _| view.dialog_error.is_some()));
+    assert_eq!(
+        view.read_with(cx, |view, cx| view.providers[0].name.read(cx).value().to_string()),
+        "Failed draft"
+    );
+    assert_eq!(std::fs::read(&settings_path).unwrap(), saved_bytes);
+    let cancel = cx.debug_bounds("action-button-provider-editor-cancel-top").unwrap();
+    cx.simulate_click(cancel.center(), Default::default());
+    draw(cx);
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            assert_eq!(view.provider_values(cx), view.saved_settings.providers);
+            assert!(view.dialog_error.is_none());
+        })
+    });
+    assert_eq!(std::fs::read(&settings_path).unwrap(), saved_bytes);
+}
+#[gpui::test]
+fn provider_editor_model_field_click_opens_the_dropdown(cx: &mut TestAppContext) {
+    let profile = Profile::new();
+    let (view, cx) = mount_profile(cx, &profile, ControlPlaneScreen::AgentsAndMcp);
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.provider_editor_open = true;
+            cx.notify();
+        })
+    });
+    draw(cx);
+    let field = cx.debug_bounds("provider-model").expect("model field rendered");
+    cx.simulate_click(field.center(), Default::default());
+    draw(cx);
+    cx.update(|_, cx| {
+        view.update(cx, |view, _| {
+            assert!(view.model_choices.dropdown_open, "clicking the model field opens the dropdown");
+        })
+    });
+    // The automatically started fetch signs itself with the current draft.
+    assert!(cx.debug_bounds("provider-model-dropdown").is_some());
+}
+
+#[gpui::test]
+fn quick_verification_sessions_are_isolated_per_runtime(cx: &mut TestAppContext) {
+    use circuitfabric_codex_runtime::execution::Cancellation;
+    let profile = Profile::new();
+    let (view, cx) = mount_profile(cx, &profile, ControlPlaneScreen::AgentsAndMcp);
+    // Two runtimes each hold an in-flight quick task with its own result.
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            for adapter in [RuntimeAdapter::CodexAppServer, RuntimeAdapter::KimiCode] {
+                let task = view.quick_task_mut(adapter);
+                task.cancel = Some(Cancellation::default());
+                task.result = format!("result-{}", adapter.backend_id());
+                task.identity = Some((None, None, adapter.backend_id().to_owned()));
+            }
+            cx.notify();
+        })
+    });
+    cx.update(|_, cx| {
+        view.update(cx, |view, _| {
+            assert!(view.quick_task_busy(RuntimeAdapter::CodexAppServer));
+            assert!(view.quick_task_busy(RuntimeAdapter::KimiCode));
+            assert!(!view.quick_task_busy(RuntimeAdapter::ClaudeCode));
+            assert!(!view.quick_task_busy(RuntimeAdapter::Dsh));
+            assert!(view.any_quick_task_running());
+            assert_eq!(view.quick_task(RuntimeAdapter::KimiCode).result, "result-kimi-code");
+        })
+    });
+
+    // Cancelling on the Codex page cancels only the Codex task: the other
+    // runtime's run flag and result text stay untouched.
+    draw(cx);
+    let cancel =
+        cx.debug_bounds("action-button-cancel-agent-task").expect("cancel button rendered");
+    cx.simulate_click(cancel.center(), Default::default());
+    cx.update(|_, cx| {
+        view.update(cx, |view, _| {
+            assert!(view.quick_task(RuntimeAdapter::CodexAppServer).cancel.as_ref().is_some_and(
+                |cancel| cancel.0.load(Ordering::SeqCst)
+            ));
+            assert!(
+                !view.quick_task(RuntimeAdapter::KimiCode).cancel.as_ref().is_some_and(
+                    |cancel| cancel.0.load(Ordering::SeqCst)
+                ),
+                "the other runtime's run is not cancelled"
+            );
+            assert_eq!(view.quick_task(RuntimeAdapter::CodexAppServer).result, "正在取消并清理进程…");
+            assert_eq!(
+                view.quick_task(RuntimeAdapter::KimiCode).result,
+                "result-kimi-code",
+                "the other runtime's result is not overwritten"
+            );
+        })
+    });
+
+    // A Codex follow-up continuation blocks only the Codex slot.
+    cx.update(|_, cx| {
+        view.update(cx, |view, _| {
+            view.quick_task_mut(RuntimeAdapter::CodexAppServer).cancel = None;
+            view.session_followup = Some(super::SessionFollowupRun {
+                project_id: "p".into(),
+                session_id: "s".into(),
+                cancel: Cancellation::default(),
+                stream: std::sync::Arc::new(std::sync::Mutex::new(
+                    super::SessionFollowupStream::default(),
+                )),
+                displayed_revision: 0,
+            });
+            assert!(view.quick_task_busy(RuntimeAdapter::CodexAppServer));
+            assert!(
+                !view.quick_task_busy(RuntimeAdapter::ClaudeCode),
+                "the follow-up blocks no other runtime's slot"
+            );
+        })
+    });
+
+    // Cross-runtime changes (project switch, grant edits) still cancel all.
+    cx.update(|_, cx| {
+        view.update(cx, |view, _| {
+            view.cancel_all_quick_tasks();
+            assert!(view.quick_task(RuntimeAdapter::KimiCode).cancel.as_ref().is_some_and(
+                |cancel| cancel.0.load(Ordering::SeqCst)
+            ));
+        })
+    });
+}
+
+#[gpui::test]
+fn provider_detail_badges_vision_from_the_model_catalog(cx: &mut TestAppContext) {
+    use circuitfabric_codex_runtime::models::ModelChoice;
+    use circuitfabric_codex_runtime::{LlmProviderSettings, ProviderConnection, RuntimeSettings};
+    let profile = Profile::new();
+    {
+        // A Codex account-direct provider alongside the default zai one.
+        let mut settings = RuntimeSettings::default();
+        let mut codex = LlmProviderSettings::default();
+        codex.id = "codex".into();
+        codex.connection = ProviderConnection::CodexAccount;
+        codex.model = "gpt-6.1-sol".into();
+        settings.providers.push(codex);
+        settings.save(&profile.0.join("runtime.json")).unwrap();
+    }
+    let (view, cx) = mount_profile(cx, &profile, ControlPlaneScreen::AgentsAndMcp);
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.agents_selection = super::AgentsSelection::Provider;
+            // The default zai provider (index 0) configures a separate vision
+            // model, so it carries the badge from its own configuration.
+            view.selected_provider = 0;
+            cx.notify();
+        })
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("provider-vision-badge").is_some(),
+        "an API-key provider with vision configured keeps its badge"
+    );
+
+    // The direct provider badges only once the fetched catalog says the
+    // selected model supports vision.
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.selected_provider = 1;
+            cx.notify();
+        })
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("provider-vision-badge").is_none(),
+        "no catalog, no badge — the direct provider never guesses"
+    );
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.model_catalogs.insert(
+                "codex".into(),
+                vec![
+                    ModelChoice {
+                        id: "gpt-6.1-sol".into(),
+                        display_name: None,
+                        is_default: true,
+                        supports_vision: Some(true),
+                    },
+                    ModelChoice {
+                        id: "gpt-6-text".into(),
+                        display_name: None,
+                        is_default: false,
+                        supports_vision: Some(false),
+                    },
+                ],
+            );
+            cx.notify();
+        })
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("provider-vision-badge").is_some(),
+        "the selected model's catalog vision support shows the badge"
+    );
+
+    // A catalog that reports no vision support for the selected model removes
+    // the badge again.
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            let state = view.providers[1].model.clone();
+            state.update(cx, |state, cx| state.set_value("gpt-6-text", window, cx));
+            cx.notify();
+        })
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("provider-vision-badge").is_none(),
+        "a text-only selected model shows no badge"
     );
 }
 
@@ -1263,4 +2135,116 @@ fn workspace_panes_scroll_independently_and_keep_heading_visible(cx: &mut TestAp
     assert_eq!(cx.debug_bounds("right-first").unwrap(), right);
     assert_eq!(cx.debug_bounds("workspace-heading").unwrap(), heading);
     assert_eq!(cx.debug_bounds("fixed-footer").unwrap().top(), px(280.));
+}
+
+#[gpui::test]
+fn datasheet_data_tables_keep_headers_on_one_line_and_align_columns(cx: &mut TestAppContext) {
+    use circuitfabric_contracts::{
+        DATASHEET_EXTRACTION_SCHEMA_VERSION, DatasheetExtraction, DatasheetOverview,
+        DatasheetParameter, DatasheetPin, DatasheetPinKind,
+    };
+    let profile = Profile::new();
+    let (view, cx) = mount_profile(cx, &profile, ControlPlaneScreen::Documents);
+    cx.simulate_resize(gpui::size(px(1400.), px(900.)));
+    let pin = |number: &str, name: &str, kind: DatasheetPinKind, description: &str| DatasheetPin {
+        number: number.into(),
+        name: name.into(),
+        kind,
+        description: description.into(),
+        evidence: None,
+    };
+    let parameter = |name: &str, conditions: Option<&str>| DatasheetParameter {
+        parameter: name.into(),
+        symbol: Some("VIN".into()),
+        min: Some("-0.3".into()),
+        typ: None,
+        max: Some("26".into()),
+        unit: Some("V".into()),
+        conditions: conditions.map(str::to_owned),
+        evidence: None,
+    };
+    let extraction = std::sync::Arc::new(DatasheetExtraction {
+        schema_version: DATASHEET_EXTRACTION_SCHEMA_VERSION,
+        document_id: "doc-a".into(),
+        content_hash: "sha256:fixture".into(),
+        extracted_at_unix_seconds: 0,
+        overview: DatasheetOverview {
+            title: "Example step-down converter".into(),
+            ..Default::default()
+        },
+        pins: vec![
+            pin("1", "VIN", DatasheetPinKind::Power, "输入电源脚，就近接输入电容。"),
+            pin(
+                "AB12",
+                "GPIO0_BOOT",
+                DatasheetPinKind::InputOutput,
+                "BGA 编号与较长名称也不能把表头挤换行。",
+            ),
+            pin(
+                "3",
+                "EN",
+                DatasheetPinKind::Input,
+                "使能脚，高电平有效；拉低进入关断模式，静态电流极低。",
+            ),
+        ],
+        absolute_maximum_ratings: vec![parameter("Input voltage", None)],
+        electrical_characteristics: vec![
+            parameter("Quiescent current", Some("VIN = 12 V, no load")),
+            parameter("Reference voltage", None),
+        ],
+        operating_conditions: vec![],
+        notes: vec![],
+    });
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.document_preview = Some(super::DocumentPreviewSelection {
+                project_id: "p".into(),
+                document_id: "doc-a".into(),
+                file_name: "current.pdf".into(),
+                state: super::DocumentPreviewState::Unavailable { reason: "fixture".into() },
+                extraction: Some(extraction),
+            });
+            view.preview_show_data = true;
+            cx.notify();
+        });
+    });
+    draw(cx);
+    let header = cx.debug_bounds("datasheet-pin-header").expect("pin table header band");
+    assert!(
+        header.size.height <= px(40.),
+        "pin header stays on one line, got {:?}",
+        header.size.height
+    );
+    let description_header = cx.debug_bounds("pin-header-cell-description").unwrap();
+    assert!(
+        description_header.size.width > px(40.),
+        "description header gets a real column width, got {:?}",
+        description_header.size.width
+    );
+    for (header_selector, cell_selector, column) in [
+        ("pin-header-cell-number", "pin-cell-number-0", "number"),
+        ("pin-header-cell-name", "pin-cell-name-0", "name"),
+        ("pin-header-cell-kind", "pin-cell-kind-0", "kind"),
+    ] {
+        let header_cell = cx.debug_bounds(header_selector).unwrap();
+        let data_cell = cx.debug_bounds(cell_selector).unwrap();
+        assert_eq!(header_cell.left(), data_cell.left(), "{column} column misaligned");
+        assert_eq!(
+            header_cell.size.width, data_cell.size.width,
+            "{column} column width differs between header and row"
+        );
+    }
+    let description_cell = cx.debug_bounds("pin-cell-description-0").unwrap();
+    assert_eq!(description_header.left(), description_cell.left(), "description misaligned");
+    let parameter_header =
+        cx.debug_bounds("datasheet-parameter-header-electricalCharacteristics").unwrap();
+    assert!(
+        parameter_header.size.height <= px(40.),
+        "parameter header stays on one line, got {:?}",
+        parameter_header.size.height
+    );
+    assert!(
+        cx.debug_bounds("parameter-header-cell-conditions").is_some(),
+        "a conditions column appears when any row carries conditions"
+    );
 }

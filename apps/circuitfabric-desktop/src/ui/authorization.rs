@@ -160,9 +160,7 @@ impl ControlPlaneView {
         id: &str,
         cx: &mut Context<Self>,
     ) {
-        if let Some(cancel) = &self.task_cancel {
-            cancel.cancel();
-        }
+        self.cancel_all_quick_tasks();
         let kind_label = Self::tool_kind_label(kind, self.language);
         match scope {
             ToolScope::Global => {

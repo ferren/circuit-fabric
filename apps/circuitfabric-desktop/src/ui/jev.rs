@@ -11,9 +11,7 @@ impl ControlPlaneView {
             crate::application::settings_persistence::SettingsUpdate::Catalog(self.catalog.clone()),
         ) {
             Ok(()) => {
-                if let Some(cancel) = &self.task_cancel {
-                    cancel.cancel();
-                }
+                self.cancel_all_quick_tasks();
                 self.status = "已保存定义；当前任务已请求取消，下次任务使用新配置".into();
                 true
             }
@@ -59,9 +57,7 @@ impl ControlPlaneView {
             ),
         ) {
             Ok(()) => {
-                if let Some(cancel) = &self.task_cancel {
-                    cancel.cancel();
-                }
+                self.cancel_all_quick_tasks();
                 self.status = if authorized {
                     format!("已全局授权 {BUNDLED_JEV_SERVER_ID}；当前任务已请求取消。")
                 } else {

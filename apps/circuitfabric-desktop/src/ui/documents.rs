@@ -141,7 +141,7 @@ impl ControlPlaneView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.datasheet_extracting {
+        if self.datasheet_extracting || self.session_followup.is_some() {
             return;
         }
         let Some(preview) = self.document_preview.as_ref() else {
@@ -203,6 +203,7 @@ impl ControlPlaneView {
             std::sync::Arc::new(std::sync::Mutex::new(resume_from.unwrap_or_default()));
         let final_checkpoint = checkpoint.clone();
         let run_cancel = cancel.clone();
+        let summary_language = self.language.choose("简体中文", "English");
         let stopped = move || cancel.0.load(std::sync::atomic::Ordering::SeqCst);
         let log = move |text: &str| {
             if let Ok(mut buffer) = stream.lock() {
@@ -308,10 +309,14 @@ impl ControlPlaneView {
                         let history = storage.session_runtime_directory(&session_id).map_err(|error| error.to_string())?;
                         let mut usage = None;
                         let mut current_stream = None;
+                        let mut reasoning = String::new();
+                        // Jev uses the controller's project grants separately;
+                        // this model thread and its history follow-ups have no tools.
                         let outcome = run_session_observed_within(
                             &settings, &ToolAuthorizationSettings::default(), prompt,
                             None, storage.root(), &history, secrets.as_ref(), &run_cancel,
                             &mut |kind, delta| {
+                                if kind == TurnDelta::Reasoning { reasoning.push_str(delta); }
                                 if current_stream != Some(kind) {
                                     current_stream = Some(kind);
                                     log(match kind { TurnDelta::Reasoning => "\n[思考]\n", TurnDelta::Answer => "\n[输出]\n" });
@@ -323,8 +328,11 @@ impl ControlPlaneView {
                         );
                         let stalled = outcome.as_ref().is_err_and(|error| error.is_stalled() || error.is_too_long());
                         let response = outcome.map_err(|error| error.to_string());
-                        crate::application::runtime_session::finish(&storage, &session_id,
-                            &format!("文档提取 document={document_id} hash={} stage={label} attempt={attempt}\n{prompt}", request.content_hash),
+                        // Store the user envelope first, then its runtime-provided summary.
+                        crate::application::runtime_session::begin_followup(&storage, &session_id,
+                            &format!("文档提取 document={document_id} hash={} stage={label} attempt={attempt}\n{prompt}", request.content_hash))?;
+                        crate::application::runtime_session::append_reasoning(&storage, &session_id, &reasoning)?;
+                        crate::application::runtime_session::finish_followup(&storage, &session_id,
                             response.as_deref().map_err(String::as_str), usage)
                             .map_err(|error| format!("文档提取会话用量未保存：{error}"))?;
                         storage.resume_session(&session_id).map_err(|error| error.to_string())?;
@@ -343,6 +351,11 @@ impl ControlPlaneView {
                     &request,
                     &pages,
                     |category, prompt, selected_pages| {
+                        let localized;
+                        let prompt = if category == "pins" {
+                            localized = format!("{prompt}\n{}", crate::application::datasheet_dialogue::overview_instruction(summary_language));
+                            localized.as_str()
+                        } else { prompt };
                         let step = model_step;
                         model_step += 1;
                         let category_label = match category {

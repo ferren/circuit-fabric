@@ -51,8 +51,9 @@ use crate::application::usage_audit::{AuditKindFilter, UsageAuditModel, UsagePer
 use circuitfabric_codex_runtime::secrets::{SecretSource, UnlockedVault, secret_source};
 use circuitfabric_codex_runtime::tools::BUNDLED_JEV_SERVER_ID;
 use circuitfabric_codex_runtime::{
-    CodexAppServerHandle, GlobalPreferences, GlobalTheme, LlmProviderSettings, LogLevel,
-    RuntimeSettings, SecretStorageProvider, ToolAuthorizationKind, ToolAuthorizationSettings,
+    CodexAppServerHandle, CodexAppServerSettings, GlobalPreferences, GlobalTheme,
+    LlmProviderSettings, LogLevel, ProviderConnection, ProviderWireApi, RuntimeSettings,
+    SecretStorageProvider, ToolAuthorizationKind, ToolAuthorizationSettings,
 };
 use circuitfabric_contracts::{
     DatasheetExtraction, DocumentKind, FactStatus, Project, SnapshotAuthority,
@@ -69,14 +70,15 @@ use circuitfabric_project::{
     ProjectStorage, ProjectWorkspace, SessionReplay, is_evidence_indexable, rfc3339,
 };
 use gpui::{
-    AnyElement, AppContext, ClickEvent, Context, Div, DragMoveEvent, Entity, FontStyle, FontWeight,
-    HighlightStyle, Image, ImageFormat, InteractiveElement, IntoElement, KeystrokeEvent,
-    ParentElement, Render, Size, StatefulInteractiveElement, StrikethroughStyle, Styled,
-    StyledText, Window, WindowOptions, div, img, prelude::FluentBuilder as _, px, rgba,
+    AnyElement, AppContext, ClickEvent, Context, Div, DragMoveEvent, Entity, FontStyle,
+    FontWeight, HighlightStyle, Image, ImageFormat, InteractiveElement, IntoElement,
+    KeystrokeEvent, MouseButton, ParentElement, Render, Size, StatefulInteractiveElement,
+    StrikethroughStyle, Styled, StyledText, Window, WindowOptions, deferred, div, img,
+    prelude::FluentBuilder as _, px, rgba,
 };
 use gpui_base::{InputBase, Selectable, input::InputEditorStyle};
 use gpui_component::{
-    Disableable, IconName, Root, StyledExt,
+    Disableable, Icon, IconName, Root, Sizable, StyledExt,
     breadcrumb::{Breadcrumb, BreadcrumbItem},
     button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState},
@@ -123,6 +125,7 @@ pub(crate) fn run() {
                     pdf_cursors::install(window);
 
                     let view = cx.new(|cx| ControlPlaneView::new(window, cx));
+                    view.update(cx, |view, cx| view.prefetch_direct_model_catalogs(cx));
                     #[cfg(feature = "ui-test-support")]
                     view.update(cx, |view, cx| view.schedule_overview_capture(window, cx));
                     cx.observe_keystrokes({

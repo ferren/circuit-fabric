@@ -121,15 +121,16 @@ impl ControlPlaneView {
             );
         }
 
-        let mut format_choices = div().flex().flex_wrap().gap_2();
+        let mut format_choices = TabBar::new("bom-format-tabs").underline().flex_none();
         for format in BomExportFormat::ALL {
             let selector = entity.clone();
             let bound_hash = snapshot.snapshot_hash.clone();
-            let selected = format == self.bom_export_format;
+            let debug_selector = format!("bom-export-format-{format:?}");
             format_choices = format_choices.child(
-                action_button(format!("bom-export-format-{format:?}"))
+                Tab::new()
+                    .debug_selector(move || debug_selector.clone())
                     .label(format.label())
-                    .when(selected, |button| button.primary())
+                    .selected(format == self.bom_export_format)
                     .on_click(move |_, _, cx| {
                         selector.update(cx, |view, cx| {
                             view.bom_export_format = format;

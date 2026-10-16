@@ -456,13 +456,15 @@ impl ControlPlaneView {
                     ),
                 ));
         }
-        let mut scopes = div().flex().flex_wrap().gap_1();
+        let mut scopes = TabBar::new("semantic-scope-tabs").underline().flex_none();
         for scope in SemanticQueryScope::ALL {
             let setter = entity.clone();
+            let debug_selector = format!("semantic-scope-{scope:?}");
             scopes = scopes.child(
-                action_button(format!("semantic-scope-{:?}", scope))
+                Tab::new()
+                    .debug_selector(move || debug_selector.clone())
                     .label(scope.label(language))
-                    .when(scope == self.semantic_query_scope, |button| button.primary())
+                    .selected(scope == self.semantic_query_scope)
                     .on_click(move |_, _, cx| {
                         setter.update(cx, |view, cx| {
                             view.semantic_query_scope = scope;

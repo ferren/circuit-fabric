@@ -44,7 +44,7 @@ impl Render for ControlPlaneView {
             None
         };
         let session_modal = (self.session_modal_open && self.session_replay.is_some())
-            .then(|| self.render_session_modal(cx).into_any_element());
+            .then(|| self.render_session_modal(window, cx).into_any_element());
         let datasheet_stream_modal = (self.datasheet_stream_modal_open
             && self.datasheet_stream.is_some())
         .then(|| self.render_datasheet_stream_modal(cx).into_any_element());

@@ -33,6 +33,11 @@ impl ControlPlaneView {
         provider: LlmProviderSettings,
         cx: &mut Context<Self>,
     ) -> ProviderFields {
+        // A direct (Codex or Kimi account) provider has no endpoint of its
+        // own: the base URL, API key, and separate vision fields do not
+        // apply. The stored values stay intact and editable again after
+        // switching back.
+        let direct = provider.uses_codex_account() || provider.uses_kimi_account();
         let vision_base_url = Self::input(
             window,
             provider.vision_base_url.unwrap_or_default(),
@@ -55,17 +60,57 @@ impl ControlPlaneView {
                 state.update(cx, |state, cx| state.set_disabled(true, cx));
             }
         }
+        let base_url = Self::input(window, provider.base_url, "https://api.example.com/v1", cx);
+        let model = Self::input(window, provider.model, "model-name", cx);
+        // The model field drives the floating catalog dropdown: focusing or
+        // typing opens it, leaving the field closes it. Row picks use
+        // mouse-down, which lands before the blur this Blur arm handles. A
+        // change that leaves an exact catalog id in the field is a finished
+        // selection (a row pick sets the value programmatically), so it closes
+        // the dropdown instead of reopening it.
+        cx.subscribe(&model, |view, _, event, cx| match event {
+            InputEvent::Focus => view.open_model_dropdown(cx),
+            InputEvent::Change => {
+                if view.provider_editor_open {
+                    let selected = view.selected_provider.min(view.providers.len() - 1);
+                    let value = view.providers[selected].model.read(cx).value().trim().to_owned();
+                    let selected_exact =
+                        view.model_choices.choices.iter().any(|choice| choice.id == value);
+                    view.model_choices.dropdown_open = !selected_exact;
+                    view.model_choices.window = super::MODEL_PAGE_SIZE;
+                    view.model_list_scroll.set_offset(gpui::Point::default());
+                    cx.notify();
+                }
+            }
+            InputEvent::Blur => view.close_model_dropdown(cx),
+            _ => {}
+        })
+        .detach();
+        let api_key_environment_variable = Self::input(
+            window,
+            provider.api_key_environment_variable,
+            "API_KEY_ENVIRONMENT_VARIABLE",
+            cx,
+        );
+        if direct {
+            for state in [
+                &base_url,
+                &api_key_environment_variable,
+                &vision_base_url,
+                &vision_model,
+                &vision_api_key_environment_variable,
+            ] {
+                state.update(cx, |state, cx| state.set_disabled(true, cx));
+            }
+        }
         ProviderFields {
             id: Self::input(window, provider.id, "provider-id", cx),
             name: Self::input(window, provider.name, "Provider name", cx),
-            base_url: Self::input(window, provider.base_url, "https://api.example.com/v1", cx),
-            model: Self::input(window, provider.model, "model-name", cx),
-            api_key_environment_variable: Self::input(
-                window,
-                provider.api_key_environment_variable,
-                "API_KEY_ENVIRONMENT_VARIABLE",
-                cx,
-            ),
+            connection: provider.connection,
+            wire_api: provider.wire_api,
+            base_url,
+            model,
+            api_key_environment_variable,
             native_vision: provider.native_vision,
             vision_base_url,
             vision_model,
@@ -179,6 +224,14 @@ impl ControlPlaneView {
         let dsh_provider = Self::input(
             window,
             settings.adapters.dsh_provider_id.clone(),
+            "留空使用默认 Provider",
+            cx,
+        );
+        let kimi_command =
+            Self::input(window, settings.adapters.kimi_command.clone(), "可执行文件", cx);
+        let kimi_provider = Self::input(
+            window,
+            settings.adapters.kimi_provider_id.clone(),
             "留空使用默认 Provider",
             cx,
         );
@@ -324,6 +377,9 @@ impl ControlPlaneView {
             project_data,
             session_replay: None,
             session_modal_open: false,
+            session_modal_tab: SessionModalTab::Conversation,
+            session_followup: None,
+            session_followup_feedback: None,
             overview_cached: Default::default(),
             project_read_errors: BTreeMap::new(),
             overview_restore_diagnostics: project_restore_diagnostics,
@@ -388,9 +444,13 @@ impl ControlPlaneView {
             agents_selection: AgentsSelection::Runtime(RuntimeAdapter::CodexAppServer),
             adapter_settings_open: None,
             provider_editor_open: false,
+            provider_editor_snapshot: None,
             dialog_error: None,
             codex_check_pending: false,
             codex_check: None,
+            model_choices: ModelChoicesState::default(),
+            model_list_scroll: gpui::ScrollHandle::new(),
+            model_catalogs: BTreeMap::new(),
             bridge_process: None,
             bridge_status: RuntimeLifecycleStatus::Stopped,
             bridge_active_address: None,
@@ -433,12 +493,12 @@ impl ControlPlaneView {
             claude_provider,
             dsh_command,
             dsh_provider,
+            kimi_command,
+            kimi_provider,
             codex_provider,
             task_prompt,
             task_image,
-            task_result: String::new(),
-            task_cancel: None,
-            task_identity: None,
+            quick_tasks: BTreeMap::new(),
             project_agent_adapter: RuntimeAdapter::CodexAppServer,
             plugin_directory,
             plugin_governance_path,

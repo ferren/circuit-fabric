@@ -35,6 +35,44 @@ impl ControlPlaneView {
         }
     }
 
+    /// One adapter's quick-verification session, read-only; adapters that have
+    /// never run read as an empty slot.
+    pub(super) fn quick_task(&self, adapter: RuntimeAdapter) -> &QuickTaskState {
+        self.quick_tasks.get(&adapter).unwrap_or(&EMPTY_QUICK_TASK)
+    }
+
+    /// One adapter's quick-verification session, created on first use.
+    pub(super) fn quick_task_mut(&mut self, adapter: RuntimeAdapter) -> &mut QuickTaskState {
+        self.quick_tasks.entry(adapter).or_default()
+    }
+
+    /// The per-adapter isolation rule for starting a quick task: only this
+    /// adapter's own running quick task blocks a new one. The session
+    /// follow-up continuation shares just the Codex slot, so a Codex quick
+    /// task and a follow-up stay mutually exclusive while other runtimes
+    /// proceed in parallel.
+    pub(super) fn quick_task_busy(&self, adapter: RuntimeAdapter) -> bool {
+        self.quick_task(adapter).cancel.is_some()
+            || (adapter == RuntimeAdapter::CodexAppServer && self.session_followup.is_some())
+    }
+
+    /// Whether any adapter has a quick task in flight — used by cross-runtime
+    /// surfaces (the sessions page's cancel button), never by per-adapter
+    /// guards, which look only at their own slot.
+    pub(super) fn any_quick_task_running(&self) -> bool {
+        self.quick_tasks.values().any(|task| task.cancel.is_some())
+    }
+
+    /// Cancels every adapter's quick task, used when a change invalidates all
+    /// of them (project switch, tool-grant edits, view teardown).
+    pub(super) fn cancel_all_quick_tasks(&mut self) {
+        for task in self.quick_tasks.values_mut() {
+            if let Some(cancel) = &task.cancel {
+                cancel.cancel();
+            }
+        }
+    }
+
     pub(super) fn current_project_context(&self) -> Option<(ProjectId, PathBuf)> {
         let id = self.navigation.selected_project.as_ref()?;
         let storage = self.project_storages.get(id)?;
@@ -63,7 +101,16 @@ impl ControlPlaneView {
             return;
         };
         self.codex_check_pending = true;
-        let snapshot = format!("{} / {} / {}", provider.id, provider.model, provider.base_url);
+        let snapshot = if provider.uses_codex_account() {
+            format!(
+                "{} / {} / {}",
+                provider.id,
+                provider.model,
+                self.language.choose("本机 Codex 账号", "local Codex account")
+            )
+        } else {
+            format!("{} / {} / {}", provider.id, provider.model, provider.base_url)
+        };
         let command = settings.codex.command.clone();
         self.status = format!("Codex 连接检查中：{snapshot}");
         let secrets = (self.secret_storage_provider == SecretStorageProvider::EncryptedVault)
@@ -395,9 +442,12 @@ impl ControlPlaneView {
             self.provider_editor_open.then(|| self.render_provider_dialog(cx).into_any_element());
 
         let mut runtime_cards = div().v_flex().gap_2();
-        for adapter in
-            [RuntimeAdapter::CodexAppServer, RuntimeAdapter::ClaudeCode, RuntimeAdapter::Dsh]
-        {
+        for adapter in [
+            RuntimeAdapter::CodexAppServer,
+            RuntimeAdapter::ClaudeCode,
+            RuntimeAdapter::Dsh,
+            RuntimeAdapter::KimiCode,
+        ] {
             let selector = entity.clone();
             let selected = matches!(self.agents_selection, AgentsSelection::Runtime(chosen) if chosen == adapter);
             let is_codex = adapter == RuntimeAdapter::CodexAppServer;
@@ -1434,7 +1484,7 @@ impl ControlPlaneView {
         cx: &mut Context<Self>,
     ) {
         use circuitfabric_codex_runtime::execution::{AgentKind, Cancellation};
-        if self.task_cancel.is_some() {
+        if self.quick_task_busy(adapter) {
             return;
         }
         if self.navigation.selected_project.is_some() && self.current_project_context().is_none() {
@@ -1447,6 +1497,28 @@ impl ControlPlaneView {
         };
         let grants = self.effective_grants();
         let user_prompt = self.task_prompt.read(cx).value().to_string();
+        let settings = if let Some(id) = &resume_id {
+            let Some(storage) = self
+                .navigation
+                .selected_project
+                .as_ref()
+                .and_then(|p| self.project_storages.get(p))
+            else {
+                self.status = "未执行：请选择原会话所属项目".into();
+                cx.notify();
+                return;
+            };
+            match crate::application::runtime_session::followup_settings(storage, id, settings) {
+                Ok(settings) => settings,
+                Err(error) => {
+                    self.status = format!("未继续会话：{error}");
+                    cx.notify();
+                    return;
+                }
+            }
+        } else {
+            settings
+        };
         let image_text = self.task_image.read(cx).value().to_string();
         let image = if adapter == RuntimeAdapter::CodexAppServer && !image_text.trim().is_empty() {
             Some(PathBuf::from(image_text))
@@ -1467,9 +1539,10 @@ impl ControlPlaneView {
             RuntimeAdapter::CodexAppServer => AgentKind::Codex,
             RuntimeAdapter::ClaudeCode => AgentKind::Claude,
             RuntimeAdapter::Dsh => AgentKind::Dsh,
+            RuntimeAdapter::KimiCode => AgentKind::Kimi,
         };
         let cancel = Cancellation::default();
-        self.task_cancel = Some(cancel.clone());
+        self.quick_task_mut(adapter).cancel = Some(cancel.clone());
         let project = self.navigation.selected_project.clone();
         // Project scope: the agent process works in the project root, and the run is
         // audited as a session record inside that project.
@@ -1479,9 +1552,26 @@ impl ControlPlaneView {
             .map(|storage| (storage.clone(), storage.root().to_path_buf()));
         let provider = circuitfabric_codex_runtime::execution::selected_provider(&settings, kind);
         let profile_id = provider.map_or_else(|| "default".to_owned(), |p| p.id.clone());
-        let snapshot = provider
-            .map_or_else(String::new, |p| format!("{} / {} / {}", p.id, p.model, p.base_url));
-        self.task_result = format!(
+        let snapshot = provider.map_or_else(String::new, |p| {
+            if p.uses_codex_account() {
+                format!(
+                    "{} / {} / {}",
+                    p.id,
+                    p.model,
+                    self.language.choose("本机 Codex 账号", "local Codex account")
+                )
+            } else if p.uses_kimi_account() {
+                format!(
+                    "{} / {} / {}",
+                    p.id,
+                    p.model,
+                    self.language.choose("本机 Kimi 账号", "local Kimi account")
+                )
+            } else {
+                format!("{} / {} / {}", p.id, p.model, p.base_url)
+            }
+        });
+        self.quick_task_mut(adapter).result = format!(
             "正在调用 {}：{snapshot}。使用已保存快照；修改配置在下次任务生效。",
             adapter.label()
         );
@@ -1489,7 +1579,7 @@ impl ControlPlaneView {
             let started = if let Some(id) = &resume_id {
                 storage.load_session(id).map_err(|error| error.to_string()).and_then(|replay| {
                     if replay.metadata.category != circuitfabric_project::SessionCategory::Runtime
-                        || replay.metadata.backend_id.as_deref() != Some(adapter.backend_id())
+                        || !adapter.matches_backend(replay.metadata.backend_id.as_deref())
                     {
                         return Err("此会话不属于当前运行时入口".into());
                     }
@@ -1512,11 +1602,11 @@ impl ControlPlaneView {
             }
         });
         if project_scope.is_some() && session.is_none() {
-            self.task_cancel = None;
+            self.quick_task_mut(adapter).cancel = None;
             cx.notify();
             return;
         }
-        self.task_identity = Some((
+        self.quick_task_mut(adapter).identity = Some((
             project.clone(),
             session.as_ref().map(|(_, id)| id.clone()),
             adapter.backend_id().to_owned(),
@@ -1530,10 +1620,29 @@ impl ControlPlaneView {
         let secrets = self.vault.as_ref().map(|vault| vault.values().clone());
         let work = cx.background_spawn(async move {
             let mut usage = None;
+            let mut reasoning = String::new();
             let result = if kind == AgentKind::Codex
                 && let Some((storage, session_id)) = &session
             {
                 match storage.session_runtime_directory(session_id) {
+                    Ok(history) if resume_id.is_some() => {
+                        circuitfabric_codex_runtime::execution::resume_session_streaming(
+                            &settings,
+                            &grants,
+                            &prompt,
+                            image.as_deref(),
+                            storage.root(),
+                            &history,
+                            secrets.as_ref(),
+                            &cancel,
+                            &mut |kind, delta| {
+                                if kind == circuitfabric_codex_runtime::TurnDelta::Reasoning {
+                                    reasoning.push_str(delta);
+                                }
+                            },
+                            &mut |reported| usage = Some(reported),
+                        )
+                    }
                     Ok(history) => circuitfabric_codex_runtime::execution::run_session_observed(
                         &settings,
                         &grants,
@@ -1543,7 +1652,11 @@ impl ControlPlaneView {
                         &history,
                         secrets.as_ref(),
                         &cancel,
-                        &mut |_, _| {},
+                        &mut |kind, delta| {
+                            if kind == circuitfabric_codex_runtime::TurnDelta::Reasoning {
+                                reasoning.push_str(delta);
+                            }
+                        },
                         &mut |reported| usage = Some(reported),
                     ),
                     Err(error) => Err(circuitfabric_codex_runtime::RuntimeError::InvalidSettings(
@@ -1560,7 +1673,11 @@ impl ControlPlaneView {
                     project_root.as_deref(),
                     secrets.as_ref(),
                     &cancel,
-                    &mut |_, _| {},
+                    &mut |kind, delta| {
+                        if kind == circuitfabric_codex_runtime::TurnDelta::Reasoning {
+                            reasoning.push_str(delta);
+                        }
+                    },
                     &mut |reported| usage = Some(reported),
                 )
             };
@@ -1568,13 +1685,21 @@ impl ControlPlaneView {
                 let error_text = result.as_ref().err().map(ToString::to_string);
                 let outcome =
                     result.as_deref().map_err(|_| error_text.as_deref().unwrap_or_default());
-                crate::application::runtime_session::finish(
+                crate::application::runtime_session::begin_followup(
                     storage,
                     session_id,
                     &user_prompt,
-                    outcome,
-                    usage,
                 )
+                .and_then(|()| {
+                    crate::application::runtime_session::append_reasoning(
+                        storage, session_id, &reasoning,
+                    )
+                })
+                .and_then(|()| {
+                    crate::application::runtime_session::finish_followup(
+                        storage, session_id, outcome, usage,
+                    )
+                })
                 .err()
             });
             (result, persistence_error)
@@ -1583,10 +1708,12 @@ impl ControlPlaneView {
             let (result, persistence_error) = work.await;
             cx.update(|_, cx| {
                 view.update(cx, |view, cx| {
-                    view.task_cancel = None;
-                    view.task_identity = None;
-                    if view.navigation.selected_project == project {
-                        view.task_result = match &result {
+                    let same_project = view.navigation.selected_project == project;
+                    let task = view.quick_task_mut(adapter);
+                    task.cancel = None;
+                    task.identity = None;
+                    if same_project {
+                        task.result = match &result {
                             Ok(output) => format!("任务完成（{snapshot}）\n{output}"),
                             Err(error) => format!("任务未完成（{snapshot}）：{error}"),
                         };
@@ -1617,6 +1744,7 @@ impl ControlPlaneView {
         let runner = cx.entity().clone();
         let stopper = runner.clone();
         let continuer = runner.clone();
+        let busy = self.quick_task_busy(adapter);
         let resume_id = self
             .session_replay
             .as_ref()
@@ -1624,7 +1752,7 @@ impl ControlPlaneView {
                 Some(&selection.project_id) == self.navigation.selected_project.as_ref()
                     && selection.replay.metadata.category
                         == circuitfabric_project::SessionCategory::Runtime
-                    && selection.replay.metadata.backend_id.as_deref() == Some(adapter.backend_id())
+                    && adapter.matches_backend(selection.replay.metadata.backend_id.as_deref())
                     && adapter == RuntimeAdapter::CodexAppServer
             })
             .map(|selection| selection.replay.metadata.session_id.clone());
@@ -1658,7 +1786,7 @@ impl ControlPlaneView {
                         action_button("run-agent-task")
                             .label("执行任务")
                             .primary()
-                            .disabled(self.task_cancel.is_some())
+                            .disabled(busy)
                             .on_click(move |_, window, cx| {
                                 runner.update(cx, |view, cx| {
                                     view.run_agent_task(adapter, window, cx);
@@ -1668,13 +1796,14 @@ impl ControlPlaneView {
                     .child(
                         action_button("cancel-agent-task")
                             .label("取消任务")
-                            .disabled(self.task_cancel.is_none())
+                            .disabled(self.quick_task(adapter).cancel.is_none())
                             .on_click(move |_, _, cx| {
                                 stopper.update(cx, |view, cx| {
-                                    if let Some(cancel) = &view.task_cancel {
+                                    if let Some(cancel) = &view.quick_task(adapter).cancel {
                                         cancel.cancel();
                                     }
-                                    view.task_result = "正在取消并清理进程…".into();
+                                    view.quick_task_mut(adapter).result =
+                                        "正在取消并清理进程…".into();
                                     cx.notify();
                                 });
                             }),
@@ -1684,7 +1813,7 @@ impl ControlPlaneView {
                 panel.child(
                     action_button("continue-runtime-session")
                         .label("继续选中的会话")
-                        .disabled(self.task_cancel.is_some())
+                        .disabled(busy)
                         .on_click(move |_, window, cx| {
                             continuer.update(cx, |view, cx| {
                                 view.run_agent_task_in_session(
@@ -1702,6 +1831,7 @@ impl ControlPlaneView {
                     project,
                     circuitfabric_project::SessionCategory::Runtime,
                     None,
+                    Some(adapter),
                     &cx.entity(),
                 ))
             })
@@ -1717,7 +1847,12 @@ impl ControlPlaneView {
                     .border_1()
                     .border_color(rgb(BORDER))
                     .bg(rgb(CARD_BG))
-                    .child(div().text_sm().whitespace_normal().child(self.task_result.clone())),
+                    .child(
+                        div()
+                            .text_sm()
+                            .whitespace_normal()
+                            .child(self.quick_task(adapter).result.clone()),
+                    ),
             )
     }
 
@@ -1730,15 +1865,20 @@ impl ControlPlaneView {
         let entity = cx.entity().clone();
         let language = self.language;
         let adapter = self.project_agent_adapter;
-        let mut selector = div().flex().gap_2().flex_wrap();
-        for candidate in
-            [RuntimeAdapter::CodexAppServer, RuntimeAdapter::ClaudeCode, RuntimeAdapter::Dsh]
-        {
+        let mut selector = TabBar::new("project-agent-adapter-tabs").underline().flex_none();
+        for candidate in [
+            RuntimeAdapter::CodexAppServer,
+            RuntimeAdapter::ClaudeCode,
+            RuntimeAdapter::Dsh,
+            RuntimeAdapter::KimiCode,
+        ] {
             let chooser = entity.clone();
+            let debug_selector = format!("project-agent-adapter-{}", candidate.backend_id());
             selector = selector.child(
-                action_button(format!("project-agent-adapter-{}", candidate.backend_id()))
+                Tab::new()
+                    .debug_selector(move || debug_selector.clone())
                     .label(candidate.label())
-                    .when(candidate == adapter, |button| button.primary())
+                    .selected(candidate == adapter)
                     .on_click(move |_, _, cx| {
                         chooser.update(cx, |view, cx| {
                             view.project_agent_adapter = candidate;

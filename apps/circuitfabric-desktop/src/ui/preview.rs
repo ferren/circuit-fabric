@@ -1,6 +1,21 @@
 //! Preview presentation and event handlers.
 use super::*;
 
+/// Pages before and after the visible ones that render in full (bitmap, handlers, text).
+const PDF_LIVE_PAGE_MARGIN: u32 = 2;
+
+/// Column geometry for the datasheet data tables: the header band and every data row
+/// share these widths and gaps so columns line up exactly.
+const PIN_NUMBER_WIDTH: f32 = 40.0;
+const PIN_NAME_WIDTH: f32 = 88.0;
+const PIN_KIND_WIDTH: f32 = 56.0;
+const PARAM_SYMBOL_WIDTH: f32 = 52.0;
+const PARAM_VALUE_WIDTH: f32 = 46.0;
+const PARAM_UNIT_WIDTH: f32 = 40.0;
+const PARAM_CONDITIONS_WIDTH: f32 = 120.0;
+/// Width reserved in the header band for the per-row source-link icon column.
+const TABLE_ACTION_WIDTH: f32 = 28.0;
+
 #[cfg(all(test, feature = "ui-test-support"))]
 mod selection_tests {
     use std::{
@@ -434,50 +449,51 @@ impl ControlPlaneView {
 
         // Datasheet PDFs get a second tab with the structured extraction.
         let tabs = if is_pdf {
-            let preview_tab = entity.clone();
-            let data_tab = entity.clone();
             Some(
-                div()
-                    .flex()
-                    .gap_1()
-                    .px_3()
-                    .py_1()
-                    .border_b_1()
-                    .border_color(rgb(BORDER))
-                    .child(
-                        action_button("preview-tab-document")
-                            .when(!show_data, Button::primary)
-                            .when(show_data, Button::ghost)
-                            .label(language.choose("文档", "Document"))
-                            .on_click(move |_, window, cx| {
-                                gpui_base::TextSelection::clear(window, cx);
-                                preview_tab.update(cx, |view, cx| {
-                                    view.preview_show_data = false;
-                                    view.stop_pdf_interaction();
-                                    view.preview_scroll.set_offset(gpui::Point::default());
-                                    #[cfg(windows)]
-                                    crate::pdf_cursors::set_area(None);
-                                    cx.notify();
-                                });
-                            }),
-                    )
-                    .child(
-                        action_button("preview-tab-data")
-                            .when(show_data, Button::primary)
-                            .when(!show_data, Button::ghost)
-                            .label(language.choose("数据", "Data"))
-                            .on_click(move |_, window, cx| {
-                                gpui_base::TextSelection::clear(window, cx);
-                                data_tab.update(cx, |view, cx| {
-                                    view.preview_show_data = true;
-                                    view.stop_pdf_interaction();
-                                    view.preview_scroll.set_offset(gpui::Point::default());
-                                    #[cfg(windows)]
-                                    crate::pdf_cursors::clear();
-                                    cx.notify();
-                                });
-                            }),
-                    ),
+                div().px_3().py_1().child(
+                    TabBar::new("preview-tabs")
+                        .underline()
+                        .child(
+                            Tab::new()
+                                .debug_selector(|| "preview-tab-document".to_owned())
+                                .label(language.choose("文档", "Document"))
+                                .selected(!show_data)
+                                .on_click({
+                                    let preview_tab = entity.clone();
+                                    move |_, window, cx| {
+                                        gpui_base::TextSelection::clear(window, cx);
+                                        preview_tab.update(cx, |view, cx| {
+                                            view.preview_show_data = false;
+                                            view.stop_pdf_interaction();
+                                            view.preview_scroll.set_offset(gpui::Point::default());
+                                            #[cfg(windows)]
+                                            crate::pdf_cursors::set_area(None);
+                                            cx.notify();
+                                        });
+                                    }
+                                }),
+                        )
+                        .child(
+                            Tab::new()
+                                .debug_selector(|| "preview-tab-data".to_owned())
+                                .label(language.choose("数据", "Data"))
+                                .selected(show_data)
+                                .on_click({
+                                    let data_tab = entity.clone();
+                                    move |_, window, cx| {
+                                        gpui_base::TextSelection::clear(window, cx);
+                                        data_tab.update(cx, |view, cx| {
+                                            view.preview_show_data = true;
+                                            view.stop_pdf_interaction();
+                                            view.preview_scroll.set_offset(gpui::Point::default());
+                                            #[cfg(windows)]
+                                            crate::pdf_cursors::clear();
+                                            cx.notify();
+                                        });
+                                    }
+                                }),
+                        ),
+                ),
             )
         } else {
             None
@@ -493,6 +509,8 @@ impl ControlPlaneView {
         // Items are direct children of the tracked scroll container, so a page can be
         // scrolled to by index.
         let mut items: Vec<(Option<u32>, AnyElement)> = Vec::new();
+        // (item index before page 1, page count, fully rendered pages) for raster PDFs.
+        let mut live_pages = None;
         if let Some(focus) = focus {
             items.push((None, self.render_preview_focus_banner(focus, preview, &entity)));
         }
@@ -503,6 +521,7 @@ impl ControlPlaneView {
                     &preview.project_id,
                     circuitfabric_project::SessionCategory::Datasheet,
                     Some(&preview.document_id),
+                    None,
                     &entity,
                 )
                 .into_any_element(),
@@ -579,15 +598,35 @@ impl ControlPlaneView {
                             .into_any_element(),
                     ));
                     items.extend(match raster {
-                        Some(raster) => Self::render_document_raster_pages(
-                            raster,
-                            language,
-                            pane_width,
-                            self.preview_pdf_zoom.value,
-                            focus,
-                            &entity,
-                            self.preview_pdf_pan.is_some(),
-                        ),
+                        Some(raster) => {
+                            let base = items.len();
+                            let count = raster.page_sizes.len();
+                            let (first, last) = target_page
+                                .filter(|_| self.preview_scroll_pending.get())
+                                .map_or_else(
+                                    || {
+                                        Self::visible_raster_pages(
+                                            &self.preview_scroll,
+                                            base,
+                                            count,
+                                        )
+                                    },
+                                    |page| (page, page),
+                                );
+                            let live = first.saturating_sub(PDF_LIVE_PAGE_MARGIN)
+                                ..=last.saturating_add(PDF_LIVE_PAGE_MARGIN);
+                            live_pages = Some((base, count, live.clone()));
+                            Self::render_document_raster_pages(
+                                raster,
+                                language,
+                                pane_width,
+                                self.preview_pdf_zoom.value,
+                                focus,
+                                &entity,
+                                self.preview_pdf_pan.is_some(),
+                                live,
+                            )
+                        }
                         None => Self::render_document_view_items(&view.body, language, focus),
                     });
                 }
@@ -752,11 +791,26 @@ impl ControlPlaneView {
                         let zoom = self.preview_pdf_zoom.value;
                         let animate = self.preview_zoom_tick.is_some();
                         let grabbing = self.preview_pdf_pan.is_some();
+                        let scroll = self.preview_scroll.clone();
+                        let live_pages = live_pages.clone();
                         area.child(
                             div().absolute().top(px(0.)).left(px(0.)).size_full().child(
                                 gpui::canvas(
                                     |_, _, _| (),
                                     move |bounds, (), window, _| {
+                                        // Render was based on the previous layout; after a
+                                        // jump (scrollbar drag, landing) re-render once the
+                                        // newly visible pages fall outside the live range.
+                                        if let Some((base, count, live)) = &live_pages {
+                                            let (first, last) =
+                                                Self::visible_raster_pages(&scroll, *base, *count);
+                                            if !live.contains(&first) || !live.contains(&last) {
+                                                let stale = zoomer.clone();
+                                                window.on_next_frame(move |_, cx| {
+                                                    stale.update(cx, |_, cx| cx.notify());
+                                                });
+                                            }
+                                        }
                                         if grabbing {
                                             window.set_window_cursor_style(
                                                 crate::pdf_zoom::native::pan_cursor(true),
@@ -1291,7 +1345,7 @@ impl ControlPlaneView {
             _ => false,
         };
 
-        let mut content = div().v_flex().gap_2();
+        let mut content = div().v_flex().gap_3();
         content = content.children(feedback_note).children(stream_window);
         if !extraction.notes.iter().any(|note| note.starts_with("Jev accepted ")) {
             content = content.child(Self::render_preview_truncation_note(
@@ -1314,18 +1368,38 @@ impl ControlPlaneView {
 
         // Overview card.
         let overview = &extraction.overview;
-        let mut overview_card =
-            div().v_flex().gap_1().p_3().rounded_lg().bg(rgb(SURFACE_BG)).child(
-                div()
-                    .text_sm()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .whitespace_normal()
-                    .cursor(gpui::CursorStyle::IBeam)
-                    .child(gpui_base::SelectableText::new(
-                        "datasheet-title",
-                        overview.title.clone(),
-                    )),
+        let mut overview_card = div()
+            .v_flex()
+            .gap_2()
+            .p_4()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(BORDER))
+            .bg(rgb(SURFACE_BG))
+            .child(
+                div().flex().items_center().gap_2().child(
+                    div()
+                        .px_1p5()
+                        .py_0p5()
+                        .rounded_sm()
+                        .text_xs()
+                        .font_weight(FontWeight::MEDIUM)
+                        .bg(rgb(0x00e0_f2fe))
+                        .text_color(rgb(0x000e_7490))
+                        .child(language.choose("文档概述", "Document overview")),
+                ),
             );
+        if !overview.title.is_empty() {
+            overview_card = overview_card.child(
+                gpui_component::text::TextView::markdown(
+                    "datasheet-title",
+                    super::session_markdown::bound_plain_paragraphs(&overview.title),
+                )
+                .selectable(true)
+                .text_base()
+                .font_weight(FontWeight::SEMIBOLD),
+            );
+        }
         let identity_line = [
             overview.manufacturer.clone(),
             (!overview.part_numbers.is_empty()).then(|| overview.part_numbers.join(" / ")),
@@ -1345,42 +1419,42 @@ impl ControlPlaneView {
                     .child(gpui_base::SelectableText::new("datasheet-identity", identity_line)),
             );
         }
+        // The model's overview text is Markdown; render it rather than flattening it.
+        if !overview.description.is_empty() {
+            overview_card = overview_card.child(
+                div().text_sm().child(
+                    gpui_component::text::TextView::markdown(
+                        "datasheet-description",
+                        super::session_markdown::bound_plain_paragraphs(&overview.description),
+                    )
+                    .selectable(true),
+                ),
+            );
+        }
         if !overview.features.is_empty() {
             overview_card = overview_card.child(
                 div()
                     .v_flex()
-                    .gap_0p5()
+                    .gap_1()
                     .child(
                         div()
                             .text_xs()
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(rgb(0x000e_7490))
-                            .child(language.choose("特性", "Features")),
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(TEXT_SECONDARY))
+                            .child(language.choose("主要特性", "Key features")),
                     )
-                    .children(overview.features.iter().enumerate().map(|(index, feature)| {
-                        div()
-                            .text_xs()
-                            .text_color(rgb(TEXT_PRIMARY))
-                            .whitespace_normal()
-                            .cursor(gpui::CursorStyle::IBeam)
-                            .child(gpui_base::SelectableText::new(
-                                ("datasheet-feature", index),
-                                format!("• {feature}"),
-                            ))
-                    })),
-            );
-        }
-        if !overview.description.is_empty() {
-            overview_card = overview_card.child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(TEXT_SECONDARY))
-                    .whitespace_normal()
-                    .cursor(gpui::CursorStyle::IBeam)
-                    .child(gpui_base::SelectableText::new(
-                        "datasheet-description",
-                        overview.description.clone(),
-                    )),
+                    .child(
+                        gpui_component::text::TextView::markdown(
+                            "datasheet-features",
+                            overview
+                                .features
+                                .iter()
+                                .map(|feature| format!("- {feature}"))
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        )
+                        .selectable(true),
+                    ),
             );
         }
         content = content.child(overview_card);
@@ -1455,7 +1529,7 @@ impl ControlPlaneView {
 
         if !extraction.notes.is_empty() {
             content = content.child(
-                div().v_flex().gap_0p5().p_2().rounded_md().bg(rgb(SURFACE_BG)).children(
+                div().v_flex().gap_0p5().px_3().py_2().rounded_lg().bg(rgb(SURFACE_BG)).children(
                     extraction.notes.iter().enumerate().map(|(index, note)| {
                         div()
                             .text_xs()
@@ -1473,7 +1547,9 @@ impl ControlPlaneView {
         content.child(extract_button)
     }
 
-    /// The pin table: number, name, classified kind, and description.
+    /// The pin table: number, name, classified kind, and description. Rendered as a card
+    /// with a header band that never wraps and rows separated by hairlines, matching the
+    /// session dialog's card styling.
     pub(super) fn render_datasheet_pin_table(
         pins: &[circuitfabric_contracts::DatasheetPin],
         language: UiLanguage,
@@ -1482,72 +1558,140 @@ impl ControlPlaneView {
         row_anchor: Option<&gpui::ScrollAnchor>,
         entity: &Entity<Self>,
     ) -> gpui::Stateful<Div> {
-        let mut table =
-            div().id("datasheet-pins").v_flex().gap_1().child(
-                div().text_sm().font_weight(FontWeight::SEMIBOLD).child(language.choose_owned(
-                    format!("引脚（{}）", pins.len()),
-                    format!("Pins ({})", pins.len()),
-                )),
-            );
-        if pins.is_empty() {
-            return table.child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(TEXT_MUTED))
-                    .child(language.choose("未解析到引脚行。", "No pin rows parsed.")),
-            );
-        }
-        let header_row = |label: &str, flex: f32| {
+        let header_cell = |selector: &'static str, width: f32, label: &str| {
             div()
+                .debug_selector(move || selector.into())
                 .flex_none()
-                .w(px(flex))
+                .w(px(width))
                 .text_xs()
-                .font_weight(FontWeight::MEDIUM)
+                .font_weight(FontWeight::SEMIBOLD)
                 .text_color(rgb(TEXT_MUTED))
+                .whitespace_nowrap()
                 .cursor(gpui::CursorStyle::IBeam)
                 .child(gpui_base::SelectableText::new(
                     gpui::SharedString::from(format!("pin-header-{label}")),
                     label.to_owned(),
                 ))
         };
-        table = table.child(
-            div()
-                .flex()
-                .gap_1()
-                .p_1()
-                .rounded_sm()
-                .bg(rgb(SURFACE_BG))
-                .child(header_row(language.choose("引脚", "Pin"), 34.0))
-                .child(header_row(language.choose("名称", "Name"), 76.0))
-                .child(header_row(language.choose("类型", "Kind"), 52.0))
-                .child(header_row(language.choose("说明", "Description"), 0.0))
-                .child(div().flex_1()),
-        );
-        for (index, pin) in pins.iter().enumerate().take(visible_rows) {
-            table = table.child(
+        let mut card = div()
+            .id("datasheet-pins")
+            .v_flex()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(BORDER))
+            .bg(rgb(CARD_BG))
+            .overflow_hidden()
+            .child(
                 div()
-                    .id(("datasheet-pin-row", index))
-                    .anchor_scroll(
-                        (focused_row == Some(index + 1)).then(|| row_anchor.cloned()).flatten(),
-                    )
                     .flex()
-                    .gap_1()
-                    .when(focused_row == Some(index + 1), |row| {
-                        row.rounded_sm().bg(rgb(FOCUSED_ROW_BG))
-                    })
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_2p5()
+                    .border_b_1()
+                    .border_color(rgb(BORDER))
                     .child(
                         div()
+                            .px_1p5()
+                            .py_0p5()
+                            .rounded_sm()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
                             .flex_none()
-                            .w(px(34.0))
+                            .bg(rgb(0x00dc_fce7))
+                            .text_color(rgb(0x0016_a34a))
+                            .child(language.choose("引脚", "Pins")),
+                    )
+                    .child(div().ml_auto().text_xs().text_color(rgb(TEXT_MUTED)).child(
+                        language.choose_owned(
+                            format!("{} 行", pins.len()),
+                            format!("{} rows", pins.len()),
+                        ),
+                    )),
+            );
+        if pins.is_empty() {
+            return card.child(
+                div()
+                    .px_3()
+                    .py_3()
+                    .text_xs()
+                    .text_color(rgb(TEXT_MUTED))
+                    .child(language.choose("未解析到引脚行。", "No pin rows parsed.")),
+            );
+        }
+        card = card.child(
+            div()
+                .debug_selector(|| "datasheet-pin-header".into())
+                .flex()
+                .gap_2()
+                .px_3()
+                .py_2()
+                .bg(rgb(SURFACE_BG))
+                .border_b_1()
+                .border_color(rgb(BORDER))
+                .child(header_cell(
+                    "pin-header-cell-number",
+                    PIN_NUMBER_WIDTH,
+                    language.choose("引脚", "Pin"),
+                ))
+                .child(header_cell(
+                    "pin-header-cell-name",
+                    PIN_NAME_WIDTH,
+                    language.choose("名称", "Name"),
+                ))
+                .child(header_cell(
+                    "pin-header-cell-kind",
+                    PIN_KIND_WIDTH,
+                    language.choose("类型", "Kind"),
+                ))
+                .child(
+                    div()
+                        .debug_selector(|| "pin-header-cell-description".into())
+                        .flex_1()
+                        .min_w(px(0.))
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(TEXT_MUTED))
+                        .whitespace_nowrap()
+                        .cursor(gpui::CursorStyle::IBeam)
+                        .child(gpui_base::SelectableText::new(
+                            "pin-header-description",
+                            language.choose("说明", "Description").to_owned(),
+                        )),
+                )
+                .child(div().flex_none().w(px(TABLE_ACTION_WIDTH))),
+        );
+        let rendered_rows = pins.len().min(visible_rows);
+        for (index, pin) in pins.iter().enumerate().take(visible_rows) {
+            let focused = focused_row == Some(index + 1);
+            card = card.child(
+                div()
+                    .id(("datasheet-pin-row", index))
+                    .anchor_scroll(focused.then(|| row_anchor.cloned()).flatten())
+                    .flex()
+                    .gap_2()
+                    .px_3()
+                    .py_1p5()
+                    .when(index + 1 < rendered_rows, |row| {
+                        row.border_b_1().border_color(rgb(BORDER))
+                    })
+                    .when(focused, |row| row.bg(rgb(FOCUSED_ROW_BG)))
+                    .child(
+                        div()
+                            .debug_selector(move || format!("pin-cell-number-{index}"))
+                            .flex_none()
+                            .w(px(PIN_NUMBER_WIDTH))
                             .text_xs()
                             .text_color(rgb(TEXT_PRIMARY))
+                            .whitespace_nowrap()
                             .cursor(gpui::CursorStyle::IBeam)
                             .child(gpui_base::SelectableText::new("number", pin.number.clone())),
                     )
                     .child(
                         div()
+                            .debug_selector(move || format!("pin-cell-name-{index}"))
                             .flex_none()
-                            .w(px(76.0))
+                            .w(px(PIN_NAME_WIDTH))
                             .text_xs()
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(rgb(TEXT_PRIMARY))
@@ -1556,10 +1700,12 @@ impl ControlPlaneView {
                     )
                     .child(
                         div()
+                            .debug_selector(move || format!("pin-cell-kind-{index}"))
                             .flex_none()
-                            .w(px(52.0))
+                            .w(px(PIN_KIND_WIDTH))
                             .text_xs()
                             .text_color(rgb(0x000e_7490))
+                            .whitespace_nowrap()
                             .cursor(gpui::CursorStyle::IBeam)
                             .child(gpui_base::SelectableText::new(
                                 "kind",
@@ -1568,6 +1714,7 @@ impl ControlPlaneView {
                     )
                     .child(
                         div()
+                            .debug_selector(move || format!("pin-cell-description-{index}"))
                             .flex_1()
                             .min_w(px(0.))
                             .text_xs()
@@ -1588,10 +1735,13 @@ impl ControlPlaneView {
                     )),
             );
         }
-        table
+        card
     }
 
-    /// One parameter table with min/typ/max/unit columns.
+    /// One parameter table with min/typ/max/unit columns. Same card layout as the pin
+    /// table: a header band that never wraps and hairline-separated rows. The conditions
+    /// column only exists when at least one row carries conditions; other rows then
+    /// render an empty slot so the source-link icons stay aligned.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn render_datasheet_parameter_table(
         title: &str,
@@ -1605,90 +1755,159 @@ impl ControlPlaneView {
         accent: u32,
         accent_text: u32,
     ) -> gpui::Stateful<Div> {
-        let mut table = div().id(section).v_flex().gap_1().child(
+        let has_conditions = parameters.iter().any(|parameter| parameter.conditions.is_some());
+        let header_cell = |selector: &'static str, width: f32, label: &str| {
             div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(
-                    div()
-                        .px_1p5()
-                        .py_0p5()
-                        .rounded_sm()
-                        .text_xs()
-                        .flex_none()
-                        .bg(rgb(accent))
-                        .text_color(rgb(accent_text))
-                        .cursor(gpui::CursorStyle::IBeam)
-                        .child(gpui_base::SelectableText::new("section-title", title.to_owned())),
-                )
-                .child(div().ml_auto().text_xs().text_color(rgb(TEXT_MUTED)).child(
-                    language.choose_owned(
-                        format!("{} 行", parameters.len()),
-                        format!("{} rows", parameters.len()),
-                    ),
-                )),
-        );
-        if parameters.is_empty() {
-            return table.child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(TEXT_MUTED))
-                    .child(language.choose("未解析到参数行。", "No parameter rows parsed.")),
-            );
-        }
-        let header_row = |label: &str, flex: f32| {
-            div()
+                .debug_selector(move || selector.into())
                 .flex_none()
-                .w(px(flex))
+                .w(px(width))
                 .text_xs()
-                .font_weight(FontWeight::MEDIUM)
+                .font_weight(FontWeight::SEMIBOLD)
                 .text_color(rgb(TEXT_MUTED))
+                .whitespace_nowrap()
                 .cursor(gpui::CursorStyle::IBeam)
                 .child(gpui_base::SelectableText::new(
                     gpui::SharedString::from(format!("parameter-header-{label}")),
                     label.to_owned(),
                 ))
         };
-        table = table.child(
+        let mut card = div()
+            .id(section)
+            .v_flex()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(BORDER))
+            .bg(rgb(CARD_BG))
+            .overflow_hidden()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_2p5()
+                    .border_b_1()
+                    .border_color(rgb(BORDER))
+                    .child(
+                        div()
+                            .px_1p5()
+                            .py_0p5()
+                            .rounded_sm()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .flex_none()
+                            .bg(rgb(accent))
+                            .text_color(rgb(accent_text))
+                            .cursor(gpui::CursorStyle::IBeam)
+                            .child(gpui_base::SelectableText::new(
+                                "section-title",
+                                title.to_owned(),
+                            )),
+                    )
+                    .child(div().ml_auto().text_xs().text_color(rgb(TEXT_MUTED)).child(
+                        language.choose_owned(
+                            format!("{} 行", parameters.len()),
+                            format!("{} rows", parameters.len()),
+                        ),
+                    )),
+            );
+        if parameters.is_empty() {
+            return card.child(
+                div()
+                    .px_3()
+                    .py_3()
+                    .text_xs()
+                    .text_color(rgb(TEXT_MUTED))
+                    .child(language.choose("未解析到参数行。", "No parameter rows parsed.")),
+            );
+        }
+        card = card.child(
             div()
+                .debug_selector(move || format!("datasheet-parameter-header-{section}"))
                 .flex()
-                .gap_1()
-                .p_1()
-                .rounded_sm()
+                .gap_2()
+                .px_3()
+                .py_2()
                 .bg(rgb(SURFACE_BG))
-                .child(header_row(language.choose("参数", "Parameter"), 0.0))
-                .child(div().flex_1())
-                .child(header_row(language.choose("符号", "Symbol"), 52.0))
-                .child(header_row(language.choose("最小", "Min"), 46.0))
-                .child(header_row(language.choose("典型", "Typ"), 46.0))
-                .child(header_row(language.choose("最大", "Max"), 46.0))
-                .child(header_row(language.choose("单位", "Unit"), 34.0)),
+                .border_b_1()
+                .border_color(rgb(BORDER))
+                .child(
+                    div()
+                        .debug_selector(|| "parameter-header-cell-parameter".to_owned())
+                        .flex_1()
+                        .min_w(px(0.))
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(TEXT_MUTED))
+                        .whitespace_nowrap()
+                        .cursor(gpui::CursorStyle::IBeam)
+                        .child(gpui_base::SelectableText::new(
+                            "parameter-header-parameter",
+                            language.choose("参数", "Parameter").to_owned(),
+                        )),
+                )
+                .child(header_cell(
+                    "parameter-header-cell-symbol",
+                    PARAM_SYMBOL_WIDTH,
+                    language.choose("符号", "Symbol"),
+                ))
+                .child(header_cell(
+                    "parameter-header-cell-min",
+                    PARAM_VALUE_WIDTH,
+                    language.choose("最小", "Min"),
+                ))
+                .child(header_cell(
+                    "parameter-header-cell-typ",
+                    PARAM_VALUE_WIDTH,
+                    language.choose("典型", "Typ"),
+                ))
+                .child(header_cell(
+                    "parameter-header-cell-max",
+                    PARAM_VALUE_WIDTH,
+                    language.choose("最大", "Max"),
+                ))
+                .child(header_cell(
+                    "parameter-header-cell-unit",
+                    PARAM_UNIT_WIDTH,
+                    language.choose("单位", "Unit"),
+                ))
+                .when(has_conditions, |band| {
+                    band.child(header_cell(
+                        "parameter-header-cell-conditions",
+                        PARAM_CONDITIONS_WIDTH,
+                        language.choose("条件", "Conditions"),
+                    ))
+                })
+                .child(div().flex_none().w(px(TABLE_ACTION_WIDTH))),
         );
+        let rendered_rows = parameters.len().min(visible_rows);
         for (index, parameter) in parameters.iter().enumerate().take(visible_rows) {
-            let cell = |id: &'static str, value: &Option<String>, emphasized: bool| {
+            let focused = focused_row == Some(index + 1);
+            let value_cell = |id: &'static str, value: &Option<String>| {
                 div()
                     .flex_none()
-                    .w(px(if emphasized { 46.0 } else { 0.0 }))
+                    .w(px(PARAM_VALUE_WIDTH))
                     .text_xs()
                     .text_color(rgb(TEXT_PRIMARY))
+                    .whitespace_nowrap()
                     .cursor(gpui::CursorStyle::IBeam)
                     .child(gpui_base::SelectableText::new(
                         id,
                         value.clone().unwrap_or_else(|| "—".to_owned()),
                     ))
             };
-            table = table.child(
+            card = card.child(
                 div()
                     .id((section, index))
-                    .anchor_scroll(
-                        (focused_row == Some(index + 1)).then(|| row_anchor.cloned()).flatten(),
-                    )
+                    .anchor_scroll(focused.then(|| row_anchor.cloned()).flatten())
                     .flex()
-                    .gap_1()
-                    .when(focused_row == Some(index + 1), |row| {
-                        row.rounded_sm().bg(rgb(FOCUSED_ROW_BG))
+                    .gap_2()
+                    .px_3()
+                    .py_1p5()
+                    .when(index + 1 < rendered_rows, |row| {
+                        row.border_b_1().border_color(rgb(BORDER))
                     })
+                    .when(focused, |row| row.bg(rgb(FOCUSED_ROW_BG)))
                     .child(
                         div()
                             .flex_1()
@@ -1705,7 +1924,7 @@ impl ControlPlaneView {
                     .child(
                         div()
                             .flex_none()
-                            .w(px(52.0))
+                            .w(px(PARAM_SYMBOL_WIDTH))
                             .text_xs()
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(rgb(0x000e_7490))
@@ -1716,13 +1935,13 @@ impl ControlPlaneView {
                                 parameter.symbol.clone().unwrap_or_else(|| "—".to_owned()),
                             )),
                     )
-                    .child(cell("min", &parameter.min, true))
-                    .child(cell("typ", &parameter.typ, true))
-                    .child(cell("max", &parameter.max, true))
+                    .child(value_cell("min", &parameter.min))
+                    .child(value_cell("typ", &parameter.typ))
+                    .child(value_cell("max", &parameter.max))
                     .child(
                         div()
                             .flex_none()
-                            .w(px(34.0))
+                            .w(px(PARAM_UNIT_WIDTH))
                             .text_xs()
                             .text_color(rgb(TEXT_MUTED))
                             .whitespace_normal()
@@ -1732,18 +1951,22 @@ impl ControlPlaneView {
                                 parameter.unit.clone().unwrap_or_else(|| "—".to_owned()),
                             )),
                     )
-                    .when_some(parameter.conditions.clone(), |row, conditions| {
+                    .when(has_conditions, |row| {
                         row.child(
                             div()
                                 .flex_none()
-                                .max_w(px(120.0))
+                                .w(px(PARAM_CONDITIONS_WIDTH))
                                 .text_xs()
                                 .text_color(rgb(TEXT_MUTED))
                                 .whitespace_normal()
                                 .cursor(gpui::CursorStyle::IBeam)
                                 .child(gpui_base::SelectableText::new(
                                     "conditions",
-                                    format!("({conditions})"),
+                                    parameter
+                                        .conditions
+                                        .clone()
+                                        .map(|conditions| format!("({conditions})"))
+                                        .unwrap_or_default(),
                                 )),
                         )
                     })
@@ -1756,7 +1979,7 @@ impl ControlPlaneView {
                     )),
             );
         }
-        table
+        card
     }
 
     /// The per-row link to the source PDF: a single icon on the row itself, with the
@@ -1789,7 +2012,7 @@ impl ControlPlaneView {
     /// are rendered on demand. Pages are separate items tagged with their number so the
     /// preview's scroll container can land on one and report which are visible.
     // Page sizes and bitmap dimensions are small positive values.
-    #[allow(clippy::cast_precision_loss)]
+    #[allow(clippy::cast_precision_loss, clippy::too_many_arguments, clippy::too_many_lines)]
     pub(super) fn render_document_raster_pages(
         raster: &DocumentRasterPreview,
         language: UiLanguage,
@@ -1798,8 +2021,12 @@ impl ControlPlaneView {
         focus: Option<&PreviewFocus>,
         entity: &Entity<Self>,
         grabbing: bool,
+        live: std::ops::RangeInclusive<u32>,
     ) -> Vec<(Option<u32>, AnyElement)> {
         crate::pdf_text_layer::begin_frame();
+        // Pages a selection spans keep their text layers even when scrolled away.
+        let selected = crate::pdf_text_layer::take_selected_pages();
+        let selected = selected.first().zip(selected.last()).map(|(first, last)| *first..=*last);
         // Page bitmaps follow the divider: pane width minus the body padding, the page
         // card's own padding, and its border.
         let bitmap_width = (pane_width - 34.0).max(240.0) * zoom;
@@ -1825,18 +2052,34 @@ impl ControlPlaneView {
             let number = u32::try_from(index + 1).unwrap_or(u32::MAX);
             let rendered = raster.pages.get(&number);
             let display_height = bitmap_width * height_points / width_points;
+            let frame =
+                div().p_1().rounded_sm().border_1().border_color(rgb(BORDER)).bg(rgb(SURFACE_BG));
+            // Far pages are bare same-sized slots: every frame (window moves included)
+            // re-renders the whole tree, so only pages near the viewport carry the
+            // bitmap, handlers and text layer.
+            if !live.contains(&number)
+                && !selected.as_ref().is_some_and(|span| span.contains(&number))
+            {
+                content.push((
+                    Some(number),
+                    div()
+                        .v_flex()
+                        .gap_1()
+                        .child(Self::render_raster_page_label(language, number, page_count))
+                        .child(frame.child(
+                            div().w(px(bitmap_width)).h(px(display_height)).bg(rgb(CARD_BG)),
+                        ))
+                        .into_any_element(),
+                ));
+                continue;
+            }
             let grabber = entity.clone();
-            let frame = div()
+            let frame = frame
                 .id(("pdf-page-frame", number))
                 .cursor(crate::pdf_zoom::native::pan_cursor(grabbing))
                 .on_mouse_down(gpui::MouseButton::Left, move |event, _, cx| {
                     grabber.update(cx, |view, cx| view.begin_pdf_pan(event.position, cx));
-                })
-                .p_1()
-                .rounded_sm()
-                .border_1()
-                .border_color(rgb(BORDER))
-                .bg(rgb(SURFACE_BG));
+                });
             let frame = match rendered {
                 Some(page) => frame.child(
                     div().relative().w(px(bitmap_width)).h(px(display_height))
@@ -1891,21 +2134,30 @@ impl ControlPlaneView {
                 div()
                     .v_flex()
                     .gap_1()
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(rgb(0x000e_7490))
-                            .child(language.choose_owned(
-                                format!("第 {number} / {page_count} 页"),
-                                format!("Page {number} / {page_count}"),
-                            )),
-                    )
+                    .child(Self::render_raster_page_label(language, number, page_count))
                     .child(frame)
                     .into_any_element(),
             ));
         }
         content
+    }
+
+    fn render_raster_page_label(language: UiLanguage, number: u32, page_count: usize) -> Div {
+        div().text_xs().font_weight(FontWeight::MEDIUM).text_color(rgb(0x000e_7490)).child(
+            language.choose_owned(
+                format!("第 {number} / {page_count} 页"),
+                format!("Page {number} / {page_count}"),
+            ),
+        )
+    }
+
+    /// The first and last page shown by the preview scroll container's last layout;
+    /// `base` is the item index just before page 1.
+    fn visible_raster_pages(scroll: &gpui::ScrollHandle, base: usize, count: usize) -> (u32, u32) {
+        let page = |index: usize| {
+            u32::try_from(index.saturating_sub(base).clamp(1, count.max(1))).unwrap_or(u32::MAX)
+        };
+        (page(scroll.top_item()), page(scroll.bottom_item()))
     }
 
     /// A view body as preview items; pages of paged text are tagged with their number

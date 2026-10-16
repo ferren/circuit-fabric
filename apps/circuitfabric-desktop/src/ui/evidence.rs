@@ -467,22 +467,36 @@ impl ControlPlaneView {
             String::new()
         };
 
-        let scope_button = |id: &'static str, scope: EvidenceScope, label: &'static str| {
+        let mut scope_tabs = TabBar::new("evidence-scope-tabs").underline().flex_none();
+        for (id, scope, label) in [
+            ("evidence-scope-all", EvidenceScope::All, language.choose("全部", "All")),
+            (
+                "evidence-scope-text",
+                EvidenceScope::FullText,
+                language.choose("文档全文", "Full text"),
+            ),
+            (
+                "evidence-scope-verified",
+                EvidenceScope::VerifiedData,
+                language.choose("已校验数据", "Verified data"),
+            ),
+        ] {
             let chooser = entity.clone();
-            let active = self.evidence_scope == scope;
-            action_button(id)
-                .when(active, Button::primary)
-                .when(!active, Button::ghost)
-                .label(label)
-                .on_click(move |_, _, cx| {
-                    chooser.update(cx, |view, cx| {
-                        if view.evidence_scope != scope {
-                            view.evidence_scope = scope;
-                            view.schedule_evidence_search(Duration::ZERO, cx);
-                        }
-                    });
-                })
-        };
+            scope_tabs = scope_tabs.child(
+                Tab::new()
+                    .debug_selector(move || id.to_owned())
+                    .label(label)
+                    .selected(self.evidence_scope == scope)
+                    .on_click(move |_, _, cx| {
+                        chooser.update(cx, |view, cx| {
+                            if view.evidence_scope != scope {
+                                view.evidence_scope = scope;
+                                view.schedule_evidence_search(Duration::ZERO, cx);
+                            }
+                        });
+                    }),
+            );
+        }
 
         let mut panel = div()
             .v_flex()
@@ -512,21 +526,7 @@ impl ControlPlaneView {
                     .flex_wrap()
                     .items_center()
                     .gap_1()
-                    .child(scope_button(
-                        "evidence-scope-all",
-                        EvidenceScope::All,
-                        language.choose("全部", "All"),
-                    ))
-                    .child(scope_button(
-                        "evidence-scope-text",
-                        EvidenceScope::FullText,
-                        language.choose("文档全文", "Full text"),
-                    ))
-                    .child(scope_button(
-                        "evidence-scope-verified",
-                        EvidenceScope::VerifiedData,
-                        language.choose("已校验数据", "Verified data"),
-                    ))
+                    .child(scope_tabs)
                     .child(div().ml_auto().text_xs().text_color(rgb(TEXT_MUTED)).child(
                         language.choose(
                             "多个词需同时命中 · \"引号\" 保持短语 · Enter 立即检索 · 点击结果跳转",

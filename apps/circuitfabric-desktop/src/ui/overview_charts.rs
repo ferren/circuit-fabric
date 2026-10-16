@@ -305,7 +305,8 @@ pub(super) fn resource_chart(model: &OverviewModel, language: UiLanguage) -> Div
                                             Grid::new()
                                                 .x((0..=4)
                                                     .map(|i| {
-                                                        px(2. + (width - 4.).max(0.) * i as f32 / 4.)
+                                                        px(2.
+                                                            + (width - 4.).max(0.) * i as f32 / 4.)
                                                     })
                                                     .collect::<Vec<_>>())
                                                 .stroke(rgb(BORDER))
@@ -352,7 +353,9 @@ pub(super) fn resource_chart(model: &OverviewModel, language: UiLanguage) -> Div
                         |bounds, (), window, _| {
                             Grid::new()
                                 .x((0..=4)
-                                    .map(|i| px(2. + (bounds.size.width.as_f32() - 4.) * i as f32 / 4.))
+                                    .map(|i| {
+                                        px(2. + (bounds.size.width.as_f32() - 4.) * i as f32 / 4.)
+                                    })
                                     .collect::<Vec<_>>())
                                 .stroke(rgb(BORDER))
                                 .paint(&bounds, window);

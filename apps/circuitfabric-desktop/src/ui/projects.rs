@@ -61,10 +61,10 @@ impl ControlPlaneView {
                 .retain(|message| !message.contains(&format!("`{project_id}`")));
         }
         self.invalidate_tool_runs();
-        if let Some(cancel) = &self.task_cancel {
-            cancel.cancel();
+        self.cancel_all_quick_tasks();
+        for task in self.quick_tasks.values_mut() {
+            task.result.clear();
         }
-        self.task_result.clear();
         if let Err(error) = self.project_registry.mark_opened(&project_id) {
             self.status = format!("项目已打开，但未能记录最近活动：{error}");
         } else if let Err(error) = self.persist_project_registry() {
@@ -193,7 +193,44 @@ impl ControlPlaneView {
                 let presentation = super::session_markdown::presentation_source(&replay.body);
                 let markdown =
                     cx.new(|cx| gpui_component::text::TextViewState::markdown(&presentation, cx));
-                self.session_replay = Some(SessionReplaySelection { project_id, replay, markdown });
+                let conversation =
+                    std::rc::Rc::new(super::session_markdown::conversation_rows(&replay.body));
+                let conversation_list =
+                    gpui::ListState::new(conversation.len(), gpui::ListAlignment::Top, px(1024.));
+                let followup_unavailable = crate::application::runtime_session::followup_settings(
+                    storage,
+                    &session_id,
+                    self.saved_settings.clone(),
+                )
+                .err();
+                let datasheet = replay
+                    .metadata
+                    .subject_id
+                    .as_deref()
+                    .filter(|_| {
+                        replay.metadata.category
+                            == circuitfabric_project::SessionCategory::Datasheet
+                    })
+                    .and_then(|id| storage.load_datasheet_extraction(id).ok().flatten());
+                let datasheet_rows =
+                    std::rc::Rc::new(super::sessions::datasheet_display_rows(datasheet.as_ref()));
+                let datasheet_list =
+                    gpui::ListState::new(datasheet_rows.len(), gpui::ListAlignment::Top, px(512.));
+                self.session_replay = Some(SessionReplaySelection {
+                    project_id,
+                    replay,
+                    markdown,
+                    conversation_base: conversation.clone(),
+                    conversation,
+                    conversation_list,
+                    conversation_at_end: std::rc::Rc::new(std::cell::Cell::new(true)),
+                    followup_prompt: None,
+                    followup_unavailable,
+                    datasheet,
+                    datasheet_rows,
+                    datasheet_list,
+                });
+                self.session_modal_tab = SessionModalTab::Conversation;
                 self.session_modal_open = true;
             }
             Err(error) => self.status = format!("未打开会话：{error}"),
@@ -824,15 +861,14 @@ impl ControlPlaneView {
                                     .child(Input::new(&self.project_search)),
                             )
                             .child(
-                                div()
-                                    .flex()
-                                    .gap_2()
+                                TabBar::new("project-filter-tabs")
+                                    .underline()
+                                    .flex_none()
                                     .child(
-                                        action_button("project-filter-all")
+                                        Tab::new()
+                                            .debug_selector(|| "project-filter-all".to_owned())
                                             .label(language.choose("全部", "All"))
-                                            .when(self.project_filter == ProjectFilter::All, |button| {
-                                                button.primary()
-                                            })
+                                            .selected(self.project_filter == ProjectFilter::All)
                                             .on_click(move |_, _, cx| {
                                                 all_filter.update(cx, |view, cx| {
                                                     view.project_filter = ProjectFilter::All;
@@ -841,15 +877,19 @@ impl ControlPlaneView {
                                             }),
                                     )
                                     .child(
-                                        action_button("project-filter-needs-configuration")
+                                        Tab::new()
+                                            .debug_selector(|| {
+                                                "project-filter-needs-configuration".to_owned()
+                                            })
                                             .label(language.choose("待配置", "Needs setup"))
-                                            .when(
-                                                self.project_filter == ProjectFilter::NeedsConfiguration,
-                                                |button| button.primary(),
+                                            .selected(
+                                                self.project_filter
+                                                    == ProjectFilter::NeedsConfiguration,
                                             )
                                             .on_click(move |_, _, cx| {
                                                 setup_filter.update(cx, |view, cx| {
-                                                    view.project_filter = ProjectFilter::NeedsConfiguration;
+                                                    view.project_filter =
+                                                        ProjectFilter::NeedsConfiguration;
                                                     cx.notify();
                                                 });
                                             }),
@@ -892,14 +932,15 @@ impl ControlPlaneView {
                 })
             })
             .unwrap_or(0);
-        let mut tabs = div().flex().gap_1().flex_wrap();
+        let mut tabs = TabBar::new("project-detail-tabs").underline().flex_none();
         for tab in ProjectDetailTab::ALL {
             let chooser = entity.clone();
-            let active = tab == selected_tab;
+            let selector = format!("project-tab-{}", tab.label(UiLanguage::English));
             tabs = tabs.child(
-                action_button(format!("project-tab-{}", tab.label(UiLanguage::English)))
+                Tab::new()
+                    .debug_selector(move || selector.clone())
                     .label(tab.label(language))
-                    .when(active, |button| button.primary())
+                    .selected(tab == selected_tab)
                     .on_click(move |_, _, cx| {
                         chooser.update(cx, |view, cx| {
                             view.project_tab = tab;

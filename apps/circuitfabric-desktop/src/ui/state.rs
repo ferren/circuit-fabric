@@ -4,6 +4,10 @@ use super::*;
 pub(super) struct ProviderFields {
     pub(super) id: Entity<InputState>,
     pub(super) name: Entity<InputState>,
+    pub(super) connection: ProviderConnection,
+    /// Which protocol the Codex App Server uses against the endpoint;
+    /// only meaningful for API-key connections.
+    pub(super) wire_api: ProviderWireApi,
     pub(super) base_url: Entity<InputState>,
     pub(super) model: Entity<InputState>,
     pub(super) api_key_environment_variable: Entity<InputState>,
@@ -14,13 +18,21 @@ pub(super) struct ProviderFields {
     pub(super) enabled: bool,
 }
 
-/// One selectable runtime adapter on the Agents & tools page. Claude Code and DSH are
-/// deliberate placeholders: they show the planned surface without claiming to work.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Values shared by the provider cards and editor before this edit began.
+pub(super) struct ProviderEditorSnapshot {
+    pub(super) index: usize,
+    pub(super) provider: LlmProviderSettings,
+    pub(super) catalogs: BTreeMap<String, Vec<circuitfabric_codex_runtime::models::ModelChoice>>,
+}
+
+/// One selectable runtime adapter on the Agents & tools page. Codex App Server is the
+/// persistent session runtime; Claude Code, DSH, and Kimi Code are per-task CLI runtimes.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(super) enum RuntimeAdapter {
     CodexAppServer,
     ClaudeCode,
     Dsh,
+    KimiCode,
 }
 
 impl RuntimeAdapter {
@@ -29,6 +41,7 @@ impl RuntimeAdapter {
             Self::CodexAppServer => "Codex App Server",
             Self::ClaudeCode => "Claude Code",
             Self::Dsh => "DSH",
+            Self::KimiCode => "Kimi Code",
         }
     }
 
@@ -38,6 +51,30 @@ impl RuntimeAdapter {
             Self::CodexAppServer => "codex",
             Self::ClaudeCode => "claude-code",
             Self::Dsh => "dsh",
+            Self::KimiCode => "kimi-code",
+        }
+    }
+
+    /// Match persisted runtime identifiers, including IDs used by older records.
+    pub(super) fn matches_backend(self, backend: Option<&str>) -> bool {
+        matches!(
+            (self, backend),
+            (Self::CodexAppServer, Some("codex" | "codex-app-server"))
+                | (Self::ClaudeCode, Some("claude-code" | "claude"))
+                | (Self::Dsh, Some("dsh"))
+                | (Self::KimiCode, Some("kimi-code" | "kimi"))
+        )
+    }
+
+    /// Whether a provider with this connection may be bound to this adapter.
+    /// Account-direct providers are exclusive to their own runtime — the same
+    /// rule save-time validation enforces, surfaced here as disabled chips so
+    /// an incompatible binding is never offered as clickable.
+    pub(super) const fn accepts(self, connection: ProviderConnection) -> bool {
+        match connection {
+            ProviderConnection::ApiKey => true,
+            ProviderConnection::CodexAccount => matches!(self, Self::CodexAppServer),
+            ProviderConnection::KimiAccount => matches!(self, Self::KimiCode),
         }
     }
 
@@ -48,6 +85,9 @@ impl RuntimeAdapter {
             Self::ClaudeCode => language.choose("本地任务 · JSON 输出", "Local task · JSON output"),
             Self::Dsh => {
                 language.choose("DeepSeek Harness · headless", "DeepSeek Harness · headless")
+            }
+            Self::KimiCode => {
+                language.choose("本地任务 · stream-json 输出", "Local task · stream-json output")
             }
         }
     }
@@ -177,6 +217,71 @@ pub(super) struct CodexCheckReport {
     pub(super) elapsed: Duration,
 }
 
+/// The draft a model catalog belongs to: provider id, connection mode, and
+/// the endpoint coordinates (base URL, key variable) the list was fetched
+/// with. Editing any of these invalidates the fetched choices, so a stale
+/// catalog never offers clicks into a changed draft.
+pub(super) type ModelCatalogKey = (String, ProviderConnection, String, String);
+
+/// Rows the model dropdown loads per step: it opens showing ten and already
+/// holds fifteen, so a scrollbar appears whenever more matches exist; each
+/// scroll that reaches the loaded bottom loads the next page.
+pub(super) const MODEL_PAGE_SIZE: usize = 15;
+/// Rows visible in the dropdown before it scrolls.
+pub(super) const MODEL_DROPDOWN_ROWS: usize = 10;
+
+/// One runtime adapter's quick-verification session: the running task's cancel
+/// handle, its latest result text, and the identity of the run in flight.
+/// Every adapter has its own slot, so quick tasks on different runtimes never
+/// block, overwrite, cancel, or misattribute one another.
+#[derive(Default)]
+pub(super) struct QuickTaskState {
+    pub(super) cancel: Option<circuitfabric_codex_runtime::execution::Cancellation>,
+    pub(super) result: String,
+    pub(super) identity: Option<(Option<ProjectId>, Option<String>, String)>,
+}
+
+/// Shared empty quick-task slot for read access to an adapter that has never run.
+pub(super) static EMPTY_QUICK_TASK: QuickTaskState =
+    QuickTaskState { cancel: None, result: String::new(), identity: None };
+
+/// Model choices fetched for the provider editor, one fetch at a time. The
+/// [`ModelCatalogKey`] keeps stale choices from a different provider,
+/// connection, or endpoint draft from offering clicks into the current one.
+/// The choices render in a floating dropdown anchored to the model field
+/// (`dropdown_open`), fetched automatically — never by a manual button.
+/// `window` is how many matches render now — the catalog itself is cached,
+/// so paging through it is instant local windowing.
+pub(super) struct ModelChoicesState {
+    pub(super) pending: bool,
+    pub(super) fetched_for: Option<ModelCatalogKey>,
+    pub(super) dropdown_open: bool,
+    /// Only the newest fetch may publish its result; every started fetch bumps
+    /// this and a completing fetch whose generation no longer matches is
+    /// dropped.
+    pub(super) generation: u64,
+    pub(super) choices: Vec<circuitfabric_codex_runtime::models::ModelChoice>,
+    pub(super) error: Option<String>,
+    /// How many matches the dropdown currently renders. Opens at
+    /// [`MODEL_PAGE_SIZE`]; grows by one page per scroll reaching the loaded
+    /// bottom, capped by the catalog limit.
+    pub(super) window: usize,
+}
+
+impl Default for ModelChoicesState {
+    fn default() -> Self {
+        Self {
+            pending: false,
+            fetched_for: None,
+            dropdown_open: false,
+            generation: 0,
+            choices: Vec::new(),
+            error: None,
+            window: MODEL_PAGE_SIZE,
+        }
+    }
+}
+
 pub(super) fn elapsed_label(language: UiLanguage, elapsed: Duration) -> String {
     let seconds = elapsed.as_secs();
     if seconds < 60 {
@@ -279,6 +384,41 @@ pub(super) struct SessionReplaySelection {
     pub(super) project_id: ProjectId,
     pub(super) replay: SessionReplay,
     pub(super) markdown: Entity<gpui_component::text::TextViewState>,
+    /// Chat-style projection of the audit body; one virtualized list item per row.
+    pub(super) conversation: std::rc::Rc<Vec<super::session_markdown::ConversationRow>>,
+    pub(super) conversation_base: std::rc::Rc<Vec<super::session_markdown::ConversationRow>>,
+    pub(super) conversation_list: gpui::ListState,
+    pub(super) conversation_at_end: std::rc::Rc<std::cell::Cell<bool>>,
+    pub(super) followup_prompt: Option<Entity<gpui_component::input::TextareaState>>,
+    pub(super) followup_unavailable: Option<String>,
+    pub(super) datasheet: Option<DatasheetExtraction>,
+    pub(super) datasheet_rows: std::rc::Rc<Vec<(String, String)>>,
+    pub(super) datasheet_list: gpui::ListState,
+}
+
+#[derive(Default)]
+pub(super) struct SessionFollowupStream {
+    pub(super) answer: String,
+    pub(super) reasoning: String,
+    pub(super) revision: u64,
+    pub(super) phase: String,
+}
+
+pub(super) struct SessionFollowupRun {
+    pub(super) project_id: ProjectId,
+    pub(super) session_id: String,
+    pub(super) cancel: circuitfabric_codex_runtime::execution::Cancellation,
+    pub(super) stream: std::sync::Arc<std::sync::Mutex<SessionFollowupStream>>,
+    pub(super) displayed_revision: u64,
+}
+
+/// Which body the session detail modal shows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SessionModalTab {
+    /// Chat-style readable conversation.
+    Conversation,
+    /// The full original audit record.
+    RawData,
 }
 
 /// Default width of the docked document-preview pane; the window grows by this much when
@@ -428,6 +568,9 @@ pub(super) struct ControlPlaneView {
     pub(super) project_data: BTreeMap<ProjectId, ProjectWorkspaceData>,
     pub(super) session_replay: Option<SessionReplaySelection>,
     pub(super) session_modal_open: bool,
+    pub(super) session_modal_tab: SessionModalTab,
+    pub(super) session_followup: Option<SessionFollowupRun>,
+    pub(super) session_followup_feedback: Option<(ProjectId, String, String)>,
     pub(super) session_project_filter: Option<ProjectId>,
     pub(super) session_category_filter: circuitfabric_project::SessionCategory,
     // Docked document preview: the selection and, when the pane widened the window on
@@ -510,9 +653,19 @@ pub(super) struct ControlPlaneView {
     pub(super) agents_selection: AgentsSelection,
     pub(super) adapter_settings_open: Option<RuntimeAdapter>,
     pub(super) provider_editor_open: bool,
+    pub(super) provider_editor_snapshot: Option<ProviderEditorSnapshot>,
     pub(super) dialog_error: Option<String>,
     pub(super) codex_check_pending: bool,
     pub(super) codex_check: Option<CodexCheckResult>,
+    pub(super) model_choices: ModelChoicesState,
+    /// Scroll position of the model dropdown's row list, tracked so both wheel
+    /// scrolling and scrollbar drags can page in more rows at the bottom.
+    pub(super) model_list_scroll: gpui::ScrollHandle,
+    /// Per-provider model catalogs kept after the editor closes, so the
+    /// provider detail pane can badge account-direct providers whose selected
+    /// model reports vision support. Populated by editor fetches and by the
+    /// startup prefetch of direct providers; keyed by provider id.
+    pub(super) model_catalogs: BTreeMap<String, Vec<circuitfabric_codex_runtime::models::ModelChoice>>,
     pub(super) bridge_process: Option<BridgeProcessHandle>,
     pub(super) bridge_status: RuntimeLifecycleStatus,
     pub(super) bridge_active_address: Option<String>,
@@ -563,11 +716,14 @@ pub(super) struct ControlPlaneView {
     pub(super) claude_provider: Entity<InputState>,
     pub(super) dsh_command: Entity<InputState>,
     pub(super) dsh_provider: Entity<InputState>,
+    pub(super) kimi_command: Entity<InputState>,
+    pub(super) kimi_provider: Entity<InputState>,
     pub(super) task_prompt: Entity<InputState>,
     pub(super) task_image: Entity<InputState>,
-    pub(super) task_result: String,
-    pub(super) task_cancel: Option<circuitfabric_codex_runtime::execution::Cancellation>,
-    pub(super) task_identity: Option<(Option<ProjectId>, Option<String>, String)>,
+    /// Per-runtime quick-verification sessions. Prompt and image fields stay
+    /// shared as a typing convenience, but each adapter's run state is
+    /// isolated in its own slot.
+    pub(super) quick_tasks: BTreeMap<RuntimeAdapter, QuickTaskState>,
     pub(super) project_agent_adapter: RuntimeAdapter,
     pub(super) plugin_directory: Entity<InputState>,
     pub(super) plugin_governance_path: PathBuf,
@@ -592,8 +748,13 @@ pub(super) struct ControlPlaneView {
 
 impl Drop for ControlPlaneView {
     fn drop(&mut self) {
-        if let Some(cancel) = &self.task_cancel {
-            cancel.cancel();
+        if let Some(run) = &self.session_followup {
+            run.cancel.cancel();
+        }
+        for task in self.quick_tasks.values() {
+            if let Some(cancel) = &task.cancel {
+                cancel.cancel();
+            }
         }
         // Dropping `vault` zeroizes the derived key and all decrypted values.
     }
