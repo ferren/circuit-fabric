@@ -14,6 +14,7 @@ import sys
 import time
 import struct
 import zlib
+from urllib.parse import urlsplit
 
 requests = []
 tool_names = []
@@ -31,6 +32,12 @@ class Model(http.server.BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(int(self.headers.get('Content-Length', 0))) or b'{}')
         requests.append((self.path, body.get('model')))
         image_seen.append('input_image' in json.dumps(body))
+        if 'CF_TEST_PROVIDER_ERROR' in json.dumps(body):
+            self.send_response(401)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'type': 'error', 'error': {'type': 'authentication_error', 'message': 'CF_PROVIDER_401 fixture-only'}}).encode())
+            return
         if 'CF_WAIT_FOR_CANCEL' in json.dumps(body):
             time.sleep(4)
             try:
@@ -156,6 +163,22 @@ if __name__ == '__main__':
                 print('First tool schema names:', [(x.get('type'), x.get('name'), [t.get('name') for t in x.get('tools', [])]) for x in (tool_names[0] or [])])
             if failed:
                 raise SystemExit(1)
+            if 'claude' in sys.argv[1:] or not sys.argv[1:]:
+                # The native Anthropic gateway has a path prefix, unlike the
+                # generic /v1 fixture. Exercise it with a GLM model through the
+                # installed Claude CLI, then verify a real HTTP failure survives
+                # its JSON result envelope without exposing the key.
+                claude_settings = {**settings, 'providers': [{**provider, 'base_url': f'http://127.0.0.1:{server.server_port}/api/anthropic', 'model': 'glm-5.3-flash'}]}
+                path.write_text(json.dumps(claude_settings), encoding='utf-8')
+                result = subprocess.run([str(binary), str(path), 'claude', 'CF_OK'], env=environment, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=220)
+                assert result.returncode == 0 and 'CF_OK' in result.stdout, result.stderr
+                assert any(urlsplit(url).path == '/api/anthropic/v1/messages' and model == 'glm-5.3-flash' for url, model in requests), requests
+                print('claude Anthropic gateway path and GLM model: PASS', flush=True)
+                result = subprocess.run([str(binary), str(path), 'claude', 'CF_TEST_PROVIDER_ERROR'], env=environment, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=220)
+                assert result.returncode != 0 and 'CF_PROVIDER_401' in result.stderr, result.stderr
+                assert 'fixture-only' not in result.stderr and '[REDACTED]' in result.stderr, result.stderr
+                print('claude HTTP 401 detail and credential redaction: PASS', flush=True)
+                path.write_text(json.dumps(settings), encoding='utf-8')
             if usage_only:
                 raise SystemExit(0)
             # Explicit binding overrides the default, including the actual service route.

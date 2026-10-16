@@ -27,6 +27,7 @@ pub const DEFAULT_PROVIDER_ID: &str = "zai";
 
 pub mod execution;
 pub mod judge;
+pub mod models;
 pub mod secrets;
 pub mod tools;
 
@@ -105,15 +106,68 @@ impl Default for GlobalPreferences {
     }
 }
 
-/// An OpenAI-compatible model provider configured by the desktop control plane.
+/// How a provider authenticates to its model backend.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderConnection {
+    /// OpenAI-compatible endpoint; the API key is referenced by environment-variable name.
+    #[default]
+    ApiKey,
+    /// Direct: reuse the local Codex installation's own `ChatGPT` sign-in
+    /// (`codex login`, `~/.codex/auth.json`); no API key or base URL applies.
+    CodexAccount,
+    /// Direct: reuse the local `kimi` CLI's own sign-in
+    /// (`kimi login`, `~/.kimi-code`); no API key or base URL applies.
+    KimiAccount,
+}
+
+/// Which OpenAI-compatible protocol the Codex App Server uses to talk to an
+/// API-key provider's endpoint. Modern codex-cli builds support the Responses
+/// API only (`wire_api = "chat"` is rejected at startup, see openai/codex
+/// discussion #7782), so responses is the default; chat stays selectable for
+/// older codex installations whose endpoints only implement chat completions.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderWireApi {
+    /// `POST {base_url}/responses` — the Responses API; also served by
+    /// coding-plan gateways such as z.ai's `https://api.z.ai/api/v1`.
+    #[default]
+    Responses,
+    /// `POST {base_url}/chat/completions` — legacy codex builds only.
+    Chat,
+}
+
+impl ProviderWireApi {
+    /// The `wire_api` value forwarded to `codex --config`.
+    #[must_use]
+    pub const fn codex_value(self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::Responses => "responses",
+        }
+    }
+}
+
+/// A model provider configured by the desktop control plane.
 ///
-/// API keys are intentionally represented only by environment-variable names.
-/// The value is supplied by the user's process environment when the Codex App
-/// Server child process is launched.
+/// Most providers are OpenAI-compatible endpoints whose API keys are
+/// intentionally represented only by environment-variable names; the value is
+/// supplied by the user's process environment when the Codex App Server child
+/// process is launched. A direct ([`ProviderConnection::CodexAccount`] or
+/// [`ProviderConnection::KimiAccount`]) provider instead reuses the local CLI
+/// installation's own sign-in,
+/// so neither a base URL nor an API key applies.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LlmProviderSettings {
     pub id: String,
     pub name: String,
+    /// How the provider authenticates; defaults to an OpenAI-compatible API-key endpoint.
+    #[serde(default)]
+    pub connection: ProviderConnection,
+    /// Which protocol the Codex App Server uses against the endpoint; chat
+    /// completions by default. Ignored by direct (account) providers.
+    #[serde(default)]
+    pub wire_api: ProviderWireApi,
     pub base_url: String,
     pub model: String,
     pub api_key_environment_variable: String,
@@ -143,12 +197,30 @@ fn default_provider_id() -> String {
     DEFAULT_PROVIDER_ID.to_owned()
 }
 
+impl LlmProviderSettings {
+    /// Whether this provider reuses the local Codex installation's own `ChatGPT` sign-in
+    /// instead of an OpenAI-compatible endpoint with an API key.
+    #[must_use]
+    pub fn uses_codex_account(&self) -> bool {
+        self.connection == ProviderConnection::CodexAccount
+    }
+
+    /// Whether this provider reuses the local `kimi` CLI's own sign-in
+    /// instead of an OpenAI-compatible endpoint with an API key.
+    #[must_use]
+    pub fn uses_kimi_account(&self) -> bool {
+        self.connection == ProviderConnection::KimiAccount
+    }
+}
+
 impl Default for LlmProviderSettings {
     fn default() -> Self {
         Self {
             id: DEFAULT_PROVIDER_ID.to_owned(),
             name: "Z.ai".to_owned(),
-            base_url: "https://api.z.ai/api/coding/paas/v4".to_owned(),
+            connection: ProviderConnection::ApiKey,
+            wire_api: ProviderWireApi::Responses,
+            base_url: "https://api.z.ai/api/v1".to_owned(),
             model: "glm-5.3-flash".to_owned(),
             api_key_environment_variable: "JLCIRCUIT_LLM_API_KEY".to_owned(),
             enabled: true,
@@ -304,6 +376,8 @@ pub enum RuntimeError {
     ProtocolJson(#[from] serde_json::Error),
     #[error("Codex App Server rejected `{method}`: {message}")]
     Rpc { method: String, message: String },
+    #[error("模型列表获取失败：{0}")]
+    ModelCatalog(String),
     /// The process exited or closed stdout; `detail` carries its last stderr lines.
     #[error("Codex 进程已退出或关闭了输出（等待 `{method}` 时）{detail}")]
     Closed { method: String, detail: String },
@@ -408,6 +482,18 @@ impl RuntimeSettings {
                     "provider ID `{}` is duplicated",
                     provider.id
                 )));
+            }
+            if provider.uses_codex_account() || provider.uses_kimi_account() {
+                // Direct sign-in: the local CLI installation's own account
+                // supplies credentials and the default model, so only the
+                // display name is required here.
+                if provider.name.trim().is_empty() {
+                    return Err(RuntimeError::InvalidSettings(format!(
+                        "provider `{}` requires a name",
+                        provider.id
+                    )));
+                }
+                continue;
             }
             if provider.name.trim().is_empty()
                 || provider.base_url.trim().is_empty()
@@ -755,13 +841,15 @@ impl CodexAppServerClient {
         model: &str,
         cwd: &std::path::Path,
     ) -> Result<(), RuntimeError> {
-        let result = self.request(
-            "thread/resume",
-            &json!({
-                "threadId": thread_id, "model": model, "cwd": cwd,
-                "approvalPolicy": "never", "sandbox": "read-only",
-            }),
-        )?;
+        let mut params = serde_json::Map::new();
+        params.insert("threadId".to_owned(), Value::String(thread_id.to_owned()));
+        params.insert("cwd".to_owned(), json!(cwd));
+        params.insert("approvalPolicy".to_owned(), Value::String("never".to_owned()));
+        params.insert("sandbox".to_owned(), Value::String("read-only".to_owned()));
+        if !model.trim().is_empty() {
+            params.insert("model".to_owned(), Value::String(model.to_owned()));
+        }
+        let result = self.request("thread/resume", &Value::Object(params))?;
         if result.pointer("/thread/id").and_then(Value::as_str) != Some(thread_id) {
             return Err(tools::invalid("运行时恢复了不同的会话标识"));
         }
@@ -1029,37 +1117,49 @@ fn toml_string(value: &str) -> String {
 }
 
 /// Builds the `codex app-server` command line shared by the JSON-RPC client and the supervised
-/// lifecycle handle: the provider, model, base URL, and environment-variable name are forwarded
-/// as `--config` overrides, so no API key value ever appears on a command line.
+/// lifecycle handle: for an API-key provider, the provider, model, base URL, and
+/// environment-variable name are forwarded as `--config` overrides, so no API key value ever
+/// appears on a command line. A direct (`codex_account`) provider adds no provider overrides at
+/// all — the child reads the local Codex installation's own sign-in — and only pins the model
+/// when one is configured.
 pub(crate) fn app_server_command(
     settings: &CodexAppServerSettings,
     provider: &LlmProviderSettings,
 ) -> Command {
     let mut command = tools::executable(&settings.command);
-    command
-        .arg("app-server")
-        .arg("--stdio")
-        .arg("--config")
-        .arg(format!("model_provider={}", toml_string(&provider.id)))
-        .arg("--config")
-        .arg(format!("model={}", toml_string(&provider.model)))
-        .arg("--config")
-        .arg(format!("model_providers.{}.name={}", provider.id, toml_string(&provider.name)))
-        .arg("--config")
-        .arg(format!(
-            "model_providers.{}.base_url={}",
-            provider.id,
-            toml_string(&provider.base_url)
-        ))
-        .arg("--config")
-        .arg(format!(
-            "model_providers.{}.env_key={}",
-            provider.id,
-            toml_string(&provider.api_key_environment_variable)
-        ))
-        .arg("--config")
-        .arg(format!("model_providers.{}.wire_api=\"responses\"", provider.id))
-        .current_dir(&settings.working_directory);
+    command.arg("app-server").arg("--stdio");
+    if provider.uses_codex_account() {
+        if !provider.model.trim().is_empty() {
+            command.arg("--config").arg(format!("model={}", toml_string(&provider.model)));
+        }
+    } else {
+        command
+            .arg("--config")
+            .arg(format!("model_provider={}", toml_string(&provider.id)))
+            .arg("--config")
+            .arg(format!("model={}", toml_string(&provider.model)))
+            .arg("--config")
+            .arg(format!("model_providers.{}.name={}", provider.id, toml_string(&provider.name)))
+            .arg("--config")
+            .arg(format!(
+                "model_providers.{}.base_url={}",
+                provider.id,
+                toml_string(&provider.base_url)
+            ))
+            .arg("--config")
+            .arg(format!(
+                "model_providers.{}.env_key={}",
+                provider.id,
+                toml_string(&provider.api_key_environment_variable)
+            ))
+            .arg("--config")
+            .arg(format!(
+                "model_providers.{}.wire_api=\"{}\"",
+                provider.id,
+                provider.wire_api.codex_value()
+            ));
+    }
+    command.current_dir(&settings.working_directory);
     command
 }
 
@@ -1119,6 +1219,39 @@ impl CodexAppServerHandle {
     #[must_use]
     pub fn pid(&self) -> u32 {
         self.client.child.id()
+    }
+
+    /// Lists the models the App Server offers for its current configuration
+    /// through the `model/list` JSON-RPC method, following pagination until
+    /// the catalog is exhausted. Older Codex builds predate the method and
+    /// reject it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the server rejects `model/list` or the response
+    /// does not match the protocol.
+    pub fn list_models(&mut self) -> Result<Vec<models::ModelChoice>, RuntimeError> {
+        // Guard against a server that keeps returning the same cursor forever.
+        const MAX_PAGES: usize = 50;
+        let mut choices = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..MAX_PAGES {
+            let mut params = serde_json::Map::new();
+            if let Some(cursor) = cursor.clone() {
+                params.insert("cursor".to_owned(), Value::String(cursor));
+            }
+            let response = self.client.request("model/list", &Value::Object(params))?;
+            choices.extend(models::parse_codex_model_list(&response)?);
+            cursor = response
+                .get("nextCursor")
+                .and_then(Value::as_str)
+                .filter(|next| !next.is_empty())
+                .map(str::to_owned);
+            if cursor.is_none() {
+                return Ok(choices);
+            }
+        }
+        Ok(choices)
     }
 
     /// Non-blocking exit poll: `None` while the process is still running, `Some` with its final
@@ -1412,6 +1545,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {{
         settings.providers.push(LlmProviderSettings {
             id: "openrouter".to_owned(),
             name: "OpenRouter".to_owned(),
+            connection: ProviderConnection::ApiKey,
             base_url: "https://openrouter.ai/api/v1".to_owned(),
             model: "z-ai/glm-5.3-flash".to_owned(),
             api_key_environment_variable: "OPENROUTER_API_KEY".to_owned(),
@@ -1420,6 +1554,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {{
             vision_base_url: None,
             vision_model: None,
             vision_api_key_environment_variable: None,
+            ..LlmProviderSettings::default()
         });
 
         settings.validate().expect("multiple providers are valid");
@@ -1438,6 +1573,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {{
         let native = LlmProviderSettings {
             id: "native".to_owned(),
             name: "Native multimodal".to_owned(),
+            connection: ProviderConnection::ApiKey,
             base_url: "https://api.example.com/v1".to_owned(),
             model: "multimodal-model".to_owned(),
             api_key_environment_variable: "EXAMPLE_API_KEY".to_owned(),
@@ -1446,6 +1582,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {{
             vision_model: Some("kept-vision-model".to_owned()),
             vision_api_key_environment_variable: Some("VISION_API_KEY".to_owned()),
             enabled: true,
+            ..LlmProviderSettings::default()
         };
         let mut settings = RuntimeSettings::default();
         settings.providers[0] = native.clone();
@@ -1472,6 +1609,115 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {{
         settings.providers[0] = text_only;
         settings.default_provider_id = DEFAULT_PROVIDER_ID.to_owned();
         settings.validate().expect("text-only provider without vision stays valid");
+    }
+
+    #[test]
+    fn codex_account_provider_needs_only_a_name() {
+        let direct = LlmProviderSettings {
+            id: "codex-account".to_owned(),
+            name: "Codex 账号直连".to_owned(),
+            connection: ProviderConnection::CodexAccount,
+            base_url: String::new(),
+            model: String::new(),
+            api_key_environment_variable: String::new(),
+            enabled: true,
+            native_vision: true,
+            vision_base_url: None,
+            vision_model: None,
+            vision_api_key_environment_variable: None,
+            ..LlmProviderSettings::default()
+        };
+        let mut settings = RuntimeSettings::default();
+        settings.providers[0] = direct.clone();
+        settings.default_provider_id = direct.id.clone();
+        settings.validate().expect("direct provider needs no endpoint fields");
+
+        let mut unnamed = settings.clone();
+        unnamed.providers[0].name = "  ".to_owned();
+        assert!(matches!(
+            unnamed.validate(),
+            Err(RuntimeError::InvalidSettings(message)) if message.contains("requires a name")
+        ));
+    }
+
+    #[test]
+    fn provider_connection_serializes_and_defaults_for_legacy_settings() {
+        let direct = LlmProviderSettings {
+            connection: ProviderConnection::CodexAccount,
+            ..LlmProviderSettings::default()
+        };
+        let encoded = serde_json::to_string(&direct).expect("settings serialize");
+        assert!(encoded.contains("\"connection\":\"codex_account\""));
+        let restored: LlmProviderSettings = serde_json::from_str(&encoded).expect("settings parse");
+        assert_eq!(restored.connection, ProviderConnection::CodexAccount);
+        assert!(restored.uses_codex_account());
+
+        let kimi_direct = LlmProviderSettings {
+            connection: ProviderConnection::KimiAccount,
+            ..LlmProviderSettings::default()
+        };
+        let encoded = serde_json::to_string(&kimi_direct).expect("settings serialize");
+        assert!(encoded.contains("\"connection\":\"kimi_account\""));
+        let restored: LlmProviderSettings = serde_json::from_str(&encoded).expect("settings parse");
+        assert_eq!(restored.connection, ProviderConnection::KimiAccount);
+        assert!(restored.uses_kimi_account());
+
+        // Settings saved before `connection` existed load as API-key providers.
+        let legacy = r#"{
+            "id": "legacy",
+            "name": "Legacy",
+            "base_url": "https://api.example.com/v1",
+            "model": "legacy-model",
+            "api_key_environment_variable": "LEGACY_API_KEY",
+            "enabled": true
+        }"#;
+        let restored: LlmProviderSettings = serde_json::from_str(legacy).expect("legacy parse");
+        assert_eq!(restored.connection, ProviderConnection::ApiKey);
+        assert!(!restored.uses_codex_account());
+    }
+
+    #[test]
+    fn direct_app_server_command_skips_provider_overrides() {
+        let settings = CodexAppServerSettings::default();
+        let provider = LlmProviderSettings {
+            id: "codex-account".to_owned(),
+            name: "Codex 账号直连".to_owned(),
+            connection: ProviderConnection::CodexAccount,
+            base_url: String::new(),
+            model: String::new(),
+            api_key_environment_variable: String::new(),
+            ..LlmProviderSettings::default()
+        };
+
+        let arguments = |provider: &LlmProviderSettings| {
+            app_server_command(&settings, provider)
+                .get_args()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        let empty_model = arguments(&provider);
+        assert!(
+            empty_model.iter().all(|argument| !argument.starts_with("model_provider")
+                && !argument.starts_with("model_providers.")
+                && !argument.contains("env_key")),
+            "direct mode adds no provider overrides: {empty_model:?}"
+        );
+        assert!(
+            !empty_model.iter().any(|argument| argument.starts_with("model=")),
+            "an empty model must not pin a model: {empty_model:?}"
+        );
+
+        let pinned = LlmProviderSettings { model: "gpt-5.1".to_owned(), ..provider };
+        let arguments = arguments(&pinned);
+        assert!(
+            arguments.iter().any(|argument| argument == "model=\"gpt-5.1\""),
+            "a configured model is pinned: {arguments:?}"
+        );
+        assert!(
+            arguments.iter().all(|argument| !argument.starts_with("model_provider")
+                && !argument.starts_with("model_providers.")),
+            "pinning a model still adds no provider overrides: {arguments:?}"
+        );
     }
 
     #[test]
@@ -1590,6 +1836,22 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {{
                 toml_string(&provider.api_key_environment_variable)
             )),
             "the API key is forwarded as an environment-variable name: {arguments:?}"
+        );
+        assert!(
+            arguments.contains(&format!("model_providers.{}.wire_api=\"responses\"", provider.id)),
+            "responses is the default wire protocol: {arguments:?}"
+        );
+        let chat = app_server_command(
+            &settings,
+            &LlmProviderSettings {
+                wire_api: ProviderWireApi::Chat,
+                ..provider.clone()
+            },
+        );
+        assert!(
+            chat.get_args()
+                .any(|argument| argument.to_string_lossy().contains("wire_api=\"chat\"")),
+            "the chat protocol is forwarded when selected for legacy codex builds"
         );
         assert!(
             arguments.iter().all(|argument| !argument.contains("sk-")),

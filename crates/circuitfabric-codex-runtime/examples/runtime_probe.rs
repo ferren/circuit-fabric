@@ -1,11 +1,15 @@
 //! Foreground integration probe; credentials are supplied only through the environment.
 use circuitfabric_codex_runtime::{
-    RuntimeSettings,
+    LlmProviderSettings, ProviderConnection, RuntimeSettings,
     execution::{AgentKind, Cancellation, run_task_observed},
+    models,
 };
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().collect::<Vec<_>>();
     let settings = RuntimeSettings::load_or_default(std::path::Path::new(&args[1]))?;
+    if args[2] == "models" {
+        return probe_models(&settings, &args[3]);
+    }
     if args[2] == "mcp" {
         for id in &settings.tools.authorized_mcp_server_ids {
             let tools = settings.catalog.list_tools(id, &settings.tools)?;
@@ -36,6 +40,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "codex" => AgentKind::Codex,
         "claude" => AgentKind::Claude,
         "dsh" => AgentKind::Dsh,
+        "kimi" => AgentKind::Kimi,
         _ => return Err("unknown runtime".into()),
     };
     let cancel = Cancellation::default();
@@ -67,8 +72,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         println!("{}", result?);
         if std::env::var_os("CF_SMOKE_REQUIRE_USAGE").is_some() {
-            if kind == AgentKind::Dsh {
-                assert!(usage.is_none(), "Dsh text output must not fabricate usage");
+            if matches!(kind, AgentKind::Dsh | AgentKind::Kimi) {
+                assert!(usage.is_none(), "Dsh/Kimi output must not fabricate usage");
             } else {
                 let usage = usage.expect("real adapter must report fixture model counters");
                 assert!(
@@ -79,5 +84,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("CF_USAGE_OK {usage:?}");
         }
     }
+    Ok(())
+}
+
+/// Prints the catalog one model per line and asserts it is non-empty.
+fn probe_models(settings: &RuntimeSettings, source: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let choices = match source {
+        "codex-account" => {
+            let provider = LlmProviderSettings {
+                id: "probe-codex".into(),
+                name: "probe".into(),
+                connection: ProviderConnection::CodexAccount,
+                ..LlmProviderSettings::default()
+            };
+            models::list_codex_models(&settings.codex, &provider, None)?
+        }
+        "kimi-account" => models::list_kimi_models(&settings.adapters.kimi_command)?,
+        source => {
+            let provider = settings
+                .providers
+                .iter()
+                .find(|provider| provider.id == source)
+                .ok_or("provider not in settings; use codex-account, kimi-account, or a provider id")?;
+            models::list_endpoint_models(provider, None)?
+        }
+    };
+    assert!(!choices.is_empty(), "model catalog must not be empty");
+    for choice in &choices {
+        println!(
+            "CF_MODEL {}{}{}",
+            choice.id,
+            choice.display_name.as_deref().map(|name| format!(" ({name})")).unwrap_or_default(),
+            if choice.supports_vision == Some(true) { " [vision]" } else { "" }
+        );
+    }
+    println!("CF_MODELS_OK {}", choices.len());
     Ok(())
 }
