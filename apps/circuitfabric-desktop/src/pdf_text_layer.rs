@@ -3,6 +3,7 @@
 
 use std::{
     cell::{Cell, RefCell},
+    collections::BTreeSet,
     ops::Range,
     rc::Rc,
     sync::Arc,
@@ -19,15 +20,35 @@ use gpui_base::{
 };
 
 thread_local! {
-    static GLYPH_BOUNDS: RefCell<Vec<Bounds<Pixels>>> = const { RefCell::new(Vec::new()) };
+    static VISIBLE_PAGES: RefCell<Vec<(Bounds<Pixels>, Arc<PdfPageText>)>> =
+        const { RefCell::new(Vec::new()) };
+    static SELECTED_PAGES: RefCell<BTreeSet<u32>> = const { RefCell::new(BTreeSet::new()) };
 }
 
 pub fn begin_frame() {
-    GLYPH_BOUNDS.with(|bounds| bounds.borrow_mut().clear());
+    VISIBLE_PAGES.with(|pages| pages.borrow_mut().clear());
+}
+
+/// Pages whose text layer took part in the window selection during the last frame.
+/// Their layers must keep rendering, or the selection would lose its participants.
+pub fn take_selected_pages() -> BTreeSet<u32> {
+    SELECTED_PAGES.with(|pages| std::mem::take(&mut *pages.borrow_mut()))
 }
 
 pub fn over_text(point: Point<Pixels>) -> bool {
-    GLYPH_BOUNDS.with(|bounds| bounds.borrow().iter().any(|bounds| bounds.contains(&point)))
+    VISIBLE_PAGES.with(|pages| {
+        pages.borrow().iter().any(|(bounds, text)| {
+            bounds.contains(&point) && text.hit_test(normalized(point, *bounds))
+        })
+    })
+}
+
+fn normalized(point: Point<Pixels>, bounds: Bounds<Pixels>) -> (f32, f32) {
+    let local = point - bounds.origin;
+    (
+        f32::from(local.x) / f32::from(bounds.size.width).max(1.),
+        f32::from(local.y) / f32::from(bounds.size.height).max(1.),
+    )
 }
 
 /// Work around gpui-base 731e33c restarting auto-scroll for a retained selection.
@@ -214,7 +235,11 @@ impl Element for PdfTextLayer {
         cx: &mut App,
     ) {
         self.content.prepaint(window, cx);
-        let rectangles: Vec<_> = if bounds.intersects(&window.content_mask().bounds) {
+        let visible = bounds.intersects(&window.content_mask().bounds);
+        if visible {
+            VISIBLE_PAGES.with(|pages| pages.borrow_mut().push((bounds, self.text.clone())));
+        }
+        let rectangles: Vec<_> = if visible {
             self.text
                 .characters
                 .iter()
@@ -242,6 +267,9 @@ impl Element for PdfTextLayer {
         });
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
         let handle = state.read(cx).handle.clone();
+        if handle.snapshot(cx).is_some() {
+            SELECTED_PAGES.with(|pages| pages.borrow_mut().insert(self.text.number));
+        }
         handle.register(
             TextSelectionRegistration::new(hitbox, bounds)
                 .with_document_order(u64::from(self.text.number))
@@ -273,15 +301,11 @@ impl Element for PdfTextLayer {
                 gpui::size(bounds.size.width * rect.width, bounds.size.height * rect.height),
             )
         };
-        GLYPH_BOUNDS.with(|all| {
-            all.borrow_mut().extend(self.text.characters.iter().map(|ch| rectangles(ch.bounds)))
-        });
-        let pointer = window.mouse_position() - bounds.origin;
-        let normalized = (
-            f32::from(pointer.x) / f32::from(bounds.size.width).max(1.),
-            f32::from(pointer.y) / f32::from(bounds.size.height).max(1.),
-        );
-        if !self.grabbing && self.text.hit_test(normalized) {
+        let pointer = window.mouse_position();
+        if !self.grabbing
+            && bounds.contains(&pointer)
+            && self.text.hit_test(normalized(pointer, bounds))
+        {
             window.set_window_cursor_style(gpui::CursorStyle::IBeam);
         }
         if let Some(range) = state.range(cx) {
@@ -401,6 +425,16 @@ mod tests {
         cx.update(|window, cx| {
             assert_eq!(gpui_base::TextSelection::selected_text(window, cx), "A 中\nµB\nA 中")
         });
+        take_selected_pages();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert_eq!(take_selected_pages(), BTreeSet::from([1, 2]));
+        cx.update(|window, cx| gpui_base::TextSelection::clear(window, cx));
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert!(take_selected_pages().is_empty());
     }
 
     struct DataView {
