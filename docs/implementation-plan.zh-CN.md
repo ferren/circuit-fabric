@@ -105,7 +105,7 @@
 - 智能体文本无法绕过审批或物化策略；
 - 运行时重启可仅使用已存储的引用和快照恢复任务。
 
-现状：部分交付。Codex App Server 适配器支持流式回传思考/输出增量、空闲超时加总时长上限、取消、Token 用量与原生 MCP 工具调用；内置 `typesafe-jev` `evaluate` 服务器随 `native/` 分发并在存在时自动登记进工具目录。Claude Code/DSH 适配器仍为桩实现。
+现状：部分交付。Codex App Server 适配器支持流式回传思考/输出增量、空闲超时加总时长上限、取消、Token 用量与原生 MCP 工具调用；内置 `typesafe-jev` `evaluate` 服务器随 `native/` 分发并在存在时自动登记进工具目录。Claude Code、DSH、Kimi Code 适配器为已实现的每任务一次性 CLI 运行时（Provider 绑定凭据、仅 MCP 工具面、用量/取消/清理；Claude 技能/MCP 闭环已于 2026-10-14 复验通过，见[运行时集成验证记录](runtime-integration-validation.md)）；流式与原生多轮会话仍仅 Codex 实现。
 
 ## 阶段 6 — 更多 EDA 与工程插件
 

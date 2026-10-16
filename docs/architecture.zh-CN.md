@@ -18,7 +18,7 @@ flowchart TB
     EdaPanel[EDA bridge 面板]
 
     subgraph AgentPlane[外部智能体层]
-      Agent[Codex App Server\n后续可接入 Claude Code / DSH]
+      Agent[Codex App Server\n已接入 Claude Code / DSH / Kimi Code]
       Skills[技能与受控工具]
     end
 
@@ -106,7 +106,7 @@ LogicalCircuitSnapshot
 
 适配器返回候选 `IRPatch`、解释、澄清请求和工具请求。它不拥有会话到设计的权威映射、持久 IR、后端凭据或 EDA bridge。EDA 发起的会话使用相同适配器契约：CircuitFabric 在启动运行时前解析其 `projectId`、会话身份、已选运行时配置、获准 MCP/技能与文档范围。
 
-Codex App Server 是第一个运行时适配器。Claude Code、DSH 和其他运行时仅在其线程、流式、动态工具与审批语义映射到本契约后才支持。
+Codex App Server 是第一个运行时适配器。Claude Code、DSH、Kimi Code 和其他运行时仅在其线程、流式、动态工具与审批语义映射到本契约后才支持。
 
 ## 6. 硬件文档服务
 

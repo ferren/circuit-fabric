@@ -105,7 +105,7 @@ Acceptance:
 - agent text cannot bypass approval or materialization policy;
 - runtime restart can recover a task using only stored references and snapshots.
 
-Status: partially delivered. The Codex App Server adapter runs turns with streamed reasoning/answer deltas, an idle timeout plus an overall maximum, cancellation, token usage, and native MCP tool calls; the bundled `typesafe-jev` `evaluate` server ships under `native/` and registers into the tool catalog when present. Claude Code/DSH adapters remain stubs.
+Status: partially delivered. The Codex App Server adapter runs turns with streamed reasoning/answer deltas, an idle timeout plus an overall maximum, cancellation, token usage, and native MCP tool calls; the bundled `typesafe-jev` `evaluate` server ships under `native/` and registers into the tool catalog when present. The Claude Code, DSH, and Kimi Code adapters are implemented one-shot per-task CLI runtimes (provider-bound credentials, MCP-only tool surface, usage/cancellation/cleanup; the Claude skills/MCP loop verified 2026-10-14 — see [runtime integration validation](runtime-integration-validation.md)); streaming and native multi-turn sessions remain Codex-only.
 
 ## Phase 6 — Additional EDA and engineering plugins
 

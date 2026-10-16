@@ -76,7 +76,7 @@ python scripts/validate-tool-management.py --reuse
 
 ## 尚未通过或未验证的部分
 
-- 全套原生 runtime smoke 中，Claude 返回了模型文本，但工具 schema 为空；不能报告 Claude 技能/MCP 闭环通过。DSH 在两个 MCP client 的初始连接/同步阶段失败。两者取消与进程清理通过，整体运行时验收仍由父任务 #398 跟踪。
+- （2026-10-14 已解除）此前记录的"Claude 工具 schema 为空、DSH MCP 初始同步失败"在当前 CLI（claude 2.1.292 / dsh 0.1.2-rc.1）下复验不再复现：完整 smoke 中 Claude 与 DSH 的技能/MCP 闭环、用量与取消清理全部通过，见 [运行时集成验证记录](runtime-integration-validation.md)。整体运行时验收仍由父任务 #398 跟踪。
 - 远程模型、Jev 的真实远程 evaluate、JLC EDA 插件实际连接未在此次运行验证；没有使用用户密钥。stdio 以外的传输和技能脚本/附属资源不在当前实现支持范围内。
 - 严格 Clippy 没有全部通过：现有 `lib.rs` 文档、project storage 文档、`usage_audit.rs` 字段命名及 `pdf_zoom.rs` 浮点比较告警仍在。仅 runtime 包在允许其既有 doc_markdown 告警时的严格检查通过，不能替代全仓严格检查。
 - 新增原生验收脚本是交互检查工具，依赖 Windows 桌面、Pillow 和焦点权限；坐标受窗口与 DPI 影响，截图内容经过检查后才作为记录。无头环境不具备同等原生验收证据。

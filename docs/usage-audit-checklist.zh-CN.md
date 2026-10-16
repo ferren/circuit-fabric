@@ -37,4 +37,4 @@ python crates/circuitfabric-codex-runtime/tests/native_smoke.py --usage-only cod
 
 本地回归结果：三个相关 crate 的应用/运行时/项目及集成测试共 138 项通过，1 项需要独立 Jev 环境的原有测试跳过；本次图表修正后，启用原生 UI 的桌面测试 54 项通过；桌面依赖/滚动边界检查和差异空白检查通过。
 
-完整 MCP smoke 的实际限制：Codex 的工具及计数检查通过；当前 Claude 向本地模型发送的工具清单为空，完整 smoke 在 MCP 工具暴露断言失败。启用 MCP 的 Dsh 也出现 fixture MCP 初始同步失败。`--usage-only` 明确关闭 MCP 授权，只验证运行时计数；不替代完整工具能力验证。
+完整 MCP smoke 的实际限制（2026-10-14 更新）：当时 Claude 向本地模型发送的工具清单为空、Dsh 出现 fixture MCP 初始同步失败；在 claude 2.1.292 / dsh 0.1.2-rc.1 下复验，完整 smoke（含 MCP 工具暴露断言）对 codex/claude/dsh 全部通过，`--usage-only` 不再是必要绕行。仍以本地 fixture 服务验证，不构成真实远程推理证据。

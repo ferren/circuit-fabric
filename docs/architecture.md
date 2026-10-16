@@ -16,7 +16,7 @@ flowchart TB
     EdaPanel[EDA bridge panel]
 
     subgraph AgentPlane[External Agent Plane]
-      Agent[Codex App Server\nClaude Code / DSH adapters later]
+      Agent[Codex App Server\nClaude Code / DSH / Kimi Code adapters]
       Skills[Skills and controlled tools]
     end
 
@@ -104,7 +104,7 @@ The adapter receives:
 
 The adapter returns candidate `IRPatch` objects, explanations, clarification requests, and tool requests. It never owns the canonical conversation-to-design mapping, persistent IR, backend credentials, or EDA bridge. EDA-originated sessions use the same adapter contract: their `projectId`, session identity, selected runtime configuration, permitted MCP/skills, and document scope are resolved by CircuitFabric before the runtime starts.
 
-Codex App Server is the first runtime adapter. Claude Code, DSH, and other runtimes are supported only after their thread, streaming, dynamic tool, and approval semantics are mapped to this contract.
+Codex App Server is the first runtime adapter. Claude Code, DSH, Kimi Code, and other runtimes are supported only after their thread, streaming, dynamic tool, and approval semantics are mapped to this contract.
 
 ## 6. Hardware Document Service
 
