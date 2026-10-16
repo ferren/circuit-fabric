@@ -146,10 +146,12 @@ fn persisted_multi_project_kpis_charts_todos_and_reopen_share_sources_without_wr
     );
     assert_eq!(model.resources[0].counts, Some([1, 1, 3]));
     assert_eq!(model.resources[1].counts, Some([0, 1, 0]));
-    assert_eq!(
-        model.sessions.iter().map(|s| (&*s.project_id, &*s.id)).collect::<Vec<_>>(),
-        [("a", "same"), ("b", "same")]
-    );
+    // This checks project-qualified identities, not chronological ordering:
+    // disk writes may cross a second boundary and make project b newer.
+    let mut identities =
+        model.sessions.iter().map(|s| (&*s.project_id, &*s.id)).collect::<Vec<_>>();
+    identities.sort_unstable();
+    assert_eq!(identities, [("a", "same"), ("b", "same")]);
     assert_eq!(model.todos.len(), 5);
     assert!(model.todos.iter().any(|todo| matches!(&todo.target, TodoTarget::Constraint { snapshot_hash, .. } if snapshot_hash == "tip")));
     assert_eq!(before, fs::read(a.root().join("logic/changesets/pending.json")).unwrap());

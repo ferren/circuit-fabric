@@ -2,6 +2,8 @@
 #[cfg(feature = "native-ui")]
 pub mod datasheet_checkpoint;
 #[cfg(feature = "native-ui")]
+pub mod datasheet_dialogue;
+#[cfg(feature = "native-ui")]
 pub mod datasheet_recovery;
 pub mod navigation;
 pub mod overview;

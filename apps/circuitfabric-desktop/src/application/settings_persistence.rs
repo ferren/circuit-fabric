@@ -21,6 +21,7 @@ pub enum SettingsUpdate {
     Codex { command: String, provider_id: String },
     Claude { command: String, provider_id: String },
     Dsh { command: String, provider_id: String },
+    Kimi { command: String, provider_id: String },
     Bridge { listen_address: String },
     Catalog(ToolCatalog),
     Authorizations(ToolAuthorizationSettings),
@@ -74,6 +75,10 @@ impl SettingsUpdate {
             Self::Dsh { command, provider_id } => {
                 saved.adapters.dsh_command = command;
                 saved.adapters.dsh_provider_id = provider_id;
+            }
+            Self::Kimi { command, provider_id } => {
+                saved.adapters.kimi_command = command;
+                saved.adapters.kimi_provider_id = provider_id;
             }
             Self::Bridge { listen_address } => saved.bridge.listen_address = listen_address,
             Self::Catalog(catalog) => saved.catalog = catalog,
@@ -213,6 +218,15 @@ mod tests {
             save_update(
                 &path,
                 SettingsUpdate::Dsh { command: "saved-dsh".into(), provider_id: String::new() }
+            )
+            .unwrap(),
+            expected
+        );
+        expected.adapters.kimi_command = "saved-kimi".into();
+        assert_eq!(
+            save_update(
+                &path,
+                SettingsUpdate::Kimi { command: "saved-kimi".into(), provider_id: String::new() }
             )
             .unwrap(),
             expected
