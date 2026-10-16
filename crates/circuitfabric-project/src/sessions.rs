@@ -154,13 +154,35 @@ pub struct SessionEvent {
 /// The auditable event shapes a session record can accumulate.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SessionEventKind {
-    Turn { actor: SessionActor, message: String },
-    ToolCall { summary: String },
-    Approval { decision: String },
-    EvidenceCited { document_id: String, content_hash: String, locator: String },
-    UsageRecorded { usage: SessionUsage },
-    StatusChanged { from: SessionStatus, to: SessionStatus },
-    Note { text: String },
+    Turn {
+        actor: SessionActor,
+        message: String,
+    },
+    /// Only the reasoning summary exposed by the runtime, never hidden reasoning.
+    ReasoningSummary {
+        text: String,
+    },
+    ToolCall {
+        summary: String,
+    },
+    Approval {
+        decision: String,
+    },
+    EvidenceCited {
+        document_id: String,
+        content_hash: String,
+        locator: String,
+    },
+    UsageRecorded {
+        usage: SessionUsage,
+    },
+    StatusChanged {
+        from: SessionStatus,
+        to: SessionStatus,
+    },
+    Note {
+        text: String,
+    },
 }
 
 impl crate::ProjectStorage {
@@ -705,7 +727,12 @@ fn parse_citations(
 fn render_event(event: &SessionEvent) -> String {
     let timestamp = rfc3339(event.timestamp_unix_seconds);
     match &event.kind {
-        SessionEventKind::Turn { actor, message } => {
+        SessionEventKind::Turn { .. } | SessionEventKind::ReasoningSummary { .. } => {
+            let (label, message) = match &event.kind {
+                SessionEventKind::Turn { actor, message } => (actor.as_str(), message),
+                SessionEventKind::ReasoningSummary { text } => ("思考摘要", text),
+                _ => unreachable!(),
+            };
             if message.contains('\n') || message.contains('\r') {
                 // Nest Markdown under the event to preserve headings and fenced code
                 // while keeping model-authored text distinct from audit event headers.
@@ -720,9 +747,9 @@ fn render_event(event: &SessionEvent) -> String {
                     .map(|line| format!("    {line}"))
                     .collect::<Vec<_>>()
                     .join("\n");
-                format!("- **{timestamp}** · {} · 消息\n\n{body}\n", actor.as_str())
+                format!("- **{timestamp}** · {label} · 消息\n\n{body}\n")
             } else {
-                format!("- **{timestamp}** · {} · {}", actor.as_str(), single_line(message))
+                format!("- **{timestamp}** · {label} · {}", single_line(message))
             }
         }
         SessionEventKind::ToolCall { summary } => {
