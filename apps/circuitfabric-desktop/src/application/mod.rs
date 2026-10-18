@@ -1,4 +1,5 @@
 //! Desktop use cases and read models. No GPUI types belong in this layer.
+pub mod assistant;
 #[cfg(feature = "native-ui")]
 pub mod datasheet_checkpoint;
 #[cfg(feature = "native-ui")]

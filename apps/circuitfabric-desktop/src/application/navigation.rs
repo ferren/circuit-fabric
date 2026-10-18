@@ -55,6 +55,26 @@ impl ControlPlaneScreen {
         }
     }
 
+    /// Stable machine identifier, e.g. for assistant actions.
+    #[must_use]
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Overview => "overview",
+            Self::Projects => "projects",
+            Self::Documents => "documents",
+            Self::Semantics => "semantics",
+            Self::EdaServices => "eda_services",
+            Self::AgentsAndMcp => "agents",
+            Self::SessionsAndTasks => "sessions",
+            Self::ChangesAndApprovals => "changes",
+            Self::BomAndExport => "bom_export",
+            Self::Plugins => "plugins",
+            Self::Usage => "usage",
+            Self::SecretsVault => "secrets",
+            Self::Settings => "settings",
+        }
+    }
+
     #[must_use]
     pub const fn group(self) -> &'static str {
         match self {
