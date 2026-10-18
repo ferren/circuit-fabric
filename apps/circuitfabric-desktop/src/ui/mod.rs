@@ -1,5 +1,6 @@
 //! Native presentation composition root. Business services live in `application`.
 use crate::application::navigation::{ControlPlaneScreen, DesktopShell, app_window_title};
+use assistant::{ASSISTANT_SHORTCUT_LABEL, AssistantState};
 #[cfg(windows)]
 use crate::{pdf_cursors, windows_icon};
 use circuitfabric_contracts::ProjectId;
@@ -7,6 +8,7 @@ use language::UiLanguage;
 use state::*;
 use theme::*;
 use tools::{CatalogEditor, ToolReport};
+mod assistant;
 mod authorization;
 mod bootstrap;
 mod changes;
@@ -92,6 +94,46 @@ use jlcircuit_eda_bridge::{
 const SIDEBAR_MARK: &[u8] =
     include_bytes!("../../../../assets/branding/circuitfabric-sidebar-mark.png");
 
+/// Lucide icons (ISC, see `assets/icons/LICENSE-LUCIDE`) the navigation needs
+/// beyond the default component bundle, embedded individually instead of the
+/// complete catalog.
+const APP_ICONS: [(&str, &[u8]); 8] = [
+    ("icons/folder-kanban.svg", include_bytes!("../../../../assets/icons/folder-kanban.svg")),
+    ("icons/circuit-board.svg", include_bytes!("../../../../assets/icons/circuit-board.svg")),
+    ("icons/messages-square.svg", include_bytes!("../../../../assets/icons/messages-square.svg")),
+    (
+        "icons/git-pull-request.svg",
+        include_bytes!("../../../../assets/icons/git-pull-request.svg"),
+    ),
+    ("icons/package.svg", include_bytes!("../../../../assets/icons/package.svg")),
+    ("icons/puzzle.svg", include_bytes!("../../../../assets/icons/puzzle.svg")),
+    (
+        "icons/chart-no-axes-column.svg",
+        include_bytes!("../../../../assets/icons/chart-no-axes-column.svg"),
+    ),
+    ("icons/vault.svg", include_bytes!("../../../../assets/icons/vault.svg")),
+];
+
+/// The component icon bundle plus [`APP_ICONS`].
+struct AppAssets;
+
+impl gpui::AssetSource for AppAssets {
+    fn load(&self, path: &str) -> gpui::Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        if let Some((_, bytes)) = APP_ICONS.iter().find(|(icon, _)| *icon == path) {
+            return Ok(Some(std::borrow::Cow::Borrowed(bytes)));
+        }
+        gpui_component_assets::Assets.load(path)
+    }
+
+    fn list(&self, path: &str) -> gpui::Result<Vec<gpui::SharedString>> {
+        let mut names = gpui_component_assets::Assets.list(path)?;
+        names.extend(
+            APP_ICONS.iter().filter(|(icon, _)| icon.starts_with(path)).map(|(i, _)| (*i).into()),
+        );
+        Ok(names)
+    }
+}
+
 fn status_dot(color: u32) -> impl IntoElement {
     div().size(px(8.)).rounded_full().bg(rgb(color)).flex_none()
 }
@@ -100,7 +142,7 @@ pub(crate) fn run() {
     // gpui-component's icons (buttons, spinners, …) are SVG assets; without a registered
     // asset source every `Icon` renders as empty space — the control still occupies its
     // layout box and handles input, but nothing is visible.
-    gpui_platform::application().with_assets(gpui_component_assets::Assets).run(move |cx| {
+    gpui_platform::application().with_assets(AppAssets).run(move |cx| {
         gpui_component::init(cx);
         cx.set_app_identity("io.circuitfabric.desktop", "CircuitFabric");
         cx.spawn(async move |cx| {
@@ -156,6 +198,6 @@ mod layout_tests;
 use layout::{ScrollRegionExt as _, capped_scroll_body, page, workspace_page};
 
 use widgets::{
-    action_button, agents_group_label, detail_pane, info_note, labeled_field, project_empty_state,
-    settings_summary_row,
+    action_button, agents_group_label, detail_pane, info_note, keycap, labeled_field,
+    project_empty_state, settings_summary_row,
 };

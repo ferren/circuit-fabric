@@ -1,6 +1,76 @@
 //! Navigation, fixed chrome and page composition.
 use super::*;
 
+const SIDEBAR_WIDTH: f32 = 248.;
+const SIDEBAR_COLLAPSED_WIDTH: f32 = 64.;
+
+/// One Lucide outline icon per screen, so the set shares stroke weight and style.
+fn screen_icon(screen: ControlPlaneScreen) -> Icon {
+    let name = match screen {
+        ControlPlaneScreen::Overview => "layout-dashboard",
+        ControlPlaneScreen::Projects => "folder-kanban",
+        ControlPlaneScreen::Documents => "file-text",
+        ControlPlaneScreen::Semantics => "circuit-board",
+        ControlPlaneScreen::EdaServices => "cpu",
+        ControlPlaneScreen::AgentsAndMcp => "bot",
+        ControlPlaneScreen::SessionsAndTasks => "messages-square",
+        ControlPlaneScreen::ChangesAndApprovals => "git-pull-request",
+        ControlPlaneScreen::BomAndExport => "package",
+        ControlPlaneScreen::Plugins => "puzzle",
+        ControlPlaneScreen::Usage => "chart-no-axes-column",
+        ControlPlaneScreen::SecretsVault => "vault",
+        ControlPlaneScreen::Settings => "settings",
+    };
+    Icon::default().path(format!("icons/{name}.svg"))
+}
+
+impl ControlPlaneView {
+    fn render_sidebar_collapse_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let entity = cx.entity().clone();
+        let collapsed = self.sidebar_collapsed;
+        let label = if collapsed {
+            self.language.choose("展开导航", "Expand navigation")
+        } else {
+            self.language.choose("收起导航", "Collapse navigation")
+        };
+        div()
+            .id("sidebar-collapse-toggle")
+            .debug_selector(|| "sidebar-collapse-toggle".into())
+            .mb_2()
+            .h(px(32.))
+            .px_2()
+            .flex()
+            .items_center()
+            .when(collapsed, Styled::justify_center)
+            .gap_2()
+            .rounded_lg()
+            .text_xs()
+            .text_color(rgb(SIDEBAR_GROUP))
+            .cursor_pointer()
+            .hover(|this| this.bg(rgb(SIDEBAR_ITEM_HOVER)).text_color(rgb(SIDEBAR_TEXT_ACTIVE)))
+            .when(collapsed, |this| {
+                this.tooltip(move |window, cx| {
+                    gpui_component::tooltip::Tooltip::new(label).build(window, cx)
+                })
+            })
+            .on_click(move |_, _, cx| {
+                entity.update(cx, |view, cx| {
+                    view.sidebar_collapsed = !view.sidebar_collapsed;
+                    cx.notify();
+                });
+            })
+            .child(
+                Icon::new(if collapsed {
+                    IconName::PanelLeftOpen
+                } else {
+                    IconName::PanelLeftClose
+                })
+                .with_size(px(16.)),
+            )
+            .when(!collapsed, |this| this.child(label))
+    }
+}
+
 impl Render for ControlPlaneView {
     #[allow(clippy::too_many_lines)]
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -48,6 +118,7 @@ impl Render for ControlPlaneView {
         let datasheet_stream_modal = (self.datasheet_stream_modal_open
             && self.datasheet_stream.is_some())
         .then(|| self.render_datasheet_stream_modal(cx).into_any_element());
+        let assistant_layer = self.render_assistant_layer(cx);
         let entity = cx.entity().clone();
         let active_screen = self.navigation.screen;
         let language = self.language;
@@ -62,20 +133,43 @@ impl Render for ControlPlaneView {
         let mut current_group = "";
         let vault_unlocked = self.vault.is_some();
         let project_selected = self.navigation.selected_project.is_some();
+        let collapsed = self.sidebar_collapsed;
+        let fading_divider = || {
+            div().flex_1().h(px(1.)).bg(gpui::linear_gradient(
+                90.,
+                gpui::linear_color_stop(rgb_alpha(SIDEBAR_DIVIDER, 1.), 0.),
+                gpui::linear_color_stop(rgb_alpha(SIDEBAR_DIVIDER, 0.), 1.),
+            ))
+        };
 
         for screen in ControlPlaneScreen::ALL {
             if screen.group() != current_group {
                 current_group = screen.group();
-                navigation = navigation.child(
+                // Collapsed, a group heading shrinks to its divider line.
+                navigation = navigation.child(if collapsed {
+                    div()
+                        .pt_3()
+                        .pb_1p5()
+                        .px_2()
+                        .flex()
+                        .child(div().flex_1().h(px(1.)).bg(rgb(SIDEBAR_DIVIDER)))
+                } else {
                     div()
                         .pt_4()
-                        .pb_1()
+                        .pb_1p5()
                         .px_3()
-                        .text_xs()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(SIDEBAR_GROUP))
-                        .child(language.group_label(screen)),
-                );
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(SIDEBAR_GROUP))
+                                .child(language.group_label(screen)),
+                        )
+                        .child(fading_divider())
+                });
             }
 
             let selector = entity.clone();
@@ -85,6 +179,66 @@ impl Render for ControlPlaneView {
             // Project-scoped screens stay gray and inert — no pointer,
             // hover, or click — until a project is selected.
             let unavailable = screen.requires_project() && !project_selected;
+            let icon_color = if unavailable {
+                rgb(SIDEBAR_GROUP)
+            } else if active {
+                rgb(ACCENT_SOFT)
+            } else {
+                rgb(SIDEBAR_TEXT)
+            };
+            let vault_dot = (screen == ControlPlaneScreen::SecretsVault)
+                .then(|| status_dot(if vault_unlocked { 0x0022_c55e } else { 0x0094_a3b8 }));
+            if collapsed {
+                let tooltip = if is_todo { format!("{label}（TODO）") } else { label.to_owned() };
+                navigation = navigation.child(
+                    div()
+                        .id(format!("nav-{}", screen.label()))
+                        .relative()
+                        .w_full()
+                        .h(px(40.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(rgb_alpha(ACCENT, 0.))
+                        .when(active, |this| {
+                            this.bg(rgb_alpha(ACCENT, 0.14)).border_color(rgb_alpha(ACCENT, 0.3))
+                        })
+                        .tooltip(move |window, cx| {
+                            gpui_component::tooltip::Tooltip::new(tooltip.clone()).build(window, cx)
+                        })
+                        .when(!unavailable, |this| {
+                            this.cursor_pointer()
+                                .hover(|this| this.bg(rgb(SIDEBAR_ITEM_HOVER)))
+                                .active(|this| this.bg(rgb(SIDEBAR_ITEM_PRESSED)))
+                                .on_click(move |_, _, cx| {
+                                    selector.update(cx, |view, cx| {
+                                        view.navigation.screen = screen;
+                                        cx.notify();
+                                    });
+                                })
+                        })
+                        .when(active, |this| {
+                            this.child(
+                                div()
+                                    .absolute()
+                                    .left(px(-1.))
+                                    .top(px(10.))
+                                    .w(px(3.))
+                                    .h(px(18.))
+                                    .rounded_full()
+                                    .bg(accent_gradient(180.))
+                                    .shadow(accent_glow(0.8, 8.)),
+                            )
+                        })
+                        .child(screen_icon(screen).with_size(px(18.)).text_color(icon_color))
+                        .when_some(vault_dot, |this, dot| {
+                            this.child(div().absolute().top(px(6.)).right(px(8.)).child(dot))
+                        }),
+                );
+                continue;
+            }
             navigation = navigation.child(
                 div()
                     .id(format!("nav-{}", screen.label()))
@@ -94,8 +248,17 @@ impl Render for ControlPlaneView {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .rounded_md()
-                    .when(active, |this| this.bg(rgb(SIDEBAR_ITEM_ACTIVE)))
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb_alpha(ACCENT, 0.))
+                    .when(active, |this| {
+                        this.bg(gpui::linear_gradient(
+                            90.,
+                            gpui::linear_color_stop(rgb_alpha(ACCENT, 0.18), 0.),
+                            gpui::linear_color_stop(rgb_alpha(ACCENT_ALT, 0.04), 1.),
+                        ))
+                        .border_color(rgb_alpha(ACCENT, 0.22))
+                    })
                     .when(!unavailable, |this| {
                         this.cursor_pointer()
                             .hover(|this| this.bg(rgb(SIDEBAR_ITEM_HOVER)))
@@ -113,8 +276,11 @@ impl Render for ControlPlaneView {
                             .h(px(18.))
                             .rounded_full()
                             .flex_none()
-                            .when(active, |this| this.bg(rgb(ACCENT))),
+                            .when(active, |this| {
+                                this.bg(accent_gradient(180.)).shadow(accent_glow(0.8, 8.))
+                            }),
                     )
+                    .child(screen_icon(screen).with_size(px(16.)).text_color(icon_color))
                     .child(
                         div()
                             .flex_1()
@@ -150,13 +316,7 @@ impl Render for ControlPlaneView {
                                 .child("TODO"),
                         )
                     })
-                    .when(screen == ControlPlaneScreen::SecretsVault, |this| {
-                        this.child(status_dot(if vault_unlocked {
-                            0x0022_c55e
-                        } else {
-                            0x0094_a3b8
-                        }))
-                    }),
+                    .when_some(vault_dot, ParentElement::child),
             );
         }
 
@@ -199,18 +359,26 @@ impl Render for ControlPlaneView {
             .child(
                 // Sidebar
                 div()
-                    .w(px(248.))
+                    .w(px(if collapsed { SIDEBAR_COLLAPSED_WIDTH } else { SIDEBAR_WIDTH }))
                     .flex_none()
                     .h_full()
                     .v_flex()
-                    .p_3()
-                    .bg(rgb(SIDEBAR_BG))
+                    .py_3()
+                    .px(px(if collapsed { 8. } else { 12. }))
+                    .bg(gpui::linear_gradient(
+                        180.,
+                        gpui::linear_color_stop(rgb(SIDEBAR_BG), 0.),
+                        gpui::linear_color_stop(rgb(0x0008_1626), 1.),
+                    ))
+                    .border_r_1()
+                    .border_color(rgb(SIDEBAR_DIVIDER))
                     .text_color(rgb(SIDEBAR_TEXT))
                     .child(
                         div()
                             .flex()
                             .items_center()
-                            .gap_2()
+                            .when(collapsed, Styled::justify_center)
+                            .gap_2p5()
                             .px_1()
                             .pb_4()
                             .mb_1()
@@ -220,40 +388,78 @@ impl Render for ControlPlaneView {
                             // frame: the tile itself supplies the only frame at this size.
                             .child(
                                 div()
-                                    .size(px(40.))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded_md()
-                                    .bg(rgb(SIDEBAR_ITEM_ACTIVE))
-                                    .border_1()
-                                    .border_color(rgb(ACCENT_SOFT))
-                                    .child(img(self.sidebar_mark.clone()).size(px(32.))),
-                            )
-                            .child(
-                                div()
-                                    .v_flex()
-                                    .gap_0p5()
+                                    .size(px(42.))
+                                    .flex_none()
+                                    .p(px(1.5))
+                                    .rounded_lg()
+                                    .bg(accent_gradient(135.))
+                                    .shadow(accent_glow(0.35, 18.))
                                     .child(
                                         div()
-                                            .text_base()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(rgb(SIDEBAR_TEXT_ACTIVE))
-                                            .child("CircuitFabric"),
-                                    )
-                                    .child(div().text_xs().text_color(rgb(SIDEBAR_GROUP)).child(
-                                        language.choose("电路设计控制面", "Circuit control plane"),
-                                    )),
-                            ),
+                                            .size_full()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .rounded_lg()
+                                            .bg(rgb(SIDEBAR_BG))
+                                            .child(img(self.sidebar_mark.clone()).size(px(30.))),
+                                    ),
+                            )
+                            .when(!collapsed, |this| {
+                                this.child(
+                                    div()
+                                        .v_flex()
+                                        .gap_0p5()
+                                        .child(
+                                            div()
+                                                .text_base()
+                                                .font_weight(FontWeight::BOLD)
+                                                .text_color(rgb(SIDEBAR_TEXT_ACTIVE))
+                                                .child("CircuitFabric"),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(rgb(ACCENT_SOFT))
+                                                .child(language.choose(
+                                                    "电路设计控制面",
+                                                    "CIRCUIT CONTROL PLANE",
+                                                )),
+                                        ),
+                                )
+                            }),
                     )
                     .child(navigation)
                     .child(div().flex_1())
-                    .child(
+                    .child(self.render_sidebar_collapse_toggle(cx))
+                    .child(if collapsed {
+                        let label = self.codex_check_label(language);
                         div()
-                            .px_1()
-                            .pt_3()
+                            .id("sidebar-codex-status")
+                            .h(px(32.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(rgb(SIDEBAR_DIVIDER))
+                            .bg(rgb_alpha(SIDEBAR_ITEM_ACTIVE, 0.6))
+                            .tooltip(move |window, cx| {
+                                gpui_component::tooltip::Tooltip::new(label.clone())
+                                    .build(window, cx)
+                            })
+                            .child(status_dot(self.codex_check_dot()))
+                            .into_any_element()
+                    } else {
+                        div()
+                            .p_2p5()
                             .v_flex()
-                            .gap_2()
+                            .gap_1p5()
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(rgb(SIDEBAR_DIVIDER))
+                            .bg(rgb_alpha(SIDEBAR_ITEM_ACTIVE, 0.6))
                             .child(
                                 div()
                                     .flex()
@@ -263,14 +469,16 @@ impl Render for ControlPlaneView {
                                     .child(
                                         div()
                                             .text_xs()
+                                            .truncate()
                                             .text_color(rgb(SIDEBAR_TEXT))
                                             .child(self.codex_check_label(language)),
                                     ),
                             )
                             .child(div().text_xs().text_color(rgb(SIDEBAR_GROUP)).child(
                                 language.choose("v0.1 · 本地控制面", "v0.1 · local control plane"),
-                            )),
-                    ),
+                            ))
+                            .into_any_element()
+                    }),
             )
             .child(
                 // Main column
@@ -286,10 +494,25 @@ impl Render for ControlPlaneView {
                             .h(px(56.))
                             .px_5()
                             .flex()
+                            .flex_none()
                             .items_center()
                             .justify_between()
-                            .border_b_1()
-                            .border_color(rgb(BORDER))
+                            .relative()
+                            .bg(rgb(CARD_BG))
+                            // Accent hairline instead of a flat divider.
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left_0()
+                                    .right_0()
+                                    .bottom_0()
+                                    .h(px(1.))
+                                    .bg(gpui::linear_gradient(
+                                        90.,
+                                        gpui::linear_color_stop(rgb_alpha(ACCENT, 0.7), 0.),
+                                        gpui::linear_color_stop(rgb_alpha(ACCENT_ALT, 0.05), 1.),
+                                    )),
+                            )
                             .child(
                                 div()
                                     .flex_1()
@@ -365,18 +588,20 @@ impl Render for ControlPlaneView {
                                     .child(
                                         div()
                                             .id("command-palette-trigger")
-                                            .self_start()
                                             .flex_none()
                                             .flex()
                                             .items_center()
-                                            .px_2()
-                                            .h(px(28.))
-                                            .rounded_md()
+                                            .gap_2()
+                                            .pl_2p5()
+                                            .pr_1()
+                                            .h(px(30.))
+                                            .w(px(220.))
+                                            .rounded_full()
                                             .border_1()
                                             .border_color(rgb(BORDER))
                                             .bg(rgb(SURFACE_BG))
                                             .cursor_pointer()
-                                            .hover(|this| this.bg(rgb(BORDER)))
+                                            .hover(|this| this.border_color(rgb_alpha(ACCENT, 0.6)))
                                             .on_click({
                                                 let opener = entity.clone();
                                                 move |_, window, cx| {
@@ -386,15 +611,27 @@ impl Render for ControlPlaneView {
                                                 }
                                             })
                                             .child(
-                                                div().text_xs().text_color(rgb(TEXT_MUTED)).child(
-                                                    if cfg!(target_os = "macos") {
-                                                        "⌘K"
-                                                    } else {
-                                                        "Ctrl K"
-                                                    },
-                                                ),
-                                            ),
+                                                Icon::new(IconName::Search)
+                                                    .small()
+                                                    .text_color(rgb(TEXT_MUTED)),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .text_xs()
+                                                    .text_color(rgb(TEXT_MUTED))
+                                                    .child(language.choose(
+                                                        "跳转到模块…",
+                                                        "Jump to module…",
+                                                    )),
+                                            )
+                                            .child(keycap(if cfg!(target_os = "macos") {
+                                                "⌘K"
+                                            } else {
+                                                "Ctrl K"
+                                            })),
                                     )
+                                    .child(self.render_assistant_trigger(cx))
                                     .child(
                                         action_button("toggle-language")
                                             .ghost()
@@ -484,7 +721,8 @@ impl Render for ControlPlaneView {
                             .flex()
                             .items_center()
                             .justify_between()
-                            .bg(rgb(CARD_BG))
+                            .flex_none()
+                            .bg(rgb(SURFACE_BG))
                             .border_t_1()
                             .border_color(rgb(BORDER))
                             .child(
@@ -500,10 +738,30 @@ impl Render for ControlPlaneView {
                                         ),
                                     )),
                             )
-                            .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(
-                                language.choose("CircuitFabric 桌面端", "CircuitFabric desktop"),
-                            )),
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_3()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_1p5()
+                                            .text_xs()
+                                            .text_color(rgb(TEXT_MUTED))
+                                            .child(keycap(ASSISTANT_SHORTCUT_LABEL))
+                                            .child(language.choose("智能助手", "Assistant")),
+                                    )
+                                    .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(
+                                        language.choose(
+                                            "CircuitFabric 桌面端",
+                                            "CircuitFabric desktop",
+                                        ),
+                                    )),
+                            ),
                     )
+                    .child(assistant_layer)
                     .when_some(command_palette, ParentElement::child)
                     .when_some(vault_prompt, ParentElement::child)
                     .when_some(vault_quick_unlock, ParentElement::child)

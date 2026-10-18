@@ -15,6 +15,22 @@ pub(super) fn action_button(id: impl Into<ElementId>) -> Button {
     Button::new(id).self_start().flex_none().debug_selector(move || selector)
 }
 
+/// A keyboard shortcut chip, e.g. `Ctrl K`.
+pub(super) fn keycap(label: &'static str) -> Div {
+    div()
+        .flex_none()
+        .px_1p5()
+        .py_0p5()
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(BORDER))
+        .bg(rgb(CARD_BG))
+        .text_xs()
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(rgb(TEXT_MUTED))
+        .child(label)
+}
+
 /// One read-only key/value row in a settings summary.
 pub(super) fn settings_summary_row(label: &str, value: String) -> Div {
     div()

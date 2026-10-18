@@ -106,7 +106,7 @@ impl ControlPlaneView {
 
     pub(super) fn set_global_theme(&mut self, theme: GlobalTheme, cx: &mut Context<Self>) {
         self.global_theme = theme;
-        DARK_MODE.store(Self::theme_is_dark(theme), Ordering::Relaxed);
+        sync_component_theme(Self::theme_is_dark(theme), cx);
         self.persist_global_preferences(cx);
     }
 

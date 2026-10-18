@@ -75,6 +75,12 @@ impl ControlPlaneView {
             return;
         }
 
+        if keystroke.modifiers.secondary() && keystroke.key.eq_ignore_ascii_case("j") {
+            self.close_command_palette(cx);
+            self.toggle_assistant(window, cx);
+            return;
+        }
+
         if self.command_palette_open {
             match keystroke.key.as_str() {
                 "escape" => self.close_command_palette(cx),
@@ -99,6 +105,14 @@ impl ControlPlaneView {
                     }
                 }
                 _ => {}
+            }
+            return;
+        }
+
+        // The assistant input owns Enter (send) and Escape (close).
+        if self.assistant_input_focused(window, cx) {
+            if keystroke.key == "escape" {
+                self.toggle_assistant(window, cx);
             }
             return;
         }
@@ -154,9 +168,11 @@ impl ControlPlaneView {
                     .justify_between()
                     .px_2()
                     .h(px(36.))
-                    .rounded_md()
+                    .rounded_lg()
                     .cursor_pointer()
-                    .when(is_selected, |this| this.bg(rgb(ACCENT)).text_color(rgb(SIDEBAR_BG)))
+                    .when(is_selected, |this| {
+                        this.bg(accent_gradient(90.)).text_color(rgb(SIDEBAR_BG))
+                    })
                     .when(!is_selected, |this| this.text_color(rgb(SIDEBAR_TEXT)))
                     .when(!is_selected, |this| this.hover(|this| this.bg(rgb(SIDEBAR_ITEM_HOVER))))
                     .on_click(move |_, _, cx| {
@@ -223,9 +239,9 @@ impl ControlPlaneView {
                     .overflow_hidden()
                     .rounded_xl()
                     .border_1()
-                    .border_color(rgb(SIDEBAR_DIVIDER))
+                    .border_color(rgb_alpha(ACCENT, 0.35))
                     .bg(rgb(SIDEBAR_BG))
-                    .shadow_lg()
+                    .shadow(accent_glow(0.25, 40.))
                     .child(
                         div()
                             .flex()

@@ -607,7 +607,10 @@ impl ControlPlaneView {
             .py_3()
             .border_t_1()
             .border_color(rgb(BORDER))
-            .bg(rgb(CARD_BG));
+            .bg(rgb(CARD_BG))
+            // GPUI does not clip children to a rounded parent: this panel sits on the
+            // modal's bottom edge, so it must follow the modal's corner radius itself.
+            .rounded_b_xl();
         if let Some(reason) = &selection.followup_unavailable {
             return panel.child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(reason.clone()));
         }
@@ -1121,6 +1124,7 @@ impl ControlPlaneView {
             .border_l_1()
             .border_color(rgb(BORDER))
             .bg(rgb(CARD_BG))
+            .rounded_br_xl()
             .child(
                 div()
                     .p_3()

@@ -138,7 +138,7 @@ impl ControlPlaneView {
         let loaded = RuntimeSettings::load_or_default(&settings_path);
         let load_error = loaded.as_ref().err().map(ToString::to_string);
         let settings = loaded.unwrap_or_default();
-        DARK_MODE.store(Self::theme_is_dark(settings.global_preferences.theme), Ordering::Relaxed);
+        sync_component_theme(Self::theme_is_dark(settings.global_preferences.theme), cx);
         let project_registry_path = project_data::project_registry_path(&settings_path);
         let (
             project_registry,
@@ -340,6 +340,15 @@ impl ControlPlaneView {
                     PluginGovernanceStore::default()
                 }
             };
+        let (assistant, assistant_restore_error) = AssistantState::new(
+            settings_path.with_file_name("assistant-history.json"),
+            window,
+            cx,
+        );
+        let status = match assistant_restore_error {
+            Some(error) => format!("{status}；{error}"),
+            None => status,
+        };
         let vault_file_exists = UnlockedVault::exists(&vault_path);
         let vault_index = if vault_file_exists {
             UnlockedVault::variable_names(&vault_path).unwrap_or_default()
@@ -518,6 +527,8 @@ impl ControlPlaneView {
             selected_secret: None,
             new_tool_kind: ToolAuthorizationKind::Skill,
             new_tool_scope: ToolScope::Global,
+            assistant,
+            sidebar_collapsed: false,
         }
     }
 }

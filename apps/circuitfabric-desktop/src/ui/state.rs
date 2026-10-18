@@ -744,6 +744,9 @@ pub(super) struct ControlPlaneView {
     pub(super) secret_name: Entity<InputState>,
     pub(super) secret_value: Entity<InputState>,
     pub(super) selected_secret: Option<String>,
+    pub(super) assistant: super::assistant::AssistantState,
+    /// Navigation shows icons only.
+    pub(super) sidebar_collapsed: bool,
 }
 
 impl Drop for ControlPlaneView {
@@ -755,6 +758,9 @@ impl Drop for ControlPlaneView {
             if let Some(cancel) = &task.cancel {
                 cancel.cancel();
             }
+        }
+        if let Some(run) = &self.assistant.run {
+            run.cancel.cancel();
         }
         // Dropping `vault` zeroizes the derived key and all decrypted values.
     }
