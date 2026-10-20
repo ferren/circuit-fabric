@@ -14,6 +14,8 @@ const ASSISTANT_DEFAULT_WIDTH: f32 = 420.;
 const ASSISTANT_DEFAULT_HEIGHT: f32 = 380.;
 const ASSISTANT_MIN_WIDTH: f32 = 320.;
 const ASSISTANT_MIN_HEIGHT: f32 = 260.;
+/// The message box grows with its wrapped content up to this many rows, then scrolls.
+const ASSISTANT_INPUT_MAX_ROWS: usize = 8;
 // Gap between the floating panel and the main column's chrome.
 const ASSISTANT_INSET: f32 = 12.;
 const TOP_BAR_HEIGHT: f32 = 56.;
@@ -75,7 +77,8 @@ pub(super) struct AssistantRun {
 
 pub(super) struct AssistantState {
     pub(super) open: bool,
-    pub(super) input: Entity<InputState>,
+    /// Grows with wrapped content up to [`ASSISTANT_INPUT_MAX_ROWS`], then scrolls.
+    pub(super) input: Entity<gpui_component::input::TextareaState>,
     pub(super) messages: Vec<AssistantMessage>,
     pub(super) run: Option<AssistantRun>,
     pub(super) list: gpui::ListState,
@@ -99,16 +102,17 @@ impl AssistantState {
             Ok(messages) => (messages, None),
             Err(error) => (Vec::new(), Some(format!("智能助手历史会话未恢复：{error}"))),
         };
-        let input = ControlPlaneView::input(
-            window,
-            String::new(),
-            "描述你想做的事，例如：帮我新建一个项目…",
-            cx,
-        );
-        cx.subscribe_in(&input, window, |view, _, event, window, cx| {
-            if let InputEvent::PressEnter { .. } = event {
-                view.send_assistant_message(window, cx);
-            }
+        let input = cx.new(|cx| {
+            gpui_component::input::TextareaState::new(window, cx)
+                .auto_grow(1, ASSISTANT_INPUT_MAX_ROWS)
+                .submit_on_enter(true)
+                .placeholder("描述你想做的事，例如：帮我新建一个项目…")
+        });
+        // Enter sends; Shift+Enter inserts a newline.
+        cx.subscribe_in(&input, window, |view, _, event, window, cx| match event {
+            InputEvent::Change => cx.notify(),
+            InputEvent::PressEnter { shift: false, .. } => view.send_assistant_message(window, cx),
+            _ => {}
         })
         .detach();
         let list = gpui::ListState::new(messages.len(), gpui::ListAlignment::Bottom, px(512.));
@@ -304,8 +308,14 @@ impl ControlPlaneView {
                 controls.push(("search_evidence", l.choose("立即检索证据", "Search evidence now")));
             }
             ControlPlaneScreen::AgentsAndMcp => controls.extend([
-                ("check_codex_runtime", l.choose("检查 Codex 连接", "Check Codex connection")),
-                ("run_codex_task", l.choose("用 Codex 运行验证任务", "Run task with Codex")),
+                (
+                    "check_default_runtime",
+                    l.choose("检查默认运行时连接", "Check default runtime connection"),
+                ),
+                (
+                    "run_default_runtime_task",
+                    l.choose("用默认运行时运行验证任务", "Run task with the default runtime"),
+                ),
             ]),
             ControlPlaneScreen::EdaServices => controls.extend([
                 ("start_bridge", l.choose("启动 Bridge 服务", "Start bridge service")),
@@ -328,8 +338,10 @@ impl ControlPlaneView {
             "choose_project_root" => self.choose_project_root(window, cx),
             "create_project" => self.create_project(window, cx),
             "search_evidence" => self.schedule_evidence_search(Duration::ZERO, cx),
-            "check_codex_runtime" => self.check_codex_runtime(window, cx),
-            "run_codex_task" => self.run_agent_task(RuntimeAdapter::CodexAppServer, window, cx),
+            "check_default_runtime" => self.check_default_runtime(window, cx),
+            "run_default_runtime_task" => {
+                self.run_agent_task(self.default_runtime(), window, cx);
+            }
             "start_bridge" => self.start_bridge_service(window, cx),
             "test_bridge" => self.test_bridge_connection(window, cx),
             _ => {}
@@ -345,7 +357,11 @@ impl ControlPlaneView {
         let mut facts = vec![
             format!("Status bar message: {}", self.status),
             format!("Secrets vault: {}", if self.vault.is_some() { "unlocked" } else { "locked" }),
-            format!("Codex runtime check: {}", self.codex_check_label(l)),
+            format!(
+                "Default runtime: {} · check: {}",
+                self.default_runtime().label(),
+                self.runtime_check_status(self.default_runtime(), l)
+            ),
             format!(
                 "JLCircuit bridge: {} / {}",
                 self.bridge_status.label(l),
@@ -377,9 +393,10 @@ impl ControlPlaneView {
         match screen {
             ControlPlaneScreen::AgentsAndMcp => {
                 facts.push(format!("Agents page detail pane: {:?}", self.agents_selection));
-                let result = &self.quick_task(RuntimeAdapter::CodexAppServer).result;
+                let runtime = self.default_runtime();
+                let result = &self.quick_task(runtime).result;
                 if !result.is_empty() {
-                    facts.push(format!("Last Codex task result: {result}"));
+                    facts.push(format!("Last {} task result: {result}", runtime.label()));
                 }
             }
             ControlPlaneScreen::Documents => {
@@ -449,7 +466,7 @@ impl ControlPlaneView {
 
     #[allow(clippy::too_many_lines)]
     pub(super) fn send_assistant_message(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        use circuitfabric_codex_runtime::execution::{AgentKind, Cancellation};
+        use circuitfabric_codex_runtime::execution::Cancellation;
         let request = self.assistant.input.read(cx).value().trim().to_owned();
         if self.assistant.run.is_some() || request.is_empty() {
             return;
@@ -490,10 +507,11 @@ impl ControlPlaneView {
         self.assistant.run = Some(AssistantRun { cancel: cancel.clone(), stream: stream.clone() });
         let secrets = self.vault.as_ref().map(|vault| vault.values().clone());
         let writer = stream.clone();
+        let (kind, settings) = settings.for_assistant();
         let work = cx.background_spawn(async move {
             circuitfabric_codex_runtime::execution::run_task_streaming(
                 &settings,
-                AgentKind::Codex,
+                kind,
                 &ToolAuthorizationSettings::default(),
                 &prompt,
                 None,
@@ -890,7 +908,7 @@ impl ControlPlaneView {
             let suggestions: [(&str, &str); 4] = [
                 ("这个页面能做什么？", "What can I do on this page?"),
                 ("帮我新建一个项目", "Help me create a new project"),
-                ("检查 Codex 运行时是否可用", "Check whether the Codex runtime works"),
+                ("检查默认运行时是否可用", "Check whether the default runtime works"),
                 ("切换到浅色主题", "Switch to the light theme"),
             ];
             let mut chips = div().v_flex().gap_2().w_full();
@@ -967,6 +985,63 @@ impl ControlPlaneView {
                 .into_any_element()
         };
 
+        // Below the input on a side dock; to its right on a top/bottom dock,
+        // where the panel is wide and short.
+        let selector = div().flex().min_w(px(0.)).child(self.render_assistant_model_selector(
+            super::assistant_selector::selector_anchor(
+                dock == AssistantDock::Left,
+                dock == AssistantDock::Top,
+            ),
+            cx,
+        ));
+        let composer = div()
+                    .debug_selector(|| "assistant-composer".into())
+                    .flex()
+                    .items_end()
+                    .gap_2()
+                    .pl_3()
+                    .pr_1()
+                    .py_1p5()
+                    .min_h(px(44.))
+                    .rounded_xl()
+                    .border_1()
+                    .border_color(rgb_alpha(ACCENT, 0.45))
+                    .bg(rgb(SURFACE_BG))
+                    .child(
+                        InputBase::new("assistant-input")
+                            .flex_1()
+                            .min_w(px(0.))
+                            .py_1p5()
+                            .text_sm()
+                            .child(self.assistant.input.clone()),
+                    )
+                    // `action_button` pins itself to the start of the cross axis;
+                    // keep it on the last line as the input grows.
+                    .child(if busy {
+                        action_button("assistant-stop")
+                            .self_end()
+                            .icon(IconName::Square)
+                            .tooltip(language.choose("停止", "Stop"))
+                            .on_click({
+                                let entity = entity.clone();
+                                move |_, _, cx| entity.update(cx, Self::stop_assistant)
+                            })
+                    } else {
+                        action_button("assistant-send")
+                            .self_end()
+                            .primary()
+                            .icon(IconName::ArrowUp)
+                            .disabled(empty)
+                            .tooltip(language.choose("发送（Enter）", "Send (Enter)"))
+                            .on_click({
+                                let entity = entity.clone();
+                                move |_, window, cx| {
+                                    entity.update(cx, |view, cx| {
+                                        view.send_assistant_message(window, cx);
+                                    });
+                                }
+                            })
+                    });
         let footer = div()
             .flex_none()
             .v_flex()
@@ -991,55 +1066,20 @@ impl ControlPlaneView {
                         ),
                     )),
             )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .pl_3()
-                    .pr_1()
-                    .h(px(44.))
-                    .rounded_xl()
-                    .border_1()
-                    .border_color(rgb_alpha(ACCENT, 0.45))
-                    .bg(rgb(SURFACE_BG))
-                    .child(
-                        InputBase::new("assistant-input")
-                            .flex_1()
-                            .h_full()
+            .map(|footer| {
+                if dock.is_horizontal_edge() {
+                    footer.child(
+                        div()
                             .flex()
-                            .items_center()
-                            .text_sm()
-                            .child(self.assistant.input.clone()),
+                            .items_end()
+                            .gap_2()
+                            .child(composer.flex_1().min_w(px(0.)))
+                            .child(selector.flex_none().max_w(px(360.)).pb_1p5()),
                     )
-                    // `action_button` pins itself to the start of the cross axis;
-                    // center it in the input row instead of hugging the top border.
-                    .child(if busy {
-                        action_button("assistant-stop")
-                            .self_center()
-                            .icon(IconName::Square)
-                            .tooltip(language.choose("停止", "Stop"))
-                            .on_click({
-                                let entity = entity.clone();
-                                move |_, _, cx| entity.update(cx, Self::stop_assistant)
-                            })
-                    } else {
-                        action_button("assistant-send")
-                            .self_center()
-                            .primary()
-                            .icon(IconName::ArrowUp)
-                            .disabled(empty)
-                            .tooltip(language.choose("发送（Enter）", "Send (Enter)"))
-                            .on_click({
-                                let entity = entity.clone();
-                                move |_, window, cx| {
-                                    entity.update(cx, |view, cx| {
-                                        view.send_assistant_message(window, cx);
-                                    });
-                                }
-                            })
-                    }),
-            );
+                } else {
+                    footer.child(composer).child(selector)
+                }
+            });
 
         let top = px(TOP_BAR_HEIGHT + ASSISTANT_INSET);
         let bottom = px(STATUS_BAR_HEIGHT + ASSISTANT_INSET);

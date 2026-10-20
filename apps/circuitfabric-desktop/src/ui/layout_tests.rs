@@ -59,6 +59,81 @@ fn mount_profile<'a>(
 }
 
 #[gpui::test]
+fn assistant_composer_grows_with_long_input_and_stops_at_its_maximum(cx: &mut TestAppContext) {
+    let profile = Profile::new();
+    let (view, cx) = mount_profile(cx, &profile, ControlPlaneScreen::Overview);
+    cx.simulate_resize(gpui::size(px(1400.), px(900.)));
+    cx.update(|window, cx| view.update(cx, |v, cx| v.toggle_assistant(window, cx)));
+    draw(cx);
+    let single = cx.debug_bounds("assistant-composer").expect("composer").size.height;
+    let input = view.read_with(cx, |v, _| v.assistant.input.clone());
+    let set = |cx: &mut VisualTestContext, text: String| {
+        cx.update(|window, cx| input.update(cx, |p, cx| p.set_value(text, window, cx)));
+        draw(cx);
+        cx.debug_bounds("assistant-composer").unwrap().size.height
+    };
+    let wrapped = set(cx, "很长的一段需求描述，".repeat(12));
+    assert!(wrapped > single, "soft-wrapped text grows the box: {wrapped:?} > {single:?}");
+    let capped = set(cx, "第一行\n".repeat(30));
+    let still_capped = set(cx, "第一行\n".repeat(60));
+    assert!(capped > wrapped);
+    assert_eq!(capped, still_capped, "beyond the maximum the box stops growing and scrolls");
+    assert!(capped < px(220.));
+}
+
+#[gpui::test]
+fn assistant_cascader_saves_each_level_and_sits_beside_the_input_on_horizontal_docks(
+    cx: &mut TestAppContext,
+) {
+    use circuitfabric_codex_runtime::{ReasoningEffort, execution::AgentKind};
+    let profile = Profile::new();
+    let (view, cx) = mount_profile(cx, &profile, ControlPlaneScreen::Overview);
+    cx.simulate_resize(gpui::size(px(1400.), px(900.)));
+    cx.update(|window, cx| view.update(cx, |v, cx| v.toggle_assistant(window, cx)));
+    draw(cx);
+    // Side dock: the trigger sits below the input.
+    let composer = cx.debug_bounds("assistant-composer").unwrap();
+    let trigger = cx.debug_bounds("assistant-model-selector-trigger").expect("trigger");
+    assert!(trigger.top() >= composer.bottom());
+
+    cx.simulate_click(trigger.center(), Default::default());
+    draw(cx);
+    assert!(cx.debug_bounds("assistant-model-selector-panel").is_some(), "popup opens");
+    let claude = cx.debug_bounds("assistant-runtime-claude-code").expect("runtime column");
+    cx.simulate_click(claude.center(), Default::default());
+    draw(cx);
+    let high = cx.debug_bounds("assistant-effort-high").expect("effort column");
+    cx.simulate_click(high.center(), Default::default());
+    draw(cx);
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.saved_settings.assistant.runtime, Some(AgentKind::Claude));
+        assert_eq!(v.saved_settings.assistant.reasoning_effort, Some(ReasoningEffort::High));
+        let reloaded =
+            circuitfabric_codex_runtime::RuntimeSettings::load_or_default(&v.settings_path)
+                .unwrap();
+        assert_eq!(reloaded.assistant, v.saved_settings.assistant, "persisted");
+        let (kind, effective) = reloaded.for_assistant();
+        assert_eq!(kind, AgentKind::Claude);
+        let provider =
+            circuitfabric_codex_runtime::execution::selected_provider(&effective, kind).unwrap();
+        assert_eq!(provider.reasoning_effort, Some(ReasoningEffort::High));
+    });
+
+    // Bottom dock: the trigger moves to the right of the input.
+    cx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.assistant.dock = super::assistant::AssistantDock::Bottom;
+            cx.notify();
+        })
+    });
+    draw(cx);
+    let composer = cx.debug_bounds("assistant-composer").unwrap();
+    let trigger = cx.debug_bounds("assistant-model-selector-trigger").unwrap();
+    assert!(trigger.left() >= composer.right());
+    assert!(trigger.bottom() <= composer.bottom() + px(1.));
+}
+
+#[gpui::test]
 fn datasheet_stream_follows_only_at_bottom_and_expands_live(cx: &mut TestAppContext) {
     let profile = Profile::new();
     let (view, cx) = mount_profile(cx, &profile, ControlPlaneScreen::Documents);

@@ -134,6 +134,7 @@ impl Render for ControlPlaneView {
         let vault_unlocked = self.vault.is_some();
         let project_selected = self.navigation.selected_project.is_some();
         let collapsed = self.sidebar_collapsed;
+        let default_runtime = self.default_runtime();
         let fading_divider = || {
             div().flex_1().h(px(1.)).bg(gpui::linear_gradient(
                 90.,
@@ -434,9 +435,9 @@ impl Render for ControlPlaneView {
                     .child(div().flex_1())
                     .child(self.render_sidebar_collapse_toggle(cx))
                     .child(if collapsed {
-                        let label = self.codex_check_label(language);
+                        let label = self.runtime_check_label(default_runtime, language);
                         div()
-                            .id("sidebar-codex-status")
+                            .id("sidebar-runtime-status")
                             .h(px(32.))
                             .flex()
                             .items_center()
@@ -449,7 +450,7 @@ impl Render for ControlPlaneView {
                                 gpui_component::tooltip::Tooltip::new(label.clone())
                                     .build(window, cx)
                             })
-                            .child(status_dot(self.codex_check_dot()))
+                            .child(status_dot(self.runtime_check_dot(default_runtime)))
                             .into_any_element()
                     } else {
                         div()
@@ -465,13 +466,15 @@ impl Render for ControlPlaneView {
                                     .flex()
                                     .items_center()
                                     .gap_2()
-                                    .child(status_dot(self.codex_check_dot()))
+                                    .child(status_dot(self.runtime_check_dot(default_runtime)))
                                     .child(
                                         div()
                                             .text_xs()
                                             .truncate()
                                             .text_color(rgb(SIDEBAR_TEXT))
-                                            .child(self.codex_check_label(language)),
+                                            .child(
+                                                self.runtime_check_label(default_runtime, language),
+                                            ),
                                     ),
                             )
                             .child(div().text_xs().text_color(rgb(SIDEBAR_GROUP)).child(

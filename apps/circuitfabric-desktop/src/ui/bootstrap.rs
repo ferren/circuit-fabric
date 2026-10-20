@@ -116,6 +116,7 @@ impl ControlPlaneView {
             vision_model,
             vision_api_key_environment_variable,
             enabled: provider.enabled,
+            reasoning_effort: provider.reasoning_effort,
         }
     }
 
@@ -455,11 +456,12 @@ impl ControlPlaneView {
             provider_editor_open: false,
             provider_editor_snapshot: None,
             dialog_error: None,
-            codex_check_pending: false,
-            codex_check: None,
+            runtime_checks_pending: std::collections::BTreeSet::new(),
+            runtime_checks: BTreeMap::new(),
             model_choices: ModelChoicesState::default(),
             model_list_scroll: gpui::ScrollHandle::new(),
             model_catalogs: BTreeMap::new(),
+            model_catalog_fetches: BTreeMap::new(),
             bridge_process: None,
             bridge_status: RuntimeLifecycleStatus::Stopped,
             bridge_active_address: None,

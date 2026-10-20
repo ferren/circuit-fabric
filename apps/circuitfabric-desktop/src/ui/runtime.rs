@@ -79,28 +79,56 @@ impl ControlPlaneView {
         Some((id.clone(), storage.root().to_path_buf()))
     }
 
-    /// One-shot connection check for the saved Codex configuration: launch the
-    /// App Server once, require the JSON-RPC initialization handshake, then stop
-    /// the process. Nothing stays resident — tasks, datasheet extraction, and
-    /// EDA bridge sessions each spawn their own isolated process from the same
-    /// saved settings, so this check is the endpoint's only role.
-    pub(super) fn check_codex_runtime(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.codex_check_pending {
+    /// The saved default runtime: the one the sidebar health chip, the overview,
+    /// and the assistant use.
+    pub(super) fn default_runtime(&self) -> RuntimeAdapter {
+        RuntimeAdapter::from_agent_kind(self.saved_settings.adapters.default_runtime)
+    }
+
+    pub(super) fn set_default_runtime(&mut self, adapter: RuntimeAdapter, cx: &mut Context<Self>) {
+        let update =
+            crate::application::settings_persistence::SettingsUpdate::DefaultRuntime(
+                adapter.agent_kind(),
+            );
+        self.status = match self.save_update(update) {
+            Ok(()) => format!("默认运行时已设为 {}。", adapter.label()),
+            Err(error) => format!("默认运行时未保存：{error}"),
+        };
+        cx.notify();
+    }
+
+    pub(super) fn check_default_runtime(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.check_runtime(self.default_runtime(), window, cx);
+    }
+
+    /// One-shot connection check for one runtime's saved configuration. Codex
+    /// launches the App Server once, requires the JSON-RPC initialization
+    /// handshake, then stops the process. The CLI runtimes run a lightweight
+    /// preflight (provider binding, key resolution, `<command> --version`)
+    /// without calling a model. Nothing stays resident: tasks spawn their own
+    /// isolated processes from the same saved settings.
+    #[allow(clippy::too_many_lines)]
+    pub(super) fn check_runtime(
+        &mut self,
+        adapter: RuntimeAdapter,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.runtime_checks_pending.contains(&adapter) {
             return;
         }
         let Some(settings) = self.settings_for_execution(cx) else {
             return;
         };
-        let Some(provider) = circuitfabric_codex_runtime::execution::selected_provider(
-            &settings,
-            circuitfabric_codex_runtime::execution::AgentKind::Codex,
-        )
-        .cloned() else {
-            "未检查：请先配置可用的 Codex Provider。".clone_into(&mut self.status);
+        let kind = adapter.agent_kind();
+        let Some(provider) =
+            circuitfabric_codex_runtime::execution::selected_provider(&settings, kind).cloned()
+        else {
+            self.status = format!("未检查：请先为 {} 配置可用的 Provider。", adapter.label());
             cx.notify();
             return;
         };
-        self.codex_check_pending = true;
+        self.runtime_checks_pending.insert(adapter);
         let snapshot = if provider.uses_codex_account() {
             format!(
                 "{} / {} / {}",
@@ -108,28 +136,49 @@ impl ControlPlaneView {
                 provider.model,
                 self.language.choose("本机 Codex 账号", "local Codex account")
             )
+        } else if provider.uses_kimi_account() {
+            format!(
+                "{} / {} / {}",
+                provider.id,
+                provider.model,
+                self.language.choose("本机 Kimi 账号", "local Kimi account")
+            )
         } else {
             format!("{} / {} / {}", provider.id, provider.model, provider.base_url)
         };
-        let command = settings.codex.command.clone();
-        self.status = format!("Codex 连接检查中：{snapshot}");
+        let command = match adapter {
+            RuntimeAdapter::CodexAppServer => &settings.codex.command,
+            RuntimeAdapter::ClaudeCode => &settings.adapters.claude_command,
+            RuntimeAdapter::Dsh => &settings.adapters.dsh_command,
+            RuntimeAdapter::KimiCode => &settings.adapters.kimi_command,
+        }
+        .clone();
+        self.status = format!("{} 连接检查中：{snapshot}", adapter.label());
         let secrets = (self.secret_storage_provider == SecretStorageProvider::EncryptedVault)
             .then(|| self.vault.as_ref().map(|vault| vault.values().clone()))
             .flatten();
-        let launch_settings = settings.codex.clone();
         let check = cx.background_spawn(async move {
             let started = Instant::now();
-            // `launch_with_secrets` requires the initialization handshake before
-            // returning, so success proves the executable, provider configuration,
-            // and key resolution all work end to end; the drop guard cleans up.
-            let outcome = CodexAppServerHandle::launch_with_secrets(
-                &launch_settings,
-                &provider,
-                secrets.as_ref(),
-            )
-            .map(|mut handle| {
-                let _ = handle.stop();
-            })
+            let outcome = if adapter == RuntimeAdapter::CodexAppServer {
+                // `launch_with_secrets` requires the initialization handshake before
+                // returning, so success proves the executable, provider configuration,
+                // and key resolution all work end to end; the drop guard cleans up.
+                CodexAppServerHandle::launch_with_secrets(
+                    &settings.codex,
+                    &provider,
+                    secrets.as_ref(),
+                )
+                .map(|mut handle| {
+                    let _ = handle.stop();
+                    String::new()
+                })
+            } else {
+                circuitfabric_codex_runtime::execution::preflight_cli(
+                    &settings,
+                    kind,
+                    secrets.as_ref(),
+                )
+            }
             .map_err(|error| error.to_string());
             (outcome, started.elapsed())
         });
@@ -137,25 +186,28 @@ impl ControlPlaneView {
             let (outcome, elapsed) = check.await;
             cx.update(|_, cx| {
                 view.update(cx, |view, cx| {
-                    view.codex_check_pending = false;
-                    view.codex_check = Some(CodexCheckResult {
-                        at: Instant::now(),
-                        outcome: outcome.map(|()| CodexCheckReport {
-                            provider: snapshot,
-                            command,
-                            elapsed,
-                        }),
-                    });
-                    view.status = match &view.codex_check.as_ref().map(|result| &result.outcome) {
-                        Some(Ok(report)) => format!(
-                            "Codex 连接检查通过：{}（{}，耗时 {}）；检查进程已结束。",
-                            report.provider,
-                            report.command,
-                            report.elapsed.as_millis()
+                    view.runtime_checks_pending.remove(&adapter);
+                    view.status = match &outcome {
+                        Ok(version) => format!(
+                            "{} 连接检查通过：{snapshot}（{command}{}，耗时 {} ms）；检查进程已结束。",
+                            adapter.label(),
+                            if version.is_empty() { String::new() } else { format!(" · {version}") },
+                            elapsed.as_millis()
                         ),
-                        Some(Err(reason)) => format!("Codex 连接检查未通过：{reason}"),
-                        None => String::new(),
+                        Err(reason) => format!("{} 连接检查未通过：{reason}", adapter.label()),
                     };
+                    view.runtime_checks.insert(
+                        adapter,
+                        RuntimeCheckResult {
+                            at: Instant::now(),
+                            outcome: outcome.map(|version| RuntimeCheckReport {
+                                provider: snapshot,
+                                command,
+                                version,
+                                elapsed,
+                            }),
+                        },
+                    );
                     cx.notify();
                 })
                 .ok();
@@ -166,34 +218,39 @@ impl ControlPlaneView {
         cx.notify();
     }
 
-    /// Status color of the one-shot check, mirroring the bridge health dots.
-    pub(super) fn codex_check_dot(&self) -> u32 {
-        if self.codex_check_pending {
+    /// Status color of one runtime's one-shot check, mirroring the bridge health dots.
+    pub(super) fn runtime_check_dot(&self, adapter: RuntimeAdapter) -> u32 {
+        if self.runtime_checks_pending.contains(&adapter) {
             return 0x00f5_9e0b;
         }
-        match &self.codex_check {
+        match self.runtime_checks.get(&adapter) {
             Some(result) if result.outcome.is_ok() => 0x0022_c55e,
             Some(_) => 0x00dc_2626,
             None => 0x0094_a3b8,
         }
     }
 
-    /// Short label for list cards and the sidebar chip.
-    pub(super) fn codex_check_label(&self, language: UiLanguage) -> String {
-        if self.codex_check_pending {
-            return language.choose("Codex 检查中…", "Codex checking…").to_owned();
+    /// Check state without the runtime name, for list cards that already show it.
+    pub(super) fn runtime_check_status(&self, adapter: RuntimeAdapter, language: UiLanguage) -> String {
+        if self.runtime_checks_pending.contains(&adapter) {
+            return language.choose("检查中…", "checking…").to_owned();
         }
-        match &self.codex_check {
+        match self.runtime_checks.get(&adapter) {
             Some(result) => match &result.outcome {
                 Ok(_) => format!(
                     "{}（{} 前）",
-                    language.choose("Codex 检查通过", "Codex check passed"),
+                    language.choose("检查通过", "check passed"),
                     elapsed_label(language, result.at.elapsed()),
                 ),
-                Err(_) => language.choose("Codex 检查未通过", "Codex check failed").to_owned(),
+                Err(_) => language.choose("检查未通过", "check failed").to_owned(),
             },
-            None => language.choose("Codex 未检查", "Codex not checked").to_owned(),
+            None => language.choose("未检查", "not checked").to_owned(),
         }
+    }
+
+    /// Named label for the sidebar chip, detail headers and status lines.
+    pub(super) fn runtime_check_label(&self, adapter: RuntimeAdapter, language: UiLanguage) -> String {
+        format!("{} {}", adapter.short_label(), self.runtime_check_status(adapter, language))
     }
 
     /// Starts the `JLCircuit` EDA bridge as a supervised child process.
@@ -442,17 +499,12 @@ impl ControlPlaneView {
             self.provider_editor_open.then(|| self.render_provider_dialog(cx).into_any_element());
 
         let mut runtime_cards = div().v_flex().gap_2();
-        for adapter in [
-            RuntimeAdapter::CodexAppServer,
-            RuntimeAdapter::ClaudeCode,
-            RuntimeAdapter::Dsh,
-            RuntimeAdapter::KimiCode,
-        ] {
+        let default_runtime = self.default_runtime();
+        for adapter in RuntimeAdapter::ALL {
             let selector = entity.clone();
             let selected = matches!(self.agents_selection, AgentsSelection::Runtime(chosen) if chosen == adapter);
-            let is_codex = adapter == RuntimeAdapter::CodexAppServer;
-            let status_label =
-                if is_codex { self.codex_check_label(language) } else { String::new() };
+            let is_default = adapter == default_runtime;
+            let status_label = self.runtime_check_status(adapter, language);
             runtime_cards = runtime_cards.child(
                 div()
                     .id(format!("runtime-card-{}", adapter.label()))
@@ -476,7 +528,7 @@ impl ControlPlaneView {
                             .flex()
                             .items_center()
                             .gap_2()
-                            .when(is_codex, |row| row.child(status_dot(self.codex_check_dot())))
+                            .child(status_dot(self.runtime_check_dot(adapter)))
                             .child(
                                 div()
                                     .text_sm()
@@ -487,17 +539,22 @@ impl ControlPlaneView {
                                     })
                                     .child(adapter.label()),
                             )
-                            .child(div().ml_auto().flex().items_center().gap_2().when(
-                                is_codex,
-                                |row| {
-                                    row.child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(rgb(TEXT_MUTED))
-                                            .child(status_label.clone()),
-                                    )
-                                },
-                            )),
+                            .when(is_default, |row| {
+                                row.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(0x00b4_5309))
+                                        .child(language.choose("★ 默认", "★ Default")),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .ml_auto()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_MUTED))
+                                    .truncate()
+                                    .child(status_label),
+                            ),
                     )
                     .child(
                         div()
@@ -1264,30 +1321,8 @@ impl ControlPlaneView {
         &mut self,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let entity = cx.entity().clone();
         let language = self.language;
-        let checker = entity.clone();
-        let binding_saver = entity;
-        let check_pending = self.codex_check_pending;
-        let last_check = self
-            .codex_check
-            .as_ref()
-            .map(|result| (elapsed_label(language, result.at.elapsed()), result.outcome.clone()));
-        let launch_provider = circuitfabric_codex_runtime::execution::selected_provider(
-            &self.saved_settings,
-            circuitfabric_codex_runtime::execution::AgentKind::Codex,
-        );
-        let launch_provider_summary = match launch_provider {
-            Some(provider) => {
-                format!("`{}`（{} · {}）", provider.id, provider.name, provider.model)
-            }
-            None => language
-                .choose(
-                    "尚未配置（请先添加 Provider）",
-                    "none configured yet (add a provider first)",
-                )
-                .to_owned(),
-        };
+        let binding_saver = cx.entity().clone();
         let codex_dirty = self.runtime_dirty(RuntimeAdapter::CodexAppServer, cx);
         let codex_binding = self.codex_provider.read(cx).value().trim().to_owned();
         let codex_binding_display = if codex_binding.is_empty() {
@@ -1329,88 +1364,9 @@ impl ControlPlaneView {
                                 ),
                             ),
                     )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .px_2()
-                            .py_1()
-                            .rounded_sm()
-                            .bg(rgb(SURFACE_BG))
-                            .child(status_dot(self.codex_check_dot()))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .child(self.codex_check_label(language)),
-                            ),
-                    ),
+                    .child(self.render_runtime_header_status(RuntimeAdapter::CodexAppServer, cx)),
             )
-            .child(
-                Self::adapter_section_card(
-                    "1",
-                    language.choose(
-                        "连接检查 · 验证已保存配置",
-                        "Connection check · verify saved configuration",
-                    ),
-                )
-                .child(
-                    div().text_xs().text_color(rgb(TEXT_MUTED)).child(
-                        language.choose(
-                            "检查会用已保存的 Codex 命令与 Provider 临时启动一次 App Server，完成 JSON-RPC 初始化握手后立即结束进程，不驻留。任务、提取与 EDA 会话不依赖此检查，各自即时拉起一次性进程。",
-                            "The check launches the App Server once with the saved Codex command and provider, completes the JSON-RPC initialization handshake, and stops the process immediately. Tasks, extraction, and EDA sessions do not depend on it; each spawns its own one-off process.",
-                        ),
-                    ),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            action_button("check-codex-runtime")
-                                .primary()
-                                .disabled(check_pending)
-                                .label(if check_pending {
-                                    language.choose("检查中…", "Checking…").to_owned()
-                                } else {
-                                    language.choose("检查连接", "Check connection").to_owned()
-                                })
-                                .on_click(move |_, window, cx| {
-                                    checker.update(cx, |view, cx| {
-                                        view.check_codex_runtime(window, cx);
-                                    });
-                                }),
-                        )
-                        .child(
-                            div().text_xs().text_color(rgb(TEXT_SECONDARY)).child(format!(
-                                "{}{}",
-                                language.choose("任务使用的 Provider：", "Provider used by tasks: "),
-                                launch_provider_summary,
-                            )),
-                        ),
-                )
-                .child(
-                    div().text_sm().whitespace_normal().child(match &last_check {
-                        None => language
-                            .choose("尚未执行连接检查。", "No connection check has been run yet.")
-                            .to_owned(),
-                        Some((elapsed, Ok(report))) => format!(
-                            "{} · {elapsed}{} · {} · {} ms",
-                            language.choose("检查通过", "Check passed"),
-                            language.choose(" 前", " ago"),
-                            report.provider,
-                            report.elapsed.as_millis(),
-                        ),
-                        Some((elapsed, Err(reason))) => format!(
-                            "{} · {elapsed}{} · {reason}",
-                            language.choose("检查未通过", "Check failed"),
-                            language.choose(" 前", " ago"),
-                        ),
-                    }),
-                ),
-            )
+            .child(self.render_runtime_check_section(RuntimeAdapter::CodexAppServer, "1", cx))
             .child(
                 Self::adapter_section_card(
                     "2",
@@ -1465,6 +1421,148 @@ impl ControlPlaneView {
                 )
                 .child(self.render_task_controls(RuntimeAdapter::CodexAppServer, cx)),
             )
+    }
+
+    /// Detail-pane header controls: the default-runtime badge (or the button that
+    /// makes this runtime the default) next to the runtime's check state.
+    pub(super) fn render_runtime_header_status(
+        &self,
+        adapter: RuntimeAdapter,
+        cx: &Context<Self>,
+    ) -> Div {
+        let language = self.language;
+        let setter = cx.entity().clone();
+        let default_control = if adapter == self.default_runtime() {
+            div()
+                .px_1p5()
+                .py_0p5()
+                .rounded_sm()
+                .text_xs()
+                .bg(rgb(0x00fe_f3c7))
+                .text_color(rgb(0x00b4_5309))
+                .child(language.choose("★ 默认运行时", "★ Default runtime"))
+                .into_any_element()
+        } else {
+            action_button(format!("set-default-runtime-{}", adapter.backend_id()))
+                .label(language.choose("设为默认运行时", "Set as default runtime"))
+                .on_click(move |_, _, cx| {
+                    setter.update(cx, |view, cx| view.set_default_runtime(adapter, cx));
+                })
+                .into_any_element()
+        };
+        div().flex().flex_none().items_center().gap_2().child(default_control).child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .bg(rgb(SURFACE_BG))
+                .child(status_dot(self.runtime_check_dot(adapter)))
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(self.runtime_check_label(adapter, language)),
+                ),
+        )
+    }
+
+    /// Numbered "connection check" card shared by every runtime's detail pane.
+    pub(super) fn render_runtime_check_section(
+        &self,
+        adapter: RuntimeAdapter,
+        step: &'static str,
+        cx: &Context<Self>,
+    ) -> Div {
+        let language = self.language;
+        let checker = cx.entity().clone();
+        let check_pending = self.runtime_checks_pending.contains(&adapter);
+        let last_check = self
+            .runtime_checks
+            .get(&adapter)
+            .map(|result| (elapsed_label(language, result.at.elapsed()), &result.outcome));
+        let launch_provider_summary = match circuitfabric_codex_runtime::execution::selected_provider(
+            &self.saved_settings,
+            adapter.agent_kind(),
+        ) {
+            Some(provider) => {
+                format!("`{}`（{} · {}）", provider.id, provider.name, provider.model)
+            }
+            None => language
+                .choose(
+                    "尚未配置（请先添加 Provider）",
+                    "none configured yet (add a provider first)",
+                )
+                .to_owned(),
+        };
+        let description = if adapter == RuntimeAdapter::CodexAppServer {
+            language.choose(
+                "检查会用已保存的 Codex 命令与 Provider 临时启动一次 App Server，完成 JSON-RPC 初始化握手后立即结束进程，不驻留。任务、提取与 EDA 会话不依赖此检查，各自即时拉起一次性进程。",
+                "The check launches the App Server once with the saved Codex command and provider, completes the JSON-RPC initialization handshake, and stops the process immediately. Tasks, extraction, and EDA sessions do not depend on it; each spawns its own one-off process.",
+            )
+        } else {
+            language.choose(
+                "轻量预检：校验已保存的 Provider 关联与密钥可解析，并执行一次「命令 --version」确认 CLI 可启动；不调用模型、不消耗 token。端到端验证请使用下方快速验证。",
+                "Lightweight preflight: verifies the saved provider binding and key resolution, then runs `<command> --version` once to confirm the CLI starts. No model is called and no tokens are spent; use the quick check below for an end-to-end test.",
+            )
+        };
+        Self::adapter_section_card(
+            step,
+            language.choose(
+                "连接检查 · 验证已保存配置",
+                "Connection check · verify saved configuration",
+            ),
+        )
+        .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(description))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    action_button(format!("check-runtime-{}", adapter.backend_id()))
+                        .primary()
+                        .disabled(check_pending)
+                        .label(if check_pending {
+                            language.choose("检查中…", "Checking…")
+                        } else {
+                            language.choose("检查连接", "Check connection")
+                        })
+                        .on_click(move |_, window, cx| {
+                            checker.update(cx, |view, cx| view.check_runtime(adapter, window, cx));
+                        }),
+                )
+                .child(div().text_xs().text_color(rgb(TEXT_SECONDARY)).child(format!(
+                    "{}{}",
+                    language.choose("任务使用的 Provider：", "Provider used by tasks: "),
+                    launch_provider_summary,
+                ))),
+        )
+        .child(div().text_sm().whitespace_normal().child(match last_check {
+            None => language
+                .choose("尚未执行连接检查。", "No connection check has been run yet.")
+                .to_owned(),
+            Some((elapsed, Ok(report))) => format!(
+                "{} · {elapsed}{} · {} · {}{} · {} ms",
+                language.choose("检查通过", "Check passed"),
+                language.choose(" 前", " ago"),
+                report.provider,
+                report.command,
+                if report.version.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · {}", report.version)
+                },
+                report.elapsed.as_millis(),
+            ),
+            Some((elapsed, Err(reason))) => format!(
+                "{} · {elapsed}{} · {reason}",
+                language.choose("检查未通过", "Check failed"),
+                language.choose(" 前", " ago"),
+            ),
+        }))
     }
 
     pub(super) fn run_agent_task(
@@ -1535,12 +1633,7 @@ impl ControlPlaneView {
         {
             prompt = format!("{instructions}\n\n{prompt}");
         }
-        let kind = match adapter {
-            RuntimeAdapter::CodexAppServer => AgentKind::Codex,
-            RuntimeAdapter::ClaudeCode => AgentKind::Claude,
-            RuntimeAdapter::Dsh => AgentKind::Dsh,
-            RuntimeAdapter::KimiCode => AgentKind::Kimi,
-        };
+        let kind = adapter.agent_kind();
         let cancel = Cancellation::default();
         self.quick_task_mut(adapter).cancel = Some(cancel.clone());
         let project = self.navigation.selected_project.clone();

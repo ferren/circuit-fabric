@@ -9,6 +9,7 @@ use state::*;
 use theme::*;
 use tools::{CatalogEditor, ToolReport};
 mod assistant;
+mod assistant_selector;
 mod authorization;
 mod bootstrap;
 mod changes;

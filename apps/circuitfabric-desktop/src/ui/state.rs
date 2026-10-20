@@ -16,6 +16,7 @@ pub(super) struct ProviderFields {
     pub(super) vision_model: Entity<InputState>,
     pub(super) vision_api_key_environment_variable: Entity<InputState>,
     pub(super) enabled: bool,
+    pub(super) reasoning_effort: Option<circuitfabric_codex_runtime::ReasoningEffort>,
 }
 
 /// Values shared by the provider cards and editor before this edit began.
@@ -36,6 +37,38 @@ pub(super) enum RuntimeAdapter {
 }
 
 impl RuntimeAdapter {
+    pub(super) const ALL: [Self; 4] = [Self::CodexAppServer, Self::ClaudeCode, Self::Dsh, Self::KimiCode];
+
+    pub(super) const fn agent_kind(self) -> circuitfabric_codex_runtime::execution::AgentKind {
+        use circuitfabric_codex_runtime::execution::AgentKind;
+        match self {
+            Self::CodexAppServer => AgentKind::Codex,
+            Self::ClaudeCode => AgentKind::Claude,
+            Self::Dsh => AgentKind::Dsh,
+            Self::KimiCode => AgentKind::Kimi,
+        }
+    }
+
+    pub(super) const fn from_agent_kind(
+        kind: circuitfabric_codex_runtime::execution::AgentKind,
+    ) -> Self {
+        use circuitfabric_codex_runtime::execution::AgentKind;
+        match kind {
+            AgentKind::Codex => Self::CodexAppServer,
+            AgentKind::Claude => Self::ClaudeCode,
+            AgentKind::Dsh => Self::Dsh,
+            AgentKind::Kimi => Self::KimiCode,
+        }
+    }
+
+    /// Compact name for the sidebar chip and status lines.
+    pub(super) const fn short_label(self) -> &'static str {
+        match self {
+            Self::CodexAppServer => "Codex",
+            other => other.label(),
+        }
+    }
+
     pub(super) const fn label(self) -> &'static str {
         match self {
             Self::CodexAppServer => "Codex App Server",
@@ -199,21 +232,23 @@ pub(super) struct BridgeTestResult {
     pub(super) outcome: Result<BridgeStatusReport, String>,
 }
 
-/// Outcome of the one-shot Codex connection check. The saved configuration is
-/// launched once, must complete the JSON-RPC initialization handshake, and the
-/// process is stopped immediately — no child stays resident. Tasks, datasheet
-/// extraction, and EDA bridge sessions each spawn their own isolated process
-/// from the same saved settings, so this check is the endpoint's only role.
-pub(super) struct CodexCheckResult {
+/// Outcome of one runtime's one-shot connection check. Codex launches the saved
+/// configuration once, must complete the JSON-RPC initialization handshake, and
+/// the process is stopped immediately — no child stays resident. The per-task CLI
+/// runtimes run a lightweight preflight instead: provider binding and key
+/// resolution plus `<command> --version`, without calling a model.
+pub(super) struct RuntimeCheckResult {
     pub(super) at: Instant,
-    pub(super) outcome: Result<CodexCheckReport, String>,
+    pub(super) outcome: Result<RuntimeCheckReport, String>,
 }
 
 /// What a passing check actually verified, shown next to the result.
 #[derive(Clone)]
-pub(super) struct CodexCheckReport {
+pub(super) struct RuntimeCheckReport {
     pub(super) provider: String,
     pub(super) command: String,
+    /// First line printed by `--version` for CLI runtimes; empty for Codex.
+    pub(super) version: String,
     pub(super) elapsed: Duration,
 }
 
@@ -279,6 +314,21 @@ impl Default for ModelChoicesState {
             error: None,
             window: MODEL_PAGE_SIZE,
         }
+    }
+}
+
+/// Display name of a reasoning effort; `None` is the model's own default.
+pub(super) const fn reasoning_effort_label(
+    effort: Option<circuitfabric_codex_runtime::ReasoningEffort>,
+    language: UiLanguage,
+) -> &'static str {
+    use circuitfabric_codex_runtime::ReasoningEffort;
+    match effort {
+        None => language.choose("模型默认", "Model default"),
+        Some(ReasoningEffort::Low) => language.choose("低", "Low"),
+        Some(ReasoningEffort::Medium) => language.choose("中", "Medium"),
+        Some(ReasoningEffort::High) => language.choose("高", "High"),
+        Some(ReasoningEffort::XHigh) => language.choose("超高", "Extra high"),
     }
 }
 
@@ -655,8 +705,8 @@ pub(super) struct ControlPlaneView {
     pub(super) provider_editor_open: bool,
     pub(super) provider_editor_snapshot: Option<ProviderEditorSnapshot>,
     pub(super) dialog_error: Option<String>,
-    pub(super) codex_check_pending: bool,
-    pub(super) codex_check: Option<CodexCheckResult>,
+    pub(super) runtime_checks_pending: std::collections::BTreeSet<RuntimeAdapter>,
+    pub(super) runtime_checks: BTreeMap<RuntimeAdapter, RuntimeCheckResult>,
     pub(super) model_choices: ModelChoicesState,
     /// Scroll position of the model dropdown's row list, tracked so both wheel
     /// scrolling and scrollbar drags can page in more rows at the bottom.
@@ -666,6 +716,10 @@ pub(super) struct ControlPlaneView {
     /// model reports vision support. Populated by editor fetches and by the
     /// startup prefetch of direct providers; keyed by provider id.
     pub(super) model_catalogs: BTreeMap<String, Vec<circuitfabric_codex_runtime::models::ModelChoice>>,
+    /// Catalog fetches the assistant's model selector started for saved
+    /// providers: `None` while running, `Some(error)` once failed (not retried
+    /// until the app restarts or the provider editor fetches it).
+    pub(super) model_catalog_fetches: BTreeMap<String, Option<String>>,
     pub(super) bridge_process: Option<BridgeProcessHandle>,
     pub(super) bridge_status: RuntimeLifecycleStatus,
     pub(super) bridge_active_address: Option<String>,

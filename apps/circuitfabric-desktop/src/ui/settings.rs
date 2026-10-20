@@ -28,6 +28,7 @@ impl ControlPlaneView {
                 vision_api_key_environment_variable: Self::optional_value(
                     provider.vision_api_key_environment_variable.read(cx).value().to_string(),
                 ),
+                reasoning_effort: provider.reasoning_effort,
             })
             .collect()
     }
@@ -137,6 +138,7 @@ impl ControlPlaneView {
             vision_base_url: None,
             vision_model: None,
             vision_api_key_environment_variable: None,
+            reasoning_effort: None,
         };
         self.providers.push(Self::provider_fields(window, provider, cx));
         self.selected_provider = self.providers.len() - 1;
@@ -364,6 +366,60 @@ impl ControlPlaneView {
         cx.notify();
     }
 
+    pub(super) fn set_provider_reasoning_effort(
+        &mut self,
+        effort: Option<circuitfabric_codex_runtime::ReasoningEffort>,
+        cx: &mut Context<Self>,
+    ) {
+        let selected = self.selected_provider.min(self.providers.len() - 1);
+        self.providers[selected].reasoning_effort = effort;
+        let provider_id = self.providers[selected].id.read(cx).value().to_string();
+        self.status = format!(
+            "Provider `{provider_id}`：默认推理强度设为「{}」；修改尚未保存，请点击「保存 Provider 列表」。",
+            reasoning_effort_label(effort, UiLanguage::SimplifiedChinese)
+        );
+        cx.notify();
+    }
+
+    /// Default reasoning-effort chips in the provider editor.
+    fn render_reasoning_effort_choice(&self, provider: &ProviderFields, cx: &Context<Self>) -> Div {
+        let language = self.language;
+        let mut row = div().flex().flex_wrap().items_center().gap_2().child(
+            div()
+                .text_sm()
+                .font_weight(FontWeight::MEDIUM)
+                .child(language.choose("默认推理强度", "Default reasoning effort")),
+        );
+        for effort in std::iter::once(None)
+            .chain(circuitfabric_codex_runtime::ReasoningEffort::ALL.into_iter().map(Some))
+        {
+            let setter = cx.entity().clone();
+            row = row.child(
+                action_button(format!(
+                    "provider-reasoning-{}",
+                    effort.map_or("default", circuitfabric_codex_runtime::ReasoningEffort::value)
+                ))
+                .label(reasoning_effort_label(effort, language))
+                .when(provider.reasoning_effort == effort, ButtonVariants::primary)
+                .on_click(move |_, _, cx| {
+                    setter.update(cx, |view, cx| view.set_provider_reasoning_effort(effort, cx));
+                }),
+            );
+        }
+        row.child(
+            div()
+                .flex_1()
+                .min_w(px(200.))
+                .text_xs()
+                .text_color(rgb(TEXT_MUTED))
+                .whitespace_normal()
+                .child(language.choose(
+                    "Codex App Server 与 Claude Code 生效；DSH 与 Kimi Code 无此设置。助手可单独覆盖。",
+                    "Applies to Codex App Server and Claude Code; DSH and Kimi Code have no such setting. The assistant can override it.",
+                )),
+        )
+    }
+
     /// The endpoint coordinates a fetched model catalog belongs to. Editing
     /// any of these invalidates the fetched choices, so a stale catalog never
     /// offers clicks into a changed draft.
@@ -420,6 +476,7 @@ impl ControlPlaneView {
                 vision_base_url: None,
                 vision_model: None,
                 vision_api_key_environment_variable: None,
+                reasoning_effort: None,
             }
         };
         self.model_choices.generation += 1;
@@ -1039,6 +1096,10 @@ impl ControlPlaneView {
                 | crate::application::settings_persistence::SettingsUpdate::Authorizations(_)
                 | crate::application::settings_persistence::SettingsUpdate::RemoveResource { .. }
         );
+        let providers_changed = matches!(
+            &update,
+            crate::application::settings_persistence::SettingsUpdate::Providers { .. }
+        );
         if let crate::application::settings_persistence::SettingsUpdate::Catalog(catalog) = &update
         {
             catalog.validate_secret_references(self.vault.as_ref().map(|v| v.values()))?;
@@ -1047,6 +1108,10 @@ impl ControlPlaneView {
             crate::application::settings_persistence::save_update(&self.settings_path, update)?;
         if tools_changed {
             self.invalidate_tool_runs();
+        }
+        if providers_changed {
+            // Endpoints may have changed; let the assistant selector refetch.
+            self.model_catalog_fetches.clear();
         }
         self.adapters = saved.adapters.clone();
         self.saved_settings = saved;
@@ -1129,8 +1194,8 @@ impl ControlPlaneView {
     }
 
     /// One numbered section card on a runtime-adapter settings page. The step badge gives
-    /// the page a stable, scannable operation order — run, settings, verification for the
-    /// supervised Codex endpoint; settings, verification for the per-task adapters.
+    /// the page a stable, scannable operation order — connection check, settings,
+    /// verification — on every runtime adapter page.
     pub(super) fn adapter_section_card(step: &'static str, title: &'static str) -> Div {
         div()
             .v_flex()
@@ -1759,6 +1824,7 @@ impl ControlPlaneView {
                                     })
                                     .child(self.render_model_field(provider, cx)),
                             )
+                            .child(self.render_reasoning_effort_choice(provider, cx))
                             .when(!direct, |this| {
                                 let wire_chat = entity.clone();
                                 let wire_responses = entity.clone();
@@ -2026,6 +2092,7 @@ impl ControlPlaneView {
             )
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(super) fn render_adapter_detail(
         &mut self,
         adapter: RuntimeAdapter,
@@ -2085,11 +2152,13 @@ impl ControlPlaneView {
                                     .whitespace_normal()
                                     .child(description),
                             ),
-                    ),
+                    )
+                    .child(self.render_runtime_header_status(adapter, cx)),
             )
+            .child(self.render_runtime_check_section(adapter, "1", cx))
             .child(
                 Self::adapter_section_card(
-                    "1",
+                    "2",
                     language.choose(
                         "设置 · 命令与 Provider 关联",
                         "Settings · command and provider binding",
@@ -2119,7 +2188,7 @@ impl ControlPlaneView {
             )
             .child(
                 Self::adapter_section_card(
-                    "2",
+                    "3",
                     language.choose("快速验证 · 提交一个任务", "Quick check · run one task"),
                 )
                 .child(
@@ -2608,7 +2677,7 @@ impl ControlPlaneView {
 /// prefetch of account-direct providers: one future per provider, resolved
 /// off the UI thread. The blocking sources (app-server launch, CLI call, HTTP
 /// request) are exactly what `background_spawn` is for.
-async fn fetch_model_catalog(
+pub(super) async fn fetch_model_catalog(
     provider: LlmProviderSettings,
     codex_settings: CodexAppServerSettings,
     kimi_command: String,
