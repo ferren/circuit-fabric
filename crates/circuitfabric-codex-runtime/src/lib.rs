@@ -148,6 +148,49 @@ impl ProviderWireApi {
     }
 }
 
+/// Reasoning effort requested from the model. Codex forwards it as
+/// `model_reasoning_effort`, Claude Code as `--effort`; DSH and Kimi Code expose
+/// no such setting. An unset effort leaves the runtime's and model's own default.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    High,
+    XHigh,
+}
+
+impl ReasoningEffort {
+    pub const ALL: [Self; 4] = [Self::Low, Self::Medium, Self::High, Self::XHigh];
+
+    /// The value both Codex and Claude Code accept on their command lines.
+    #[must_use]
+    pub const fn value(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+        }
+    }
+}
+
+/// The assistant panel's own runtime choice. Empty fields follow the global
+/// configuration: the default runtime, that runtime's provider binding, and the
+/// provider's own model and default reasoning effort.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AssistantSelection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<execution::AgentKind>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub provider_id: String,
+    /// Chosen under `provider_id` (or the binding when that is empty).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
+}
+
 /// A model provider configured by the desktop control plane.
 ///
 /// Most providers are OpenAI-compatible endpoints whose API keys are
@@ -187,6 +230,10 @@ pub struct LlmProviderSettings {
     pub vision_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vision_api_key_environment_variable: Option<String>,
+    /// Default reasoning effort for tasks through this provider; `None` keeps
+    /// the model's own default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 const fn default_enabled() -> bool {
@@ -231,6 +278,7 @@ impl Default for LlmProviderSettings {
             vision_base_url: Some("https://openrouter.ai/api/v1".to_owned()),
             vision_model: Some("z-ai/glm-5.3-flash".to_owned()),
             vision_api_key_environment_variable: Some("JLCIRCUIT_VISION_LLM_API_KEY".to_owned()),
+            reasoning_effort: None,
         }
     }
 }
@@ -333,6 +381,8 @@ pub struct RuntimeSettings {
     pub adapters: execution::AdapterSettings,
     #[serde(default)]
     pub global_preferences: GlobalPreferences,
+    #[serde(default)]
+    pub assistant: AssistantSelection,
 }
 
 impl Default for RuntimeSettings {
@@ -346,6 +396,7 @@ impl Default for RuntimeSettings {
             catalog: tools::ToolCatalog::default(),
             adapters: execution::AdapterSettings::default(),
             global_preferences: GlobalPreferences::default(),
+            assistant: AssistantSelection::default(),
         }
     }
 }
@@ -544,6 +595,35 @@ impl RuntimeSettings {
     #[must_use]
     pub fn default_provider(&self) -> Option<&LlmProviderSettings> {
         self.providers.iter().find(|provider| provider.id == self.default_provider_id)
+    }
+
+    /// The runtime and effective settings for an assistant turn: the saved
+    /// [`AssistantSelection`] layered over the global configuration. A provider
+    /// override that no longer names an enabled provider is ignored together
+    /// with the model chosen under it, so a stale selection falls back to the
+    /// runtime's binding instead of failing.
+    #[must_use]
+    pub fn for_assistant(&self) -> (execution::AgentKind, Self) {
+        let selection = &self.assistant;
+        let kind = selection.runtime.unwrap_or(self.adapters.default_runtime);
+        let mut settings = self.clone();
+        let provider_valid = selection.provider_id.is_empty()
+            || self.providers.iter().any(|p| p.id == selection.provider_id && p.enabled);
+        if provider_valid && !selection.provider_id.is_empty() {
+            settings.adapters.provider_binding_mut(kind).clone_from(&selection.provider_id);
+        }
+        let selected = execution::selected_provider(&settings, kind).map(|p| p.id.clone());
+        if let Some(provider) =
+            settings.providers.iter_mut().find(|p| Some(&p.id) == selected.as_ref())
+        {
+            if provider_valid && !selection.model.is_empty() {
+                provider.model.clone_from(&selection.model);
+            }
+            if selection.reasoning_effort.is_some() {
+                provider.reasoning_effort = selection.reasoning_effort;
+            }
+        }
+        (kind, settings)
     }
 
     fn migrate_legacy_provider(mut self) -> Self {
@@ -1158,6 +1238,9 @@ pub(crate) fn app_server_command(
                 provider.id,
                 provider.wire_api.codex_value()
             ));
+    }
+    if let Some(effort) = provider.reasoning_effort {
+        command.arg("--config").arg(format!("model_reasoning_effort=\"{}\"", effort.value()));
     }
     command.current_dir(&settings.working_directory);
     command
@@ -1857,5 +1940,67 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {{
             arguments.iter().all(|argument| !argument.contains("sk-")),
             "no key value may appear on the command line: {arguments:?}"
         );
+        assert!(
+            arguments.iter().all(|argument| !argument.contains("model_reasoning_effort")),
+            "an unset effort leaves the model default: {arguments:?}"
+        );
+        let high = app_server_command(
+            &settings,
+            &LlmProviderSettings { reasoning_effort: Some(ReasoningEffort::High), ..provider },
+        );
+        assert!(high.get_args().any(|a| a.to_string_lossy() == "model_reasoning_effort=\"high\""));
+    }
+
+    #[test]
+    fn assistant_selection_layers_over_the_global_configuration() {
+        let mut settings = RuntimeSettings::default();
+        settings.providers.push(LlmProviderSettings {
+            id: "second".into(),
+            reasoning_effort: Some(ReasoningEffort::Low),
+            ..LlmProviderSettings::default()
+        });
+
+        let (kind, effective) = settings.for_assistant();
+        assert_eq!(kind, execution::AgentKind::Codex, "follows the default runtime");
+        assert_eq!(effective, settings, "an empty selection changes nothing");
+
+        settings.assistant = AssistantSelection {
+            runtime: Some(execution::AgentKind::Claude),
+            provider_id: "second".into(),
+            model: "picked-model".into(),
+            reasoning_effort: Some(ReasoningEffort::XHigh),
+        };
+        let (kind, effective) = settings.for_assistant();
+        assert_eq!(kind, execution::AgentKind::Claude);
+        let provider = execution::selected_provider(&effective, kind).unwrap();
+        assert_eq!(provider.id, "second");
+        assert_eq!(provider.model, "picked-model");
+        assert_eq!(provider.reasoning_effort, Some(ReasoningEffort::XHigh));
+        assert_eq!(settings.providers[1].model, LlmProviderSettings::default().model);
+
+        // A provider that is gone falls back to the binding, dropping its model.
+        settings.assistant.provider_id = "removed".into();
+        let (kind, effective) = settings.for_assistant();
+        let provider = execution::selected_provider(&effective, kind).unwrap();
+        assert_eq!(provider.id, settings.default_provider_id);
+        assert_eq!(provider.model, LlmProviderSettings::default().model);
+        assert_eq!(provider.reasoning_effort, Some(ReasoningEffort::XHigh));
+    }
+
+    #[test]
+    fn reasoning_effort_and_assistant_selection_round_trip_and_default_when_absent() {
+        let mut settings = RuntimeSettings::default();
+        settings.providers[0].reasoning_effort = Some(ReasoningEffort::Medium);
+        settings.assistant.runtime = Some(execution::AgentKind::Kimi);
+        let json = serde_json::to_value(&settings).unwrap();
+        assert_eq!(json["providers"][0]["reasoning_effort"], "medium");
+        assert_eq!(json["assistant"]["runtime"], "kimi");
+        assert_eq!(serde_json::from_value::<RuntimeSettings>(json.clone()).unwrap(), settings);
+        let mut legacy = json;
+        legacy.as_object_mut().unwrap().remove("assistant");
+        legacy["providers"][0].as_object_mut().unwrap().remove("reasoning_effort");
+        let restored: RuntimeSettings = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.assistant, AssistantSelection::default());
+        assert_eq!(restored.providers[0].reasoning_effort, None);
     }
 }

@@ -32,6 +32,10 @@ pub struct AdapterSettings {
     pub dsh_provider_id: String,
     #[serde(default)]
     pub kimi_provider_id: String,
+    /// Runtime used by the desktop's connection check, sidebar health and assistant.
+    /// Configs written before this setting default to Codex.
+    #[serde(default)]
+    pub default_runtime: AgentKind,
 }
 fn default_kimi_command() -> String {
     "kimi".into()
@@ -46,10 +50,21 @@ impl Default for AdapterSettings {
             claude_provider_id: String::new(),
             dsh_provider_id: String::new(),
             kimi_provider_id: String::new(),
+            default_runtime: AgentKind::Codex,
         }
     }
 }
 impl AdapterSettings {
+    /// The provider binding of one runtime; empty uses the global default provider.
+    pub fn provider_binding_mut(&mut self, kind: AgentKind) -> &mut String {
+        match kind {
+            AgentKind::Codex => &mut self.codex_provider_id,
+            AgentKind::Claude => &mut self.claude_provider_id,
+            AgentKind::Dsh => &mut self.dsh_provider_id,
+            AgentKind::Kimi => &mut self.kimi_provider_id,
+        }
+    }
+
     pub(crate) fn validate(&self, settings: &RuntimeSettings) -> Result<(), RuntimeError> {
         for id in [
             &self.codex_provider_id,
@@ -84,12 +99,22 @@ impl AdapterSettings {
         Ok(())
     }
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum AgentKind {
+    #[default]
     Codex,
     Claude,
     Dsh,
     Kimi,
+}
+
+/// Whether the runtime forwards a provider's reasoning effort: Codex as
+/// `model_reasoning_effort`, Claude Code as `--effort`. DSH and Kimi Code have no
+/// such setting, so an effort there is ignored.
+#[must_use]
+pub const fn supports_reasoning_effort(kind: AgentKind) -> bool {
+    matches!(kind, AgentKind::Codex | AgentKind::Claude)
 }
 
 /// Reported runtime counters. Absence is represented by `None`, never an estimated zero.
@@ -136,6 +161,96 @@ pub fn selected_provider(
     };
     let id = if binding.is_empty() { &settings.default_provider_id } else { binding };
     settings.providers.iter().find(|p| &p.id == id && p.enabled)
+}
+
+/// The selected provider, rejected when its connection mode cannot drive `kind`.
+fn compatible_provider(
+    settings: &RuntimeSettings,
+    kind: AgentKind,
+) -> Result<crate::LlmProviderSettings, RuntimeError> {
+    let provider =
+        selected_provider(settings, kind).ok_or_else(|| invalid("Provider 不可用"))?.clone();
+    if provider.uses_codex_account() && kind != AgentKind::Codex {
+        return Err(invalid("Codex 账号直连 Provider 仅支持 Codex 运行时"));
+    }
+    if provider.uses_kimi_account() && kind != AgentKind::Kimi {
+        return Err(invalid("Kimi 账号直连 Provider 仅支持 Kimi 运行时"));
+    }
+    if kind == AgentKind::Kimi && !provider.uses_kimi_account() {
+        return Err(invalid("Kimi 运行时仅支持 Kimi 账号直连 Provider（本机 kimi 登录态）"));
+    }
+    Ok(provider)
+}
+
+fn provider_key(
+    provider: &crate::LlmProviderSettings,
+    secrets: Option<&crate::secrets::SecretValues>,
+) -> Result<zeroize::Zeroizing<String>, RuntimeError> {
+    if provider.uses_codex_account() || provider.uses_kimi_account() {
+        // Direct sign-in carries its own credentials in the real CLI home;
+        // there is no API key to resolve or redact.
+        return Ok(zeroize::Zeroizing::new(String::new()));
+    }
+    crate::secrets::resolve(&provider.api_key_environment_variable, secrets).ok_or_else(|| {
+        invalid(crate::secrets::missing_variable_message(&provider.api_key_environment_variable))
+    })
+}
+
+/// Lightweight readiness check for a per-task CLI runtime (Claude Code, DSH, Kimi Code):
+/// validates the saved settings, the provider binding and key resolution, then runs
+/// `<command> --version` once. No model is called and no tokens are spent.
+/// Returns the first line the CLI printed, typically its version.
+/// # Errors
+/// Rejects Codex (checked through its App Server handshake instead), invalid settings,
+/// incompatible providers, unavailable keys, and a CLI that cannot start, fails, or hangs.
+pub fn preflight_cli(
+    settings: &RuntimeSettings,
+    kind: AgentKind,
+    secrets: Option<&crate::secrets::SecretValues>,
+) -> Result<String, RuntimeError> {
+    settings.validate()?;
+    let program = match kind {
+        AgentKind::Claude => &settings.adapters.claude_command,
+        AgentKind::Dsh => &settings.adapters.dsh_command,
+        AgentKind::Kimi => &settings.adapters.kimi_command,
+        AgentKind::Codex => return Err(invalid("Codex 运行时通过 App Server 初始化握手检查")),
+    };
+    let provider = compatible_provider(settings, kind)?;
+    provider_key(&provider, secrets)?;
+    if kind == AgentKind::Dsh {
+        dsh_endpoint(&provider.base_url)?;
+    }
+    let mut command = executable(program);
+    command.arg("--version").stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child =
+        command.spawn().map_err(|error| invalid(format!("无法启动 `{program}`：{error}")))?;
+    let ownership = ProcessOwnership::attach(&mut child)?;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            stop_child(&mut child);
+            return Err(invalid(format!("`{program} --version` 在 15 秒内未结束")));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    drop(ownership);
+    let mut output = String::new();
+    let mut error_output = String::new();
+    if let Some(mut stdout) = child.stdout.take() {
+        stdout.read_to_string(&mut output)?;
+    }
+    if let Some(mut stderr) = child.stderr.take() {
+        stderr.read_to_string(&mut error_output)?;
+    }
+    if !status.success() {
+        let detail = if error_output.trim().is_empty() { &output } else { &error_output };
+        let detail: String = detail.trim().chars().take(2000).collect();
+        return Err(invalid(format!("`{program} --version` 退出（{status}）：{detail}")));
+    }
+    Ok(output.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or_default().to_owned())
 }
 
 /// Cancellation checked while waiting for a CLI result.
@@ -228,9 +343,9 @@ pub fn run_task_with_secrets(
 /// Like [`run_task_with_secrets`], additionally forwarding the agent's reasoning summary
 /// and reply as they stream.
 ///
-/// Codex forwards each redacted delta tagged with its stream; the CLI adapters produce no
-/// incremental output, so `on_delta` is not called for them. The returned string is the
-/// complete reply (answer stream only) either way.
+/// Codex and Claude Code forward token-level deltas tagged with their stream; Kimi Code
+/// forwards each complete assistant message; DSH forwards its printed output line by line.
+/// Every delta is redacted. The returned string is the complete reply (answer stream only).
 /// # Errors
 /// Same as [`run_task_with_secrets`].
 #[allow(clippy::too_many_arguments)]
@@ -496,17 +611,7 @@ fn run_task_in(
     if prompt.trim().is_empty() {
         return Err(invalid("任务不能为空"));
     }
-    let mut provider =
-        selected_provider(settings, kind).ok_or_else(|| invalid("Provider 不可用"))?.clone();
-    if provider.uses_codex_account() && kind != AgentKind::Codex {
-        return Err(invalid("Codex 账号直连 Provider 仅支持 Codex 运行时"));
-    }
-    if provider.uses_kimi_account() && kind != AgentKind::Kimi {
-        return Err(invalid("Kimi 账号直连 Provider 仅支持 Kimi 运行时"));
-    }
-    if kind == AgentKind::Kimi && !provider.uses_kimi_account() {
-        return Err(invalid("Kimi 运行时仅支持 Kimi 账号直连 Provider（本机 kimi 登录态）"));
-    }
+    let mut provider = compatible_provider(settings, kind)?;
     if image.is_some() {
         if kind != AgentKind::Codex {
             return Err(invalid("图片任务需要 Codex 运行时"));
@@ -545,19 +650,7 @@ fn run_task_in(
             apply_vision_provider(&mut provider)?;
         }
     }
-    let key = if provider.uses_codex_account() || provider.uses_kimi_account() {
-        // Direct sign-in carries its own credentials in the real CLI home;
-        // there is no API key to resolve or redact.
-        zeroize::Zeroizing::new(String::new())
-    } else {
-        crate::secrets::resolve(&provider.api_key_environment_variable, secrets).ok_or_else(
-            || {
-                invalid(crate::secrets::missing_variable_message(
-                    &provider.api_key_environment_variable,
-                ))
-            },
-        )?
-    };
+    let key = provider_key(&provider, secrets)?;
     let instructions = settings.catalog.skill_instructions(grants)?;
     let servers = grants
         .authorized_mcp_server_ids
@@ -620,7 +713,18 @@ fn run_task_in(
         AgentKind::Kimi => kimi_command(settings, &provider, &servers, &input, secrets),
         AgentKind::Codex => unreachable!("Codex is dispatched before the CLI adapters"),
     };
-    execute_cli(command, &environment, input, kind, cancel, &key, &servers, secrets, on_usage)
+    execute_cli(
+        command,
+        &environment,
+        input,
+        kind,
+        cancel,
+        &key,
+        &servers,
+        secrets,
+        on_delta,
+        on_usage,
+    )
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -785,7 +889,9 @@ fn claude_command(
         .args([
             "--print",
             "--output-format",
-            "json",
+            "stream-json",
+            "--verbose",
+            "--include-partial-messages",
             "--bare",
             "--strict-mcp-config",
             "--disable-slash-commands",
@@ -793,6 +899,7 @@ fn claude_command(
         ])
         .arg(servers.iter().map(|s| format!("mcp__{}__*", s.id)).collect::<Vec<_>>().join(","))
         .args(["--model", &provider.model])
+        .args(provider.reasoning_effort.map(|effort| ["--effort", effort.value()]).into_iter().flatten())
         .arg("--mcp-config")
         .arg(path)
         .env("CLAUDE_CONFIG_DIR", home)
@@ -944,7 +1051,7 @@ fn kimi_command(
     command
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn execute_cli(
     mut command: std::process::Command,
     environment: &RunEnvironment,
@@ -954,8 +1061,10 @@ fn execute_cli(
     key: &str,
     servers: &[&crate::tools::McpServerDefinition],
     secrets: Option<&crate::secrets::SecretValues>,
+    on_delta: &mut dyn FnMut(crate::TurnDelta, &str),
     on_usage: &mut dyn FnMut(TaskTokenUsage),
 ) -> Result<String, RuntimeError> {
+    use std::io::BufRead as _;
     command
         .current_dir(&environment.current)
         .stdin(Stdio::piped())
@@ -964,19 +1073,36 @@ fn execute_cli(
     let mut child = command.spawn()?;
     let ownership = ProcessOwnership::attach(&mut child)?;
     let mut stdin = child.stdin.take().ok_or_else(|| invalid("运行时缺少 stdin"))?;
-    let mut stdout = child.stdout.take().ok_or_else(|| invalid("运行时缺少 stdout"))?;
+    let stdout = child.stdout.take().ok_or_else(|| invalid("运行时缺少 stdout"))?;
     let stderr = child.stderr.take().ok_or_else(|| invalid("运行时缺少 stderr"))?;
     let error_reader = std::thread::spawn(move || {
         let mut output = String::new();
         stderr.take(1024 * 1024).read_to_string(&mut output).map(|_| output)
     });
+    // Whole lines travel to this thread, which owns `on_delta`; a line never splits a
+    // JSON event or a secret, so per-line redaction stays complete.
+    let (lines, received) = std::sync::mpsc::channel::<String>();
     let reader = std::thread::spawn(move || {
-        let mut output = String::new();
-        stdout.read_to_string(&mut output).map(|_| output)
+        let mut stdout = std::io::BufReader::new(stdout);
+        loop {
+            let mut line = Vec::new();
+            if stdout.read_until(b'\n', &mut line)? == 0
+                || lines.send(String::from_utf8_lossy(&line).into_owned()).is_err()
+            {
+                return Ok::<_, std::io::Error>(());
+            }
+        }
     });
     let writer = std::thread::spawn(move || {
         if kind == AgentKind::Claude { stdin.write_all(input.as_bytes()) } else { Ok(()) }
     });
+    let mut output = String::new();
+    let mut accept = |line: String| {
+        if let Some((stream, delta)) = cli_line_delta(kind, &line) {
+            on_delta(stream, &redact(&delta, key, servers, secrets));
+        }
+        output.push_str(&line);
+    };
     let deadline = Instant::now() + Duration::from_secs(180);
     let outcome = loop {
         if cancel.0.load(Ordering::SeqCst) || Instant::now() >= deadline {
@@ -991,7 +1117,11 @@ fn execute_cli(
                     Err(invalid(format!("运行时任务失败（{status}），请检查服务地址、协议及模型")))
                 };
             }
-            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Ok(None) => {
+                if let Ok(line) = received.recv_timeout(Duration::from_millis(50)) {
+                    accept(line);
+                }
+            }
             Err(error) => {
                 stop_child(&mut child);
                 break Err(error.into());
@@ -1000,10 +1130,13 @@ fn execute_cli(
     };
     drop(ownership);
     let _ = writer.join();
-    let output = reader.join().map_err(|_| invalid("读取任务结果失败"))??;
+    reader.join().map_err(|_| invalid("读取任务结果失败"))??;
+    for line in received.try_iter() {
+        accept(line);
+    }
     let error_output = error_reader.join().map_err(|_| invalid("读取运行时错误失败"))??;
     if kind == AgentKind::Claude
-        && let Ok(response) = serde_json::from_str::<serde_json::Value>(&output)
+        && let Some(response) = claude_result(&output)
         && let Some(usage) = TaskTokenUsage::from_claude_result(&response)
     {
         on_usage(usage);
@@ -1018,21 +1151,14 @@ fn execute_cli(
     if kind == AgentKind::Kimi {
         // `stream-json` emits one JSON event per line; the answer is the
         // concatenation of every assistant message's string content.
-        let mut text = String::new();
-        for line in output.lines() {
-            let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-            if event.get("role").and_then(serde_json::Value::as_str) == Some("assistant")
-                && let Some(content) = event.get("content").and_then(serde_json::Value::as_str)
-            {
-                text.push_str(content);
-            }
-        }
+        let text: String =
+            output.lines().filter_map(|line| cli_line_delta(kind, line)).map(|(_, t)| t).collect();
         if text.trim().is_empty() {
             return Err(invalid("Kimi 未返回文本结果"));
         }
         return Ok(redact(&text, key, servers, secrets));
     }
-    let response: serde_json::Value = serde_json::from_str(&output)?;
+    let response = claude_result(&output).ok_or_else(|| invalid("Claude Code 未返回任务结果"))?;
     if response["is_error"] == true {
         let detail = failure_detail(&error_output, &output, key, servers, secrets);
         return Err(with_failure_detail(invalid("Claude Code 返回任务错误"), &detail));
@@ -1043,6 +1169,51 @@ fn execute_cli(
         servers,
         secrets,
     ))
+}
+
+/// The incremental reply carried by one stdout line of a CLI adapter.
+///
+/// Claude's `stream-json` partial messages carry token-level text and thinking deltas;
+/// Kimi's `stream-json` carries one complete assistant message per line; DSH prints its
+/// final message as plain text, forwarded as it arrives.
+fn cli_line_delta(kind: AgentKind, line: &str) -> Option<(crate::TurnDelta, String)> {
+    match kind {
+        AgentKind::Claude => {
+            let event: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+            if event["type"] != "stream_event" {
+                return None;
+            }
+            let delta = &event["event"]["delta"];
+            let (stream, field) = match delta["type"].as_str()? {
+                "text_delta" => (crate::TurnDelta::Answer, "text"),
+                "thinking_delta" => (crate::TurnDelta::Reasoning, "thinking"),
+                _ => return None,
+            };
+            Some((stream, delta[field].as_str()?.to_owned()))
+        }
+        AgentKind::Kimi => {
+            let event: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+            if event["role"] != "assistant" {
+                return None;
+            }
+            Some((crate::TurnDelta::Answer, event["content"].as_str()?.to_owned()))
+        }
+        AgentKind::Dsh => Some((crate::TurnDelta::Answer, line.to_owned())),
+        AgentKind::Codex => None,
+    }
+}
+
+/// Claude's final `result` event: the last `stream-json` line of that type, or the
+/// whole output when it is a single JSON object (the `json` output format).
+fn claude_result(output: &str) -> Option<serde_json::Value> {
+    if let Ok(response @ serde_json::Value::Object(_)) = serde_json::from_str(output) {
+        return Some(response);
+    }
+    output
+        .lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
+        .find(|event| event["type"] == "result")
 }
 
 fn with_failure_detail(error: RuntimeError, detail: &str) -> RuntimeError {
@@ -1064,7 +1235,7 @@ fn failure_detail(
     secrets: Option<&crate::secrets::SecretValues>,
 ) -> String {
     let mut parts = Vec::new();
-    if let Ok(response) = serde_json::from_str::<serde_json::Value>(output)
+    if let Some(response) = claude_result(output)
         && response["is_error"] == true
     {
         if let Some(result) = response["result"].as_str().filter(|s| !s.trim().is_empty()) {
@@ -1396,6 +1567,63 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
         )
         .expect("legacy adapter settings parse");
         assert_eq!(restored, AdapterSettings::default());
+        assert_eq!(restored.default_runtime, AgentKind::Codex);
+    }
+
+    #[test]
+    fn default_runtime_round_trips_as_a_lowercase_identifier() {
+        let adapters =
+            AdapterSettings { default_runtime: AgentKind::Claude, ..AdapterSettings::default() };
+        let json = serde_json::to_value(&adapters).unwrap();
+        assert_eq!(json["default_runtime"], "claude");
+        assert_eq!(serde_json::from_value::<AdapterSettings>(json).unwrap(), adapters);
+    }
+
+    #[test]
+    fn preflight_rejects_codex_incompatible_providers_and_missing_commands() {
+        let mut settings = RuntimeSettings::default();
+        assert!(preflight_cli(&settings, AgentKind::Codex, None).is_err());
+        let error = preflight_cli(&settings, AgentKind::Kimi, None).unwrap_err();
+        assert!(error.to_string().contains("仅支持 Kimi 账号直连"));
+        let secrets = crate::secrets::SecretValues::single(
+            &settings.providers[0].api_key_environment_variable,
+            "test-key",
+        );
+        settings.adapters.claude_command = "circuitfabric-missing-cli-for-test".into();
+        let error = preflight_cli(&settings, AgentKind::Claude, Some(&secrets)).unwrap_err();
+        assert!(error.to_string().contains("无法启动"), "{error}");
+    }
+
+    #[test]
+    fn cli_stream_lines_become_answer_and_reasoning_deltas() {
+        use crate::TurnDelta::{Answer, Reasoning};
+        let text = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"你好"}}}"#;
+        let thinking = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hmm"}}}"#;
+        let complete = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"你好"}]}}"#;
+        assert_eq!(cli_line_delta(AgentKind::Claude, text), Some((Answer, "你好".into())));
+        assert_eq!(cli_line_delta(AgentKind::Claude, thinking), Some((Reasoning, "hmm".into())));
+        assert_eq!(cli_line_delta(AgentKind::Claude, complete), None);
+        assert_eq!(
+            cli_line_delta(AgentKind::Kimi, "{\"role\":\"assistant\",\"content\":\"hi\"}\n"),
+            Some((Answer, "hi".into()))
+        );
+        assert_eq!(
+            cli_line_delta(AgentKind::Kimi, r#"{"role":"meta","content":"resume hint"}"#),
+            None
+        );
+        assert_eq!(cli_line_delta(AgentKind::Dsh, "line\n"), Some((Answer, "line\n".into())));
+    }
+
+    #[test]
+    fn claude_result_reads_the_final_stream_event_or_a_single_json_object() {
+        let stream = concat!(
+            "{\"type\":\"system\",\"subtype\":\"init\"}\n",
+            "{\"type\":\"stream_event\",\"event\":{}}\n",
+            "{\"type\":\"result\",\"is_error\":false,\"result\":\"done\"}\n",
+        );
+        assert_eq!(claude_result(stream).unwrap()["result"], "done");
+        assert_eq!(claude_result(r#"{"is_error":true,"result":"x"}"#).unwrap()["result"], "x");
+        assert!(claude_result("not json").is_none());
     }
 
     #[test]
