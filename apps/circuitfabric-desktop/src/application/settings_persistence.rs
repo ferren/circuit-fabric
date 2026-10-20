@@ -22,6 +22,8 @@ pub enum SettingsUpdate {
     Claude { command: String, provider_id: String },
     Dsh { command: String, provider_id: String },
     Kimi { command: String, provider_id: String },
+    DefaultRuntime(circuitfabric_codex_runtime::execution::AgentKind),
+    Assistant(circuitfabric_codex_runtime::AssistantSelection),
     Bridge { listen_address: String },
     Catalog(ToolCatalog),
     Authorizations(ToolAuthorizationSettings),
@@ -80,6 +82,8 @@ impl SettingsUpdate {
                 saved.adapters.kimi_command = command;
                 saved.adapters.kimi_provider_id = provider_id;
             }
+            Self::DefaultRuntime(kind) => saved.adapters.default_runtime = kind,
+            Self::Assistant(selection) => saved.assistant = selection,
             Self::Bridge { listen_address } => saved.bridge.listen_address = listen_address,
             Self::Catalog(catalog) => saved.catalog = catalog,
             Self::Authorizations(tools) => saved.tools = tools,
@@ -229,6 +233,27 @@ mod tests {
                 SettingsUpdate::Kimi { command: "saved-kimi".into(), provider_id: String::new() }
             )
             .unwrap(),
+            expected
+        );
+        expected.adapters.default_runtime =
+            circuitfabric_codex_runtime::execution::AgentKind::Claude;
+        assert_eq!(
+            save_update(
+                &path,
+                SettingsUpdate::DefaultRuntime(
+                    circuitfabric_codex_runtime::execution::AgentKind::Claude
+                )
+            )
+            .unwrap(),
+            expected
+        );
+        expected.assistant = circuitfabric_codex_runtime::AssistantSelection {
+            runtime: Some(circuitfabric_codex_runtime::execution::AgentKind::Kimi),
+            model: "picked".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            save_update(&path, SettingsUpdate::Assistant(expected.assistant.clone())).unwrap(),
             expected
         );
         expected.catalog = catalog.clone();
