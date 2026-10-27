@@ -353,6 +353,13 @@ impl ControlPlaneView {
         } else {
             Vec::new()
         };
+        let time_zone = settings.global_preferences.time_zone;
+        let time_zone_select = Self::time_zone_select(
+            time_zone,
+            UiLanguage::from_preference(settings.global_preferences.language),
+            window,
+            cx,
+        );
         Self {
             sidebar_mark: Arc::new(Image::from_bytes(ImageFormat::Png, SIDEBAR_MARK.to_vec())),
             saved_settings: settings.clone(),
@@ -372,6 +379,8 @@ impl ControlPlaneView {
             data_directory,
             secret_storage_provider: settings.global_preferences.secret_storage_provider,
             log_level: settings.global_preferences.log_level,
+            time_zone,
+            time_zone_select,
             settings_path,
             status,
             command_palette_open: false,

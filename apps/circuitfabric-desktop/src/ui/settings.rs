@@ -1,6 +1,20 @@
 //! Settings presentation and event handlers.
 use super::*;
 
+fn time_zone_option_label(zone: GlobalTimeZone, language: UiLanguage) -> String {
+    match zone {
+        GlobalTimeZone::System => {
+            let current = time_zone::zone_label(GlobalTimeZone::System);
+            language.choose_owned(
+                format!("跟随操作系统（当前 {current}）"),
+                format!("System (currently {current})"),
+            )
+        }
+        GlobalTimeZone::Utc => "UTC".to_owned(),
+        GlobalTimeZone::Offset(_) => time_zone::zone_label(zone),
+    }
+}
+
 impl ControlPlaneView {
     pub(super) fn provider_values(&self, cx: &Context<Self>) -> Vec<LlmProviderSettings> {
         self.providers
@@ -77,6 +91,7 @@ impl ControlPlaneView {
             data_directory: self.data_directory.read(cx).value().to_string().into(),
             secret_storage_provider: self.secret_storage_provider,
             log_level: self.log_level,
+            time_zone: self.time_zone,
         }
     }
 
@@ -111,9 +126,43 @@ impl ControlPlaneView {
         self.persist_global_preferences(cx);
     }
 
-    pub(super) fn toggle_global_language(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn toggle_global_language(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.language = self.language.toggled();
+        self.time_zone_select = Self::time_zone_select(self.time_zone, self.language, window, cx);
         self.persist_global_preferences(cx);
+    }
+
+    pub(super) fn set_time_zone(&mut self, zone: GlobalTimeZone, cx: &mut Context<Self>) {
+        self.time_zone = zone;
+        self.persist_global_preferences(cx);
+    }
+
+    /// Builds the settings page's time-zone dropdown and wires selection changes to
+    /// persist immediately, like the other preference controls.
+    pub(super) fn time_zone_select(
+        zone: GlobalTimeZone,
+        language: UiLanguage,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<SelectState<SearchableVec<TimeZoneChoice>>> {
+        let choices: Vec<TimeZoneChoice> = time_zone::settings_options()
+            .into_iter()
+            .map(|zone| TimeZoneChoice {
+                zone,
+                label: time_zone_option_label(zone, language).into(),
+            })
+            .collect();
+        let delegate = SearchableVec::new(choices);
+        let selected = delegate.position(&zone);
+        let select =
+            cx.new(|cx| SelectState::new(delegate, selected, window, cx).searchable(true));
+        cx.subscribe_in(&select, window, |view, _, event, _, cx| {
+            if let SelectEvent::Confirm(Some(zone)) = event {
+                view.set_time_zone(*zone, cx);
+            }
+        })
+        .detach();
+        select
     }
 
     pub(super) fn add_provider(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2524,7 +2573,7 @@ impl ControlPlaneView {
                 div()
                     .text_base()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child(language.choose("外观与语言", "Appearance & language")),
+                    .child(language.choose("外观、语言与时区", "Appearance, language & time zone")),
             )
             .child(
                 div()
@@ -2546,9 +2595,26 @@ impl ControlPlaneView {
             .child(
                 action_button("settings-toggle-language")
                     .label(language.choose("切换为 English", "Switch to 中文"))
-                    .on_click(move |_, _, cx| {
-                        change_language.update(cx, |view, cx| view.toggle_global_language(cx));
+                    .on_click(move |_, window, cx| {
+                        change_language.update(cx, |view, cx| {
+                            view.toggle_global_language(window, cx)
+                        });
                     }),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(language.choose("时区", "Time zone")),
+            )
+            .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(language.choose(
+                "影响界面中所有时间的显示，默认跟随操作系统；存储的记录和导出文件始终保持 UTC。",
+                "Applies to every timestamp shown in the interface, following the operating system by default; stored records and exported files always stay UTC.",
+            )))
+            .child(
+                Select::new(&self.time_zone_select)
+                    .w(px(280.))
+                    .search_placeholder(language.choose("搜索时区…", "Search time zones…")),
             );
         let secret_buttons = div()
             .flex()

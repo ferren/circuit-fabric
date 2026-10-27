@@ -40,7 +40,7 @@ CircuitFabric
 ├─ Usage & Audit    token usage / audit log
 ├─ Secrets vault    encrypted API-key store, unlocked by the user's vault password
 │
-└─ Settings         theme / language / data dir / about
+└─ Settings         theme / language / time zone / data dir / about
 ```
 
 Group semantics:
@@ -277,7 +277,7 @@ Plugin manifest: `id`, `kind` (`agent-runtime` / `eda-backend`), `apiVersion`, `
 
 ### 5.12 Settings
 
-Global preferences: theme (light/dark/system), language, data directory, log level; about (version, branding). Credential storage is the secrets vault (§5.6a), a dedicated screen rather than a settings field.
+Global preferences: theme (light/dark/system), language, time zone (defaults to the operating system; every timestamp in the interface — sessions, snapshots, plugin events, usage and audit records, chart dates — is converted for display, while stored records and CSV exports always stay UTC), data directory, log level; about (version, branding). Credential storage is the secrets vault (§5.6a), a dedicated screen rather than a settings field.
 
 ## 6. Key interaction flows
 

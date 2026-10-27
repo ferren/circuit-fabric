@@ -67,14 +67,20 @@ fn session_status_label(
 
 /// One chat row in the conversation tab. User turns sit on the right, agent turns on
 /// the left; non-message audit events collapse into a compact centered annotation.
+/// Timestamps embedded in the persisted Markdown are re-rendered in the display zone;
+/// non-timestamp text (live "thinking" placeholders, empty labels) passes through.
 fn conversation_row_element(
     row: &super::session_markdown::ConversationRow,
     ix: usize,
     language: UiLanguage,
     reasoning_collapsed: bool,
     entity: &Entity<ControlPlaneView>,
+    zone: GlobalTimeZone,
 ) -> AnyElement {
     use super::session_markdown::ConversationRow;
+    let display_time = |timestamp: &String| {
+        time_zone::reformat_timestamp(timestamp, zone).unwrap_or_else(|| timestamp.clone())
+    };
     match row {
         ConversationRow::Reasoning { timestamp, text } => {
             let toggler = entity.clone();
@@ -114,7 +120,7 @@ fn conversation_row_element(
                                 .text_color(rgb(0x000e_7490))
                                 .child(language.choose("思考摘要", "Reasoning")),
                         )
-                        .child(div().text_color(rgb(TEXT_MUTED)).child(timestamp.clone())),
+                        .child(div().text_color(rgb(TEXT_MUTED)).child(display_time(timestamp))),
                 );
             if !reasoning_collapsed {
                 card = card.child(
@@ -160,7 +166,7 @@ fn conversation_row_element(
                                 .text_color(rgb(if is_user { 0x000e_7490 } else { TEXT_SECONDARY }))
                                 .child(actor_label),
                         )
-                        .child(timestamp.clone()),
+                        .child(display_time(timestamp)),
                 );
             }
             let bubble = div()
@@ -216,7 +222,7 @@ fn conversation_row_element(
                     .bg(rgb(CARD_BG))
                     .text_xs()
                     .text_color(rgb(TEXT_MUTED))
-                    .child(format!("{timestamp} · {label} · {detail}")),
+                    .child(format!("{} · {label} · {detail}", display_time(timestamp))),
             )
             .into_any_element(),
     }
@@ -873,7 +879,10 @@ impl ControlPlaneView {
                             .truncate()
                             .text_sm()
                             .font_weight(FontWeight::MEDIUM)
-                            .child(rfc3339(metadata.started_at_unix_seconds)),
+                            .child(time_zone::format_timestamp(
+                                metadata.started_at_unix_seconds,
+                                self.time_zone,
+                            )),
                     )
                     .child(
                         div()
@@ -1413,10 +1422,15 @@ impl ControlPlaneView {
                     .child(metadata.backend_id.clone().unwrap_or_else(|| "—".into()))
                     .child(format!(
                         "{} → {}",
-                        rfc3339(metadata.started_at_unix_seconds),
+                        time_zone::format_timestamp(
+                            metadata.started_at_unix_seconds,
+                            self.time_zone
+                        ),
                         metadata
                             .completed_at_unix_seconds
-                            .map(rfc3339)
+                            .map(|seconds| {
+                                time_zone::format_timestamp(seconds, self.time_zone)
+                            })
                             .unwrap_or_else(|| "—".into())
                     ))
                     .child(format!(
@@ -1473,6 +1487,7 @@ impl ControlPlaneView {
             let render_rows = rows.clone();
             let render_collapsed = selection.reasoning_collapsed.clone();
             let row_entity = entity.clone();
+            let zone = self.time_zone;
             div()
                 .size_full()
                 .relative()
@@ -1484,6 +1499,7 @@ impl ControlPlaneView {
                             language,
                             render_collapsed.contains(&ix),
                             &row_entity,
+                            zone,
                         )
                     })
                     .size_full()

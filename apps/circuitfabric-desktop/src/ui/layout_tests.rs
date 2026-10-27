@@ -2826,3 +2826,35 @@ fn semantics_timeline_marks_a_revert_to_an_earlier_state(cx: &mut TestAppContext
     assert!(cx.debug_bounds("semantic-timeline-revisit-2").is_none());
     assert!(cx.debug_bounds("semantic-timeline-revisit-4").is_none(), "unchanged inspect adds no event");
 }
+
+
+#[gpui::test]
+fn time_zone_setting_defaults_to_system_and_persists_fixed_offsets(cx: &mut TestAppContext) {
+    use circuitfabric_codex_runtime::GlobalTimeZone;
+    let profile = Profile::new();
+    let (view, cx) = mount_profile(cx, &profile, ControlPlaneScreen::Settings);
+    draw(cx);
+    assert_eq!(
+        view.read_with(cx, |view, _| view.time_zone),
+        GlobalTimeZone::System,
+        "the default display zone follows the operating system"
+    );
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.set_time_zone(GlobalTimeZone::Offset(8 * 3600), cx);
+        })
+    });
+    let saved = std::fs::read_to_string(profile.0.join("runtime.json")).unwrap();
+    assert!(saved.contains("offset:+08:00"), "fixed offset persisted: {saved}");
+    assert_eq!(
+        view.read_with(cx, |view, _| view.time_zone),
+        GlobalTimeZone::Offset(8 * 3600)
+    );
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.set_time_zone(GlobalTimeZone::System, cx);
+        })
+    });
+    let saved = std::fs::read_to_string(profile.0.join("runtime.json")).unwrap();
+    assert!(saved.contains("time_zone") && saved.contains("system"), "{saved}");
+}

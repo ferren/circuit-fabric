@@ -9,7 +9,7 @@ use gpui_component::{
 pub(super) const FACT_COLORS: [u32; 4] = [0x0016_a34a, 0x00b9_1c1c, 0x00b4_5309, 0x0047_5563];
 pub(super) const RESOURCE_COLORS: [u32; 3] = [0x008b_5cf6, ACCENT, 0x003b_82f6];
 
-fn frame(selector: &'static str, title: &'static str) -> Div {
+fn frame(selector: &'static str, title: impl Into<gpui::SharedString>) -> Div {
     div()
         .debug_selector(move || selector.into())
         .v_flex()
@@ -21,7 +21,7 @@ fn frame(selector: &'static str, title: &'static str) -> Div {
         .border_1()
         .border_color(rgb(BORDER))
         .rounded_xl()
-        .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(title))
+        .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(title.into()))
 }
 fn legend(color: u32, label: impl Into<gpui::SharedString>) -> Div {
     div().flex().gap_2().items_center().text_xs().child(status_dot(color)).child(label.into())
@@ -148,7 +148,11 @@ pub(super) fn fact_chart(model: &OverviewModel, language: UiLanguage) -> Div {
     }))
 }
 
-pub(super) fn session_chart(model: &OverviewModel, language: UiLanguage) -> Div {
+pub(super) fn session_chart(
+    model: &OverviewModel,
+    language: UiLanguage,
+    zone: GlobalTimeZone,
+) -> Div {
     let maximum = model.daily_sessions.iter().map(|(_, count)| *count).max().unwrap_or(0).max(4);
     let points = model.daily_sessions.clone();
     let known = model.complete() || model.loaded_projects > 0;
@@ -167,12 +171,18 @@ pub(super) fn session_chart(model: &OverviewModel, language: UiLanguage) -> Div 
         div().ml(px(36.)).flex().justify_between().text_xs().text_color(rgb(TEXT_MUTED));
     for index in [0, 3, 6] {
         if let Some((day, _)) = model.daily_sessions.get(index) {
-            dates = dates.child(rfc3339(day * 86_400)[5..10].to_owned());
+            dates = dates.child(time_zone::day_index_date(*day).format("%m-%d").to_string());
         }
     }
     frame(
         "overview-session-chart",
-        language.choose("最近 7 个日历日会话（UTC）", "Session starts over 7 calendar days (UTC)"),
+        {
+            let zone_label = time_zone::zone_label(zone);
+            language.choose_owned(
+                format!("最近 7 个日历日会话（{zone_label}）"),
+                format!("Session starts over 7 calendar days ({zone_label})"),
+            )
+        },
     )
     .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(scope(model, language)))
     .child(legend(

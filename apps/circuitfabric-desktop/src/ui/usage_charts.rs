@@ -17,20 +17,20 @@ struct Trend {
 }
 
 impl Trend {
-    fn new(records: &[&UsageRecord], period: UsagePeriod, now: u64) -> Self {
-        let daily = UsageAuditModel::daily_input_output(records);
+    fn new(records: &[&UsageRecord], period: UsagePeriod, now: u64, zone: GlobalTimeZone) -> Self {
+        let daily = UsageAuditModel::daily_input_output(records, zone);
         let day_numbers: BTreeMap<_, _> = records
             .iter()
             .map(|record| {
                 (
-                    rfc3339(record.timestamp_unix_seconds)[..10].to_owned(),
-                    record.timestamp_unix_seconds / 86_400,
+                    time_zone::day_key(record.timestamp_unix_seconds, zone),
+                    time_zone::day_index(record.timestamp_unix_seconds, zone),
                 )
             })
             .collect();
         let mut days: BTreeMap<u64, (u64, u64)> =
             daily.into_iter().map(|(date, totals)| (day_numbers[&date], totals)).collect();
-        let today = now / 86_400;
+        let today = time_zone::day_index(now, zone);
         let (mut start, mut end) = match period {
             UsagePeriod::Last7Days => (today.saturating_sub(7), today),
             UsagePeriod::Last30Days => (today.saturating_sub(30), today),
@@ -85,8 +85,9 @@ pub(super) fn usage_trend_chart(
     period: UsagePeriod,
     now: u64,
     language: UiLanguage,
+    zone: GlobalTimeZone,
 ) -> Div {
-    let trend = Trend::new(records, period, now);
+    let trend = Trend::new(records, period, now, zone);
     let mut ticks = div()
         .w(px(72.))
         .h(px(220.))
@@ -102,7 +103,7 @@ pub(super) fn usage_trend_chart(
         div().ml(px(80.)).flex().justify_between().text_xs().text_color(rgb(TEXT_MUTED));
     for index in 0..4 {
         let day = trend.start + (trend.end - trend.start) * index / 3;
-        dates = dates.child(rfc3339(day.saturating_mul(86_400))[..10].to_owned());
+        dates = dates.child(time_zone::day_index_date(day).format("%Y-%m-%d").to_string());
     }
     let empty = records.is_empty();
     let zero = records.iter().all(|record| record.total_tokens() == 0);
@@ -116,12 +117,13 @@ pub(super) fn usage_trend_chart(
             .border_1()
             .border_color(rgb(BORDER))
             .bg(rgb(CARD_BG))
-            .child(div().text_base().font_weight(FontWeight::SEMIBOLD).child(
-                language.choose(
-                    "每日输入 / 输出折线图（UTC）",
-                    "Daily input / output line chart (UTC)",
-                ),
-            ))
+            .child(div().text_base().font_weight(FontWeight::SEMIBOLD).child({
+                let zone_label = time_zone::zone_label(zone);
+                language.choose_owned(
+                    format!("每日输入 / 输出折线图（{zone_label}）"),
+                    format!("Daily input / output line chart ({zone_label})"),
+                )
+            }))
             .child(
                 div()
                     .flex()
@@ -340,7 +342,7 @@ mod tests {
             source_locator: "session".into(),
         };
         for records in [vec![], vec![&record]] {
-            let trend = Trend::new(&records, UsagePeriod::All, 864_000);
+            let trend = Trend::new(&records, UsagePeriod::All, 864_000, GlobalTimeZone::Utc);
             let points = trend.positions(false, 400., 220.);
             assert!(points.len() >= 2);
             assert!(points.first().unwrap().0 < points.last().unwrap().0);
@@ -351,7 +353,8 @@ mod tests {
         record.output_tokens = u64::MAX / 2;
         let mut later = record.clone();
         later.timestamp_unix_seconds += 3 * 86_400;
-        let trend = Trend::new(&[&record, &later], UsagePeriod::All, later.timestamp_unix_seconds);
+        let trend =
+            Trend::new(&[&record, &later], UsagePeriod::All, later.timestamp_unix_seconds, GlobalTimeZone::Utc);
         let input = trend.positions(false, 400., 220.);
         let output = trend.positions(true, 400., 220.);
         assert_eq!(input[0].1, 8.);

@@ -217,7 +217,10 @@ impl ControlPlaneView {
                             )
                             .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(
                                 if record.timestamp_known {
-                                    rfc3339(record.timestamp_unix_seconds)
+                                    time_zone::format_timestamp(
+                                        record.timestamp_unix_seconds,
+                                        self.time_zone,
+                                    )
                                 } else {
                                     language
                                         .choose(
@@ -247,6 +250,7 @@ impl ControlPlaneView {
             );
         }
 
+        let zone_label = time_zone::zone_label(self.time_zone);
         page("usage-audit-page")
             .child(div().v_flex().gap_1()
             .child(
@@ -294,9 +298,9 @@ impl ControlPlaneView {
             ))
             .child(div().flex().flex_wrap().gap_3().child(metric(input_tokens, language.choose("输入 tokens", "Input tokens"))).child(metric(output_tokens, language.choose("输出 tokens", "Output tokens"))).child(metric(total_tokens, language.choose("总 tokens", "Total tokens"))))
             .child(div().text_xs().text_color(rgb(TEXT_MUTED)).whitespace_normal().child(
-                format!("{}: {} · {}: {unavailable} · {}", language.choose("筛选会话", "Filtered sessions"), usage.len(), language.choose("未报告用量", "Usage unavailable"), language.choose("未报告不等于零用量；周期按会话完成时间（未完成按开始时间），日期按 UTC。", "Unavailable counters are not measured zero; periods use completion time (start time for active sessions), dates use UTC."))))
+                format!("{}: {} · {}: {unavailable} · {}", language.choose("筛选会话", "Filtered sessions"), usage.len(), language.choose("未报告用量", "Usage unavailable"), language.choose_owned(format!("未报告不等于零用量；周期按会话完成时间（未完成按开始时间），日期按 {zone_label}。"), format!("Unavailable counters are not measured zero; periods use completion time (start time for active sessions), dates use {zone_label}.")))))
             .children(model.diagnostics.iter().map(|message| div().text_sm().text_color(rgb(TEXT_MUTED)).whitespace_normal().child(message.clone())))
-            .child(usage_trend_chart(&usage, period, now, language))
+            .child(usage_trend_chart(&usage, period, now, language, self.time_zone))
             .child(usage_distribution_chart("usage-project-chart", language.choose("项目分布", "Project distribution"), &UsageAuditModel::distribution(&usage, UsageDimension::Project), language))
             .child(usage_distribution_chart("usage-provider-chart", language.choose("Provider 分布", "Provider distribution"), &UsageAuditModel::distribution(&usage, UsageDimension::Provider), language))
             .child(usage_distribution_chart("usage-runtime-chart", language.choose("运行时分布", "Runtime distribution"), &UsageAuditModel::distribution(&usage, UsageDimension::Runtime), language))

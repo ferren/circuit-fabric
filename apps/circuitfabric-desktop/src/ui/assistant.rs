@@ -1083,7 +1083,7 @@ impl ControlPlaneView {
                         };
                         self.set_global_theme(theme, cx);
                     }
-                    AssistantAction::ToggleLanguage => self.toggle_global_language(cx),
+                    AssistantAction::ToggleLanguage => self.toggle_global_language(window, cx),
                     // Routed through their own handlers above.
                     AssistantAction::ImportDocument { .. }
                     | AssistantAction::FetchDocument { .. } => {}

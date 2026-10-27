@@ -593,6 +593,26 @@ pub(super) struct PreviewFocus {
     pub(super) resolving: bool,
 }
 
+/// One entry in the settings page's time-zone dropdown. Labels are built with the
+/// launch-time language; switching language rebuilds the select state.
+#[derive(Clone)]
+pub(super) struct TimeZoneChoice {
+    pub(super) zone: GlobalTimeZone,
+    pub(super) label: gpui::SharedString,
+}
+
+impl SelectItem for TimeZoneChoice {
+    type Value = GlobalTimeZone;
+
+    fn title(&self) -> gpui::SharedString {
+        self.label.clone()
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.zone
+    }
+}
+
 // One GPUI view struct accumulates the whole control plane's UI state; the
 // independent booleans track one asynchronous in-flight action each.
 #[allow(clippy::struct_excessive_bools)]
@@ -609,6 +629,8 @@ pub(super) struct ControlPlaneView {
     pub(super) data_directory: Entity<InputState>,
     pub(super) secret_storage_provider: SecretStorageProvider,
     pub(super) log_level: LogLevel,
+    pub(super) time_zone: GlobalTimeZone,
+    pub(super) time_zone_select: Entity<SelectState<SearchableVec<TimeZoneChoice>>>,
     pub(super) settings_path: std::path::PathBuf,
     pub(super) status: String,
     pub(super) command_palette_open: bool,

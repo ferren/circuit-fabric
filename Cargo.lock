@@ -983,6 +983,7 @@ dependencies = [
 name = "circuitfabric-desktop"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "circuitfabric-codex-runtime",
  "circuitfabric-contracts",
  "circuitfabric-document-opener",

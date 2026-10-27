@@ -303,7 +303,10 @@ impl ControlPlaneView {
                         div()
                             .text_xs()
                             .text_color(rgb(TEXT_MUTED))
-                            .child(rfc3339(event.occurred_at_unix_seconds)),
+                            .child(time_zone::format_timestamp(
+                                event.occurred_at_unix_seconds,
+                                self.time_zone,
+                            )),
                     ),
             );
         }

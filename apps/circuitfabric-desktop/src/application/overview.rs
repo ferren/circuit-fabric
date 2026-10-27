@@ -1,5 +1,7 @@
 //! Cached, read-only workspace projection. No file reads or domain writes occur here.
 use super::project_data::ProjectWorkspaceData;
+use super::time_zone;
+use circuitfabric_codex_runtime::GlobalTimeZone;
 use circuitfabric_contracts::{FactStatus, LogicalCircuitSnapshot};
 use circuitfabric_project::{SessionStatus, SnapshotTimelineEvent};
 use std::collections::{BTreeMap, BTreeSet};
@@ -65,8 +67,9 @@ impl OverviewModel {
         data: &BTreeMap<String, ProjectWorkspaceData>,
         errors: &BTreeMap<String, String>,
         now: u64,
+        zone: GlobalTimeZone,
     ) -> Self {
-        let today = now / 86_400;
+        let today = time_zone::day_index(now, zone);
         let mut model = Self {
             daily_sessions: (today.saturating_sub(6)..=today).map(|day| (day, 0)).collect(),
             ..Self::default()
@@ -148,8 +151,10 @@ impl OverviewModel {
                 // Schema-v1 uses integer timestamps. Zero and future values are not reliable history.
                 if timestamp == 0 || timestamp > now {
                     model.unreliable_session_times += 1;
-                } else if let Some((_, count)) =
-                    model.daily_sessions.iter_mut().find(|(day, _)| *day == timestamp / 86_400)
+                } else if let Some((_, count)) = model
+                    .daily_sessions
+                    .iter_mut()
+                    .find(|(day, _)| *day == time_zone::day_index(timestamp, zone))
                 {
                     *count += 1;
                 }
@@ -248,7 +253,7 @@ pub(crate) fn current_snapshot<'a>(
     Ok(Some(current))
 }
 
-type CacheKey = (u64, Vec<(String, String, Option<u128>, Option<String>)>);
+type CacheKey = (u64, GlobalTimeZone, Vec<(String, String, Option<u128>, Option<String>)>);
 #[derive(Default)]
 pub(crate) struct OverviewCache {
     key: Option<CacheKey>,
@@ -261,9 +266,11 @@ impl OverviewCache {
         data: &BTreeMap<String, ProjectWorkspaceData>,
         errors: &BTreeMap<String, String>,
         now: u64,
+        zone: GlobalTimeZone,
     ) -> &OverviewModel {
         let key = (
-            now / 86_400,
+            time_zone::day_index(now, zone),
+            zone,
             projects
                 .iter()
                 .map(|(id, name)| {
@@ -277,7 +284,7 @@ impl OverviewCache {
                 .collect(),
         );
         if self.key.as_ref() != Some(&key) {
-            self.model = OverviewModel::build(projects, data, errors, now);
+            self.model = OverviewModel::build(projects, data, errors, now, zone);
             self.key = Some(key);
         }
         &self.model

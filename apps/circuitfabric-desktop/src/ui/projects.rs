@@ -679,7 +679,12 @@ impl ControlPlaneView {
                         .session_listing
                         .sessions
                         .first()
-                        .map(|summary| rfc3339(summary.metadata.started_at_unix_seconds));
+                        .map(|summary| {
+                            time_zone::format_timestamp(
+                                summary.metadata.started_at_unix_seconds,
+                                self.time_zone,
+                            )
+                        });
                     (data.documents.len(), data.session_listing.sessions.len(), last_activity)
                 });
             let document_label = language.choose_owned(

@@ -12,6 +12,7 @@ pub mod plugin_governance;
 pub mod project_data;
 pub mod runtime_session;
 pub mod settings_persistence;
+pub mod time_zone;
 pub mod usage_audit;
 
 #[cfg(test)]

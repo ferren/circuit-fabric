@@ -140,7 +140,7 @@ impl ControlPlaneView {
             };
             let observed_at = event.observed_at_unix_millis.map_or_else(
                 || language.choose("时间未知", "unknown time").to_owned(),
-                |millis| rfc3339(millis / 1000),
+                |millis| time_zone::format_timestamp(millis / 1000, self.time_zone),
             );
             let is_current = index + 1 == timeline.len();
             lineage = lineage.child(

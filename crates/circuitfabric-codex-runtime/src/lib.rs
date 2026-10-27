@@ -53,6 +53,67 @@ pub enum GlobalLanguage {
     English,
 }
 
+/// Time zone for user-facing timestamps. `System` follows the operating system's
+/// zone, including daylight-saving changes; `Offset` is a fixed seconds-east-of-UTC
+/// offset for a stable display regardless of the machine's configuration.
+/// Persisted records and exports always stay UTC; this only affects display.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum GlobalTimeZone {
+    #[default]
+    System,
+    Utc,
+    Offset(i32),
+}
+
+impl GlobalTimeZone {
+    #[must_use]
+    pub fn preference(self) -> String {
+        match self {
+            Self::System => "system".to_owned(),
+            Self::Utc => "utc".to_owned(),
+            Self::Offset(seconds) => {
+                let sign = if seconds < 0 { '-' } else { '+' };
+                let magnitude = seconds.unsigned_abs();
+                format!("offset:{sign}{:02}:{:02}", magnitude / 3600, magnitude % 3600 / 60)
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn from_preference(value: &str) -> Self {
+        let parse_offset = |value: &str| {
+            let (sign, rest) = match value.as_bytes().first()? {
+                b'+' => (1_i64, &value[1..]),
+                b'-' => (-1_i64, &value[1..]),
+                _ => return None,
+            };
+            let (hours, minutes) = rest.split_once(':')?;
+            let seconds = sign * (hours.parse::<i64>().ok()? * 3600 + minutes.parse::<i64>().ok()? * 60);
+            i32::try_from(seconds).ok()
+        };
+        match value {
+            "utc" => Self::Utc,
+            _ => value
+                .strip_prefix("offset:")
+                .and_then(parse_offset)
+                .map_or(Self::System, Self::Offset),
+        }
+    }
+}
+
+impl Serialize for GlobalTimeZone {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.preference())
+    }
+}
+
+impl<'de> Deserialize<'de> for GlobalTimeZone {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Ok(Self::from_preference(&value))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SecretStorageProvider {
@@ -92,6 +153,8 @@ pub struct GlobalPreferences {
     pub secret_storage_provider: SecretStorageProvider,
     #[serde(default)]
     pub log_level: LogLevel,
+    #[serde(default)]
+    pub time_zone: GlobalTimeZone,
 }
 
 impl Default for GlobalPreferences {
@@ -102,6 +165,7 @@ impl Default for GlobalPreferences {
             data_directory: default_data_directory(),
             secret_storage_provider: SecretStorageProvider::default(),
             log_level: LogLevel::default(),
+            time_zone: GlobalTimeZone::default(),
         }
     }
 }
@@ -1607,11 +1671,38 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {{
         settings.global_preferences.data_directory = PathBuf::from("D:/CircuitFabric-data");
         settings.global_preferences.secret_storage_provider = SecretStorageProvider::Environment;
         settings.global_preferences.log_level = LogLevel::Debug;
+        settings.global_preferences.time_zone = GlobalTimeZone::Offset(8 * 3600);
 
         let encoded = serde_json::to_string(&settings).expect("settings serialize");
+        assert!(encoded.contains("offset:+08:00"));
         let restored: RuntimeSettings = serde_json::from_str(&encoded).expect("settings parse");
         assert_eq!(restored.global_preferences, settings.global_preferences);
         assert!(!encoded.contains("api-key-value"));
+    }
+
+    #[test]
+    fn time_zone_defaults_to_system_and_recovers_from_unreadable_values() {
+        let preferences: GlobalPreferences = serde_json::from_str("{}").expect("defaults parse");
+        assert_eq!(preferences.time_zone, GlobalTimeZone::System);
+        assert_eq!(
+            serde_json::from_str::<GlobalPreferences>(r#"{"time_zone":"utc"}"#)
+                .expect("utc parses")
+                .time_zone,
+            GlobalTimeZone::Utc
+        );
+        assert_eq!(
+            serde_json::from_str::<GlobalPreferences>(r#"{"time_zone":"offset:-03:30"}"#)
+                .expect("offset parses")
+                .time_zone,
+            GlobalTimeZone::Offset(-(3 * 3600 + 1800))
+        );
+        // Unknown or legacy values fall back to following the operating system.
+        assert_eq!(
+            serde_json::from_str::<GlobalPreferences>(r#"{"time_zone":"Mars/Olympus"}"#)
+                .expect("unknown values recover")
+                .time_zone,
+            GlobalTimeZone::System
+        );
     }
 
     #[test]

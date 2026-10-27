@@ -493,10 +493,13 @@ impl UsageAuditModel {
     }
 
     #[must_use]
-    pub fn daily_input_output(records: &[&UsageRecord]) -> BTreeMap<String, (u64, u64)> {
+    pub fn daily_input_output(
+        records: &[&UsageRecord],
+        zone: circuitfabric_codex_runtime::GlobalTimeZone,
+    ) -> BTreeMap<String, (u64, u64)> {
         let mut daily = BTreeMap::new();
         for record in records {
-            let day = rfc3339(record.timestamp_unix_seconds)[..10].to_owned();
+            let day = super::time_zone::day_key(record.timestamp_unix_seconds, zone);
             let totals = daily.entry(day).or_insert((0_u64, 0_u64));
             totals.0 = totals.0.saturating_add(record.input_tokens);
             totals.1 = totals.1.saturating_add(record.output_tokens);
@@ -596,6 +599,7 @@ impl UsageAuditModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use circuitfabric_codex_runtime::GlobalTimeZone;
 
     fn usage(timestamp: u64, project: &str, input: u64, output: u64) -> UsageRecord {
         UsageRecord {
@@ -679,7 +683,10 @@ mod tests {
         let filtered = model.filtered_usage(UsagePeriod::Last7Days, " SELECTED ", now);
         assert_eq!(filtered.len(), 1);
         assert_eq!(
-            UsageAuditModel::daily_input_output(&filtered).values().copied().collect::<Vec<_>>(),
+            UsageAuditModel::daily_input_output(&filtered, GlobalTimeZone::Utc)
+                .values()
+                .copied()
+                .collect::<Vec<_>>(),
             [(10, 4)]
         );
         for dimension in
@@ -706,13 +713,22 @@ mod tests {
     fn empty_zero_and_extreme_values_preserve_totals_and_exports() {
         let empty = UsageAuditModel::default();
         let rows = empty.filtered_usage(UsagePeriod::All, "", 0);
-        assert!(UsageAuditModel::daily_input_output(&rows).is_empty());
+        assert!(UsageAuditModel::daily_input_output(&rows, GlobalTimeZone::Utc).is_empty());
         assert!(UsageAuditModel::distribution(&rows, UsageDimension::Project).is_empty());
         assert_eq!(UsageAuditModel::usage_csv(&rows).lines().count(), 1);
         assert_eq!(UsageAuditModel::audit_csv(&[]).lines().count(), 1);
         let zero = usage(0, "zero", 0, 0);
         let rows = [&zero];
-        assert_eq!(UsageAuditModel::daily_input_output(&rows)["1970-01-01"], (0, 0));
+        assert_eq!(
+            UsageAuditModel::daily_input_output(&rows, GlobalTimeZone::Utc)["1970-01-01"],
+            (0, 0)
+        );
+        assert_eq!(
+            UsageAuditModel::daily_input_output(&rows, GlobalTimeZone::Offset(-3600))
+                ["1969-12-31"],
+            (0, 0),
+            "a negative offset moves the epoch into the previous local day"
+        );
         assert_eq!(UsageAuditModel::distribution(&rows, UsageDimension::Project)["zero"], 0);
         let extreme = usage(0, "max", u64::MAX, 1);
         assert_eq!(extreme.total_tokens(), u64::MAX);

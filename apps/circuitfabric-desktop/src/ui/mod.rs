@@ -50,11 +50,12 @@ use std::{
 };
 
 use crate::application::plugin_governance::PluginGovernanceStore;
+use crate::application::time_zone;
 use crate::application::usage_audit::{AuditKindFilter, UsageAuditModel, UsagePeriod};
 use circuitfabric_codex_runtime::secrets::{SecretSource, UnlockedVault, secret_source};
 use circuitfabric_codex_runtime::tools::BUNDLED_JEV_SERVER_ID;
 use circuitfabric_codex_runtime::{
-    CodexAppServerHandle, CodexAppServerSettings, GlobalPreferences, GlobalTheme,
+    CodexAppServerHandle, CodexAppServerSettings, GlobalPreferences, GlobalTheme, GlobalTimeZone,
     LlmProviderSettings, LogLevel, ProviderConnection, ProviderWireApi, RuntimeSettings,
     SecretStorageProvider, ToolAuthorizationKind, ToolAuthorizationSettings,
 };
@@ -70,7 +71,7 @@ use circuitfabric_plugin_api::{
 use circuitfabric_project::{
     ChangeSetAuditEntry, ChangeSetStageStatus, DocumentCategory, EvidenceCorpus, EvidenceHit,
     EvidenceScope, EvidenceSearch, FragmentAnchor, ProjectDocument, ProjectRegistry,
-    ProjectStorage, ProjectWorkspace, SessionReplay, is_evidence_indexable, rfc3339,
+    ProjectStorage, ProjectWorkspace, SessionReplay, is_evidence_indexable,
 };
 use gpui::{
     AnyElement, AppContext, ClickEvent, Context, Div, DragMoveEvent, Entity, FontStyle, FontWeight,
@@ -86,6 +87,7 @@ use gpui_component::{
     button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState},
     scroll::ScrollableElement as _,
+    select::{SearchableVec, Select, SelectDelegate as _, SelectEvent, SelectItem, SelectState},
     tab::{Tab, TabBar},
 };
 use jlcircuit_eda_bridge::{

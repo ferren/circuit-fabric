@@ -62,7 +62,7 @@ impl ControlPlaneView {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         let mut model = self
             .overview_cached
-            .get(&projects, &self.project_data, &self.project_read_errors, now)
+            .get(&projects, &self.project_data, &self.project_read_errors, now, self.time_zone)
             .clone();
         model.registry_unknown =
             self.overview_restore_diagnostics.iter().any(|message| message.contains("项目注册表"));
@@ -201,20 +201,29 @@ impl ControlPlaneView {
                 div()
                     .flex_1()
                     .min_w(px(0.))
-                    .child(super::overview_charts::session_chart(&model, language)),
+                    .child(super::overview_charts::session_chart(&model, language, self.time_zone)),
             );
         let mut diagnostics = div().v_flex().gap_1().text_xs().text_color(rgb(0x00b4_5309));
         for message in self.overview_restore_diagnostics.iter().chain(&model.diagnostics) {
             diagnostics = diagnostics.child(message.clone());
         }
+        let zone = self.time_zone;
+        let zone_label = time_zone::zone_label(zone);
         for row in &model.resources {
             if let Some(error) = &row.error {
                 diagnostics = diagnostics.child(format!(
                     "{} / {} · {error} · {} {}",
                     row.name,
                     row.id,
-                    language.choose("保留缓存时间（UTC）", "Retained cache at (UTC)"),
-                    if row.loaded_at == 0 { "—".into() } else { rfc3339(row.loaded_at) }
+                    language.choose_owned(
+                        format!("保留缓存时间（{zone_label}）"),
+                        format!("Retained cache at ({zone_label})"),
+                    ),
+                    if row.loaded_at == 0 {
+                        "—".into()
+                    } else {
+                        time_zone::format_timestamp(row.loaded_at, zone)
+                    }
                 ));
             }
         }
@@ -276,7 +285,7 @@ impl ControlPlaneView {
                     if row.started_at == 0 {
                         "unknown time".into()
                     } else {
-                        rfc3339(row.started_at)
+                        time_zone::format_timestamp(row.started_at, zone)
                     }
                 )))
                 .child(

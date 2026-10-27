@@ -639,9 +639,9 @@ impl Render for ControlPlaneView {
                                         action_button("toggle-language")
                                             .ghost()
                                             .label(language.toggle_label())
-                                            .on_click(move |_, _, cx| {
+                                            .on_click(move |_, window, cx| {
                                                 entity.update(cx, |view, cx| {
-                                                    view.toggle_global_language(cx);
+                                                    view.toggle_global_language(window, cx);
                                                 });
                                             }),
                                     ),

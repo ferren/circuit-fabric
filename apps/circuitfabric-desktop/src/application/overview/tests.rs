@@ -91,6 +91,17 @@ fn projects(ids: &[&str]) -> BTreeMap<String, String> {
     ids.iter().map(|id| (id.to_string(), format!("项目 {id}"))).collect()
 }
 
+/// Fixtures predate the time-zone setting: they assert on UTC day buckets, the
+/// behavior of `OverviewModel::build` with `GlobalTimeZone::Utc`.
+fn build(
+    projects: &BTreeMap<String, String>,
+    data: &BTreeMap<String, ProjectWorkspaceData>,
+    errors: &BTreeMap<String, String>,
+    now: u64,
+) -> OverviewModel {
+    OverviewModel::build(projects, data, errors, now, GlobalTimeZone::Utc)
+}
+
 #[test]
 fn persisted_multi_project_kpis_charts_todos_and_reopen_share_sources_without_writes() {
     let fixture = Fixture::new();
@@ -136,7 +147,7 @@ fn persisted_multi_project_kpis_charts_todos_and_reopen_share_sources_without_wr
     };
     let data = BTreeMap::from([("a".into(), read(&a)), ("b".into(), read(&b))]);
     let before = fs::read(a.root().join("logic/changesets/pending.json")).unwrap();
-    let model = OverviewModel::build(&projects(&["a", "b"]), &data, &BTreeMap::new(), u64::MAX);
+    let model = build(&projects(&["a", "b"]), &data, &BTreeMap::new(), u64::MAX);
     assert!(model.complete());
     assert_eq!(model.documents, 1);
     assert_eq!(model.pending, 2);
@@ -161,21 +172,21 @@ fn persisted_multi_project_kpis_charts_todos_and_reopen_share_sources_without_wr
 #[test]
 fn empty_zero_unloaded_partial_stale_and_removed_projects_are_distinct() {
     let empty =
-        OverviewModel::build(&BTreeMap::new(), &BTreeMap::new(), &BTreeMap::new(), 10 * 86_400);
+        build(&BTreeMap::new(), &BTreeMap::new(), &BTreeMap::new(), 10 * 86_400);
     assert!(empty.complete());
     assert_eq!(empty.daily_sessions.len(), 7);
     assert!(empty.daily_sessions.iter().all(|(_, count)| *count == 0));
     let mut data = BTreeMap::from([("a".into(), ProjectWorkspaceData::default())]);
-    let model = OverviewModel::build(&projects(&["a", "b"]), &data, &BTreeMap::new(), 10 * 86_400);
+    let model = build(&projects(&["a", "b"]), &data, &BTreeMap::new(), 10 * 86_400);
     assert!(!model.complete());
     assert_eq!(model.resources[0].counts, Some([0; 3]));
     assert_eq!(model.resources[1].counts, None);
     let errors = BTreeMap::from([("a".into(), "corrupt source".into())]);
-    let stale = OverviewModel::build(&projects(&["a", "b"]), &data, &errors, 10 * 86_400);
+    let stale = build(&projects(&["a", "b"]), &data, &errors, 10 * 86_400);
     assert_eq!(stale.loaded_projects, 0);
     assert_eq!(stale.resources[0].counts, None);
     data.insert("b".into(), ProjectWorkspaceData::default());
-    let removed = OverviewModel::build(&projects(&["b"]), &data, &BTreeMap::new(), 10 * 86_400);
+    let removed = build(&projects(&["b"]), &data, &BTreeMap::new(), 10 * 86_400);
     assert_eq!(removed.resources.len(), 1);
     assert_eq!(removed.resources[0].id, "b");
     assert!(removed.complete());
@@ -241,7 +252,7 @@ fn true_daily_time_spacing_excludes_zero_future_and_out_of_range_times() {
             },
         });
     }
-    let model = OverviewModel::build(
+    let model = build(
         &projects(&["p"]),
         &BTreeMap::from([("p".into(), data)]),
         &BTreeMap::new(),
@@ -260,13 +271,13 @@ fn cache_rebuilds_on_refresh_error_recovery_day_and_project_removal() {
     let mut cache = OverviewCache::default();
     let projects = projects(&["p"]);
     let mut data = BTreeMap::from([("p".into(), ProjectWorkspaceData::default())]);
-    assert!(cache.get(&projects, &data, &BTreeMap::new(), 1_000_000).complete());
+    assert!(cache.get(&projects, &data, &BTreeMap::new(), 1_000_000, GlobalTimeZone::Utc).complete());
     let errors = BTreeMap::from([("p".into(), "failed".into())]);
-    assert!(!cache.get(&projects, &data, &errors, 1_000_000).complete());
+    assert!(!cache.get(&projects, &data, &errors, 1_000_000, GlobalTimeZone::Utc).complete());
     data.get_mut("p").unwrap().change_sets.push(change("new", None));
     data.get_mut("p").unwrap().loaded_at_unix_nanos = 1;
-    assert_eq!(cache.get(&projects, &data, &BTreeMap::new(), 1_000_000).pending, 1);
-    assert!(cache.get(&BTreeMap::new(), &data, &BTreeMap::new(), 2_000_000).resources.is_empty());
+    assert_eq!(cache.get(&projects, &data, &BTreeMap::new(), 1_000_000, GlobalTimeZone::Utc).pending, 1);
+    assert!(cache.get(&BTreeMap::new(), &data, &BTreeMap::new(), 2_000_000, GlobalTimeZone::Utc).resources.is_empty());
 }
 
 #[test]
@@ -286,18 +297,18 @@ fn corrupt_source_recovery_restarts_and_authorization_change_are_project_scoped(
     index["documents"][0]["authorized"] = false.into();
     fs::write(&doc_path, serde_json::to_vec(&index).unwrap()).unwrap();
     refresh_project_data(&stores, &mut data, "p").unwrap();
-    assert_eq!(OverviewModel::build(&projects(&["p"]), &data, &BTreeMap::new(), 1).documents, 0);
+    assert_eq!(build(&projects(&["p"]), &data, &BTreeMap::new(), 1).documents, 0);
     let bad = store.root().join("logic/changesets/broken.json");
     fs::write(&bad, "broken").unwrap();
     let error = refresh_project_data(&stores, &mut data, "p").unwrap_err();
     let failed =
-        OverviewModel::build(&projects(&["p"]), &data, &BTreeMap::from([("p".into(), error)]), 1);
+        build(&projects(&["p"]), &data, &BTreeMap::from([("p".into(), error)]), 1);
     assert_eq!(failed.resources[0].counts, None);
     assert!(failed.resources[0].loaded_at > 0);
     fs::remove_file(bad).unwrap();
     store.save_change_set(&change("recover", None)).unwrap();
     refresh_project_data(&stores, &mut data, "p").unwrap();
-    assert_eq!(OverviewModel::build(&projects(&["p"]), &data, &BTreeMap::new(), 1).pending, 1);
+    assert_eq!(build(&projects(&["p"]), &data, &BTreeMap::new(), 1).pending, 1);
 }
 
 #[test]
@@ -305,7 +316,7 @@ fn many_projects_remain_identifiable_and_all_zero() {
     let projects: BTreeMap<_, _> =
         (0..500).map(|i| (format!("p{i:03}"), "同名项目".into())).collect();
     let data = projects.keys().map(|id| (id.clone(), ProjectWorkspaceData::default())).collect();
-    let model = OverviewModel::build(&projects, &data, &BTreeMap::new(), 1_000_000);
+    let model = build(&projects, &data, &BTreeMap::new(), 1_000_000);
     assert_eq!(model.resources.len(), 500);
     assert!(model.complete());
     assert!(model.resources.iter().all(|row| row.counts == Some([0; 3])));
@@ -319,7 +330,7 @@ fn unknown_approval_and_corrupt_fact_identity_never_claim_pending_or_success() {
     bad.constraints[0].snapshot_hash = "another".into();
     data.semantic_snapshots.push(bad);
     data.snapshot_timeline = timeline(&["tip"]);
-    let model = OverviewModel::build(
+    let model = build(
         &projects(&["p"]),
         &BTreeMap::from([("p".into(), data)]),
         &BTreeMap::new(),
@@ -353,4 +364,41 @@ fn duplicate_persisted_session_identity_is_a_failed_source() {
     let error =
         ProjectWorkspaceData::load(&store).err().expect("duplicate identity must not be summed");
     assert!(error.contains("重复"));
+}
+
+#[test]
+fn daily_session_buckets_follow_the_display_zone_calendar() {
+    use circuitfabric_project::{SessionMetadata, SessionSummary};
+    // 2026-10-27T16:30:00Z: still the 27th in UTC, already the 28th at UTC+08:00.
+    let started = 1_793_118_600;
+    // 2026-10-28T12:00:00Z.
+    let now = started + 70_200;
+    let mut data = ProjectWorkspaceData::default();
+    data.session_listing.sessions.push(SessionSummary {
+        file_name: "s.md".into(),
+        byte_size: 1,
+        metadata: SessionMetadata {
+            category: circuitfabric_project::SessionCategory::Legacy,
+            subject_id: None,
+            session_id: "s".into(),
+            project_id: "p".into(),
+            runtime_profile_id: "codex".into(),
+            backend_id: None,
+            started_at_unix_seconds: started,
+            completed_at_unix_seconds: None,
+            status: SessionStatus::Completed,
+            usage: SessionUsage::default(),
+            citations: vec![],
+        },
+    });
+    let data = BTreeMap::from([("p".into(), data)]);
+    let counts = |zone: GlobalTimeZone| {
+        OverviewModel::build(&projects(&["p"]), &data, &BTreeMap::new(), now, zone)
+            .daily_sessions
+            .iter()
+            .map(|(_, count)| *count)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(counts(GlobalTimeZone::Utc), [0, 0, 0, 0, 0, 1, 0]);
+    assert_eq!(counts(GlobalTimeZone::Offset(8 * 3600)), [0, 0, 0, 0, 0, 0, 1]);
 }

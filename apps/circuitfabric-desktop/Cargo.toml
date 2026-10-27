@@ -29,6 +29,7 @@ circuitfabric-document-opener = { workspace = true, optional = true, features = 
 circuitfabric-plugin-api = { workspace = true, optional = true }
 pulldown-cmark = { workspace = true, optional = true }
 circuitfabric-project.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 image = "0.25"
 jlcircuit-eda-bridge.workspace = true
 serde_json.workspace = true
