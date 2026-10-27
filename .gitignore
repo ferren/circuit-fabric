@@ -10,19 +10,27 @@ dist/
 build/
 coverage/
 target/
+artifacts/
+
+# Local agent tooling state (indexes, runtime context, review scratch)
+.claude/
+.codegraph/
+.kimi/
+.multica/
+.review/
+/AGENTS.md
+
+# JLC EDA acceptance run outputs (screenshots, probe logs, packaged probes)
+scripts/jlc-acceptance/shots*/
+scripts/jlc-acceptance/probe_log.jsonl
+scripts/jlc-acceptance/*.eext
+scripts/jlc-acceptance/probe-extension/
 
 # Editor and OS files
 .DS_Store
 Thumbs.db
 .idea/
 .vscode/
-
-# Local agent tooling state (indexes, runtime context, review scratch)
-.claude/
-.codegraph/
-.multica/
-.review/
-/AGENTS.md
 
 # Python validation caches
 __pycache__/
