@@ -1,7 +1,7 @@
 //! Foreground integration probe; credentials are supplied only through the environment.
 use circuitfabric_codex_runtime::{
     LlmProviderSettings, ProviderConnection, RuntimeSettings,
-    execution::{AgentKind, Cancellation, run_task_observed},
+    execution::{AgentKind, Cancellation, TurnCapabilities, run_task_observed},
     models,
 };
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -60,6 +60,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &args[3],
         image,
         None,
+        TurnCapabilities::default(),
         None,
         &cancel,
         &mut |_, _| {},
@@ -88,7 +89,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Prints the catalog one model per line and asserts it is non-empty.
-fn probe_models(settings: &RuntimeSettings, source: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn probe_models(
+    settings: &RuntimeSettings,
+    source: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let choices = match source {
         "codex-account" => {
             let provider = LlmProviderSettings {
@@ -101,11 +105,9 @@ fn probe_models(settings: &RuntimeSettings, source: &str) -> Result<(), Box<dyn 
         }
         "kimi-account" => models::list_kimi_models(&settings.adapters.kimi_command)?,
         source => {
-            let provider = settings
-                .providers
-                .iter()
-                .find(|provider| provider.id == source)
-                .ok_or("provider not in settings; use codex-account, kimi-account, or a provider id")?;
+            let provider = settings.providers.iter().find(|provider| provider.id == source).ok_or(
+                "provider not in settings; use codex-account, kimi-account, or a provider id",
+            )?;
             models::list_endpoint_models(provider, None)?
         }
     };

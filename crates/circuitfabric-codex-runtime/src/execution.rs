@@ -117,6 +117,24 @@ pub const fn supports_reasoning_effort(kind: AgentKind) -> bool {
     matches!(kind, AgentKind::Codex | AgentKind::Claude)
 }
 
+/// What an agent turn may do beyond composing a reply. The default is fully
+/// locked down: no tools, no file access, no network.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TurnCapabilities {
+    /// Fetch reference material from the web and write collected files into
+    /// the run's working directory. Codex enforces the write scope with its
+    /// `workspace-write` sandbox; Claude Code gets its web and Write tools;
+    /// DSH and Kimi Code have no headless tools to open and stay locked.
+    /// Requires a working directory.
+    pub collect_material: bool,
+}
+
+impl TurnCapabilities {
+    /// The material-collection bundle: web fetching plus writes under the
+    /// working directory.
+    pub const COLLECT_MATERIAL: Self = Self { collect_material: true };
+}
+
 /// Reported runtime counters. Absence is represented by `None`, never an estimated zero.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TaskTokenUsage {
@@ -334,6 +352,7 @@ pub fn run_task_with_secrets(
         prompt,
         image,
         working_directory,
+        TurnCapabilities::default(),
         secrets,
         cancel,
         &mut |_, _| {},
@@ -356,6 +375,7 @@ pub fn run_task_streaming(
     prompt: &str,
     image: Option<&std::path::Path>,
     working_directory: Option<&std::path::Path>,
+    capabilities: TurnCapabilities,
     secrets: Option<&crate::secrets::SecretValues>,
     cancel: &Cancellation,
     on_delta: &mut dyn FnMut(crate::TurnDelta, &str),
@@ -367,6 +387,7 @@ pub fn run_task_streaming(
         prompt,
         image,
         working_directory,
+        capabilities,
         secrets,
         cancel,
         on_delta,
@@ -385,6 +406,7 @@ pub fn run_task_observed(
     prompt: &str,
     image: Option<&std::path::Path>,
     working_directory: Option<&std::path::Path>,
+    capabilities: TurnCapabilities,
     secrets: Option<&crate::secrets::SecretValues>,
     cancel: &Cancellation,
     on_delta: &mut dyn FnMut(crate::TurnDelta, &str),
@@ -395,6 +417,9 @@ pub fn run_task_observed(
     {
         return Err(invalid("工作目录不存在或不是文件夹"));
     }
+    if capabilities.collect_material && working_directory.is_none() {
+        return Err(invalid("收集资料需要工作目录"));
+    }
     run_task_in(
         settings,
         kind,
@@ -402,6 +427,7 @@ pub fn run_task_observed(
         prompt,
         image,
         working_directory,
+        capabilities,
         secrets,
         cancel,
         on_delta,
@@ -473,6 +499,7 @@ pub fn run_session_observed_within(
         prompt,
         image,
         Some(working_directory),
+        TurnCapabilities::default(),
         secrets,
         cancel,
         on_delta,
@@ -541,6 +568,7 @@ pub fn resume_session_streaming(
         prompt,
         image,
         Some(working_directory),
+        TurnCapabilities::default(),
         secrets,
         cancel,
         on_delta,
@@ -593,6 +621,7 @@ fn run_task_in(
     prompt: &str,
     image: Option<&std::path::Path>,
     working_directory: Option<&std::path::Path>,
+    capabilities: TurnCapabilities,
     secrets: Option<&crate::secrets::SecretValues>,
     cancel: &Cancellation,
     on_delta: &mut dyn FnMut(crate::TurnDelta, &str),
@@ -693,6 +722,7 @@ fn run_task_in(
             &servers,
             &environment,
             grants,
+            capabilities,
             &inputs,
             secrets,
             cancel,
@@ -704,9 +734,15 @@ fn run_task_in(
         .map(|output| redact(&output, &key, &servers, secrets));
     }
     let command = match kind {
-        AgentKind::Claude => {
-            claude_command(settings, &provider, &servers, &environment.home, &key, secrets)?
-        }
+        AgentKind::Claude => claude_command(
+            settings,
+            &provider,
+            &servers,
+            &environment.home,
+            capabilities,
+            &key,
+            secrets,
+        )?,
         AgentKind::Dsh => {
             dsh_command(settings, &provider, &servers, &environment.home, &input, secrets)?
         }
@@ -734,6 +770,7 @@ fn run_codex(
     servers: &[&crate::tools::McpServerDefinition],
     environment: &RunEnvironment,
     grants: &ToolAuthorizationSettings,
+    capabilities: TurnCapabilities,
     input: &[serde_json::Value],
     secrets: Option<&crate::secrets::SecretValues>,
     cancel: &Cancellation,
@@ -764,9 +801,20 @@ fn run_codex(
         "-c",
         "features.skill_mcp_dependency_install=false",
         "-c",
-        "web_search=\"disabled\"",
+        // Material collection opens the web tool and widens the sandbox to the
+        // working directory (the process cwd); everything else stays read-only.
+        // The CLI accepts disabled | cached | indexed | live.
+        if capabilities.collect_material {
+            "web_search=\"live\""
+        } else {
+            "web_search=\"disabled\""
+        },
         "-c",
-        "sandbox_mode=\"read-only\"",
+        if capabilities.collect_material {
+            "sandbox_mode=\"workspace-write\""
+        } else {
+            "sandbox_mode=\"read-only\""
+        },
         "-c",
         "approval_policy=\"never\"",
     ]);
@@ -864,6 +912,7 @@ fn claude_command(
     provider: &crate::LlmProviderSettings,
     servers: &[&crate::tools::McpServerDefinition],
     home: &std::path::Path,
+    capabilities: TurnCapabilities,
     key: &str,
     secrets: Option<&crate::secrets::SecretValues>,
 ) -> Result<std::process::Command, RuntimeError> {
@@ -885,6 +934,12 @@ fn claude_command(
     }
     let path = home.join("mcp.json");
     fs::write(&path, serde_json::to_vec(&serde_json::json!({"mcpServers":mcp}))?)?;
+    // Tool surfaces: the authorized MCP servers always; with material
+    // collection also the built-in web and workspace-write tools.
+    let mut tools: Vec<String> = servers.iter().map(|s| format!("mcp__{}__*", s.id)).collect();
+    if capabilities.collect_material {
+        tools.extend(["WebFetch", "WebSearch", "Write"].map(str::to_owned));
+    }
     command
         .args([
             "--print",
@@ -897,9 +952,15 @@ fn claude_command(
             "--disable-slash-commands",
             "--tools",
         ])
-        .arg(servers.iter().map(|s| format!("mcp__{}__*", s.id)).collect::<Vec<_>>().join(","))
+        .arg(tools.join(","))
         .args(["--model", &provider.model])
-        .args(provider.reasoning_effort.map(|effort| ["--effort", effort.value()]).into_iter().flatten())
+        .args(
+            provider
+                .reasoning_effort
+                .map(|effort| ["--effort", effort.value()])
+                .into_iter()
+                .flatten(),
+        )
         .arg("--mcp-config")
         .arg(path)
         .env("CLAUDE_CONFIG_DIR", home)
@@ -910,10 +971,8 @@ fn claude_command(
         // backoff can outlast our task deadline, hiding the final JSON error.
         .env("CLAUDE_CODE_MAX_RETRIES", "2")
         .env(credential_variable, key);
-    if !servers.is_empty() {
-        command
-            .arg("--allowedTools")
-            .arg(servers.iter().map(|s| format!("mcp__{}__*", s.id)).collect::<Vec<_>>().join(","));
+    if !tools.is_empty() {
+        command.arg("--allowedTools").arg(tools.join(","));
     }
     Ok(command)
 }
@@ -1599,7 +1658,8 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
         use crate::TurnDelta::{Answer, Reasoning};
         let text = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"你好"}}}"#;
         let thinking = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hmm"}}}"#;
-        let complete = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"你好"}]}}"#;
+        let complete =
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"你好"}]}}"#;
         assert_eq!(cli_line_delta(AgentKind::Claude, text), Some((Answer, "你好".into())));
         assert_eq!(cli_line_delta(AgentKind::Claude, thinking), Some((Reasoning, "hmm".into())));
         assert_eq!(cli_line_delta(AgentKind::Claude, complete), None);
@@ -1651,9 +1711,16 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
             "https://api.z.ai/api/anthropic/v1/",
         ] {
             provider.base_url = base_url.into();
-            let command =
-                claude_command(&settings, &provider, &[], &scope.home, "fixture-key", None)
-                    .unwrap();
+            let command = claude_command(
+                &settings,
+                &provider,
+                &[],
+                &scope.home,
+                TurnCapabilities::default(),
+                "fixture-key",
+                None,
+            )
+            .unwrap();
             let environment = command.get_envs().collect::<std::collections::BTreeMap<_, _>>();
             let value = |name: &str| environment.get(std::ffi::OsStr::new(name)).copied().flatten();
             assert_eq!(
@@ -1677,6 +1744,33 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
             claude_endpoint("http://127.0.0.1:1234/api/anthropic"),
             ("http://127.0.0.1:1234/api/anthropic".into(), "ANTHROPIC_API_KEY")
         );
+    }
+
+    #[test]
+    fn claude_tool_surface_opens_only_with_material_collection() {
+        let settings = RuntimeSettings::default();
+        let scope = RunEnvironment::new(None).unwrap();
+        let provider = settings.providers[0].clone();
+        let args = |capabilities: TurnCapabilities| {
+            claude_command(&settings, &provider, &[], &scope.home, capabilities, "key", None)
+                .unwrap()
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        let locked = args(TurnCapabilities::default());
+        assert!(
+            !locked.iter().any(|arg| arg.contains("WebFetch") || arg.contains("Write")),
+            "locked run exposes no web or write tools: {locked:?}"
+        );
+        let open = args(TurnCapabilities::COLLECT_MATERIAL);
+        for flag in ["--tools", "--allowedTools"] {
+            assert_eq!(
+                open.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone()),
+                Some("WebFetch,WebSearch,Write".to_owned()),
+                "{flag} lists exactly the collection tools"
+            );
+        }
     }
 
     #[test]

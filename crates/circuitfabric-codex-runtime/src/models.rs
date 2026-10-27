@@ -23,6 +23,52 @@ use crate::{CodexAppServerSettings, LlmProviderSettings, RuntimeError, secrets, 
 const ENDPOINT_TIMEOUT: Duration = Duration::from_secs(20);
 /// Safety bound on one `/models` response body, mirroring the Jev adapter.
 const ENDPOINT_MAX_BODY: u64 = 4 * 1024 * 1024;
+/// How long an assistant material download may take before giving up.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(120);
+/// Upper bound for one downloaded document; datasheets sit far below this.
+const FETCH_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// Downloads one `http(s)` document for the assistant's material collection.
+///
+/// The CLIs' web tools return processed text, not binaries, so PDFs and other
+/// documents are fetched by the application itself after the user confirms the
+/// proposed URL.
+///
+/// # Errors
+///
+/// Rejects non-http(s) URLs, network and status failures, interrupted bodies
+/// and files above the size cap.
+pub fn fetch_url_bytes(url: &str) -> Result<Vec<u8>, RuntimeError> {
+    let url = url.trim();
+    if !url.starts_with("https://") && !url.starts_with("http://") {
+        return Err(catalog_error("仅支持 http/https 链接"));
+    }
+    let client = reqwest::blocking::Client::builder()
+        .timeout(FETCH_TIMEOUT)
+        .build()
+        .map_err(|_| catalog_error("无法初始化 HTTP 客户端"))?;
+    let response = client.get(url).send().map_err(|error| {
+        catalog_error(if error.is_timeout() {
+            "下载超时".to_owned()
+        } else {
+            format!("下载失败：{error}")
+        })
+    })?;
+    let status = response.status().as_u16();
+    if !response.status().is_success() {
+        return Err(catalog_error(format!("服务器返回 HTTP {status}")));
+    }
+    let bytes =
+        response.bytes().map_err(|error| catalog_error(format!("下载中断：{error}")))?.to_vec();
+    if bytes.len() > FETCH_MAX_BYTES {
+        return Err(catalog_error(format!(
+            "文件过大（{} MB），超过 {} MB 上限",
+            bytes.len() / 1_048_576,
+            FETCH_MAX_BYTES / 1_048_576
+        )));
+    }
+    Ok(bytes)
+}
 /// The largest endpoint catalog kept for the picker; longer lists are still
 /// valid — the dropdown searches this locally and renders only the top rows,
 /// and the model field itself accepts anything. Sized so `OpenRouter`'s full
@@ -57,9 +103,10 @@ fn bool_field(entry: &Value, key: &str) -> bool {
 }
 
 fn string_array_field(entry: &Value, key: &str) -> Option<Vec<String>> {
-    entry.get(key)?.as_array().map(|values| {
-        values.iter().filter_map(Value::as_str).map(str::to_owned).collect()
-    })
+    entry
+        .get(key)?
+        .as_array()
+        .map(|values| values.iter().filter_map(Value::as_str).map(str::to_owned).collect())
 }
 
 /// Lists the models a Codex App Server offers for the provider's configuration.
@@ -77,8 +124,7 @@ pub fn list_codex_models(
     provider: &LlmProviderSettings,
     secrets: Option<&secrets::SecretValues>,
 ) -> Result<Vec<ModelChoice>, RuntimeError> {
-    let mut handle =
-        crate::CodexAppServerHandle::launch_with_secrets(settings, provider, secrets)?;
+    let mut handle = crate::CodexAppServerHandle::launch_with_secrets(settings, provider, secrets)?;
     let result = handle.list_models();
     let _ = handle.stop();
     result
@@ -125,18 +171,16 @@ pub fn list_endpoint_models(
     if base.is_empty() {
         return Err(catalog_error("Base URL 为空；请先填写再获取模型列表"));
     }
-    let key = secrets::resolve(&provider.api_key_environment_variable, secrets).ok_or_else(
-        || catalog_error(secrets::missing_variable_message(&provider.api_key_environment_variable)),
-    )?;
+    let key =
+        secrets::resolve(&provider.api_key_environment_variable, secrets).ok_or_else(|| {
+            catalog_error(secrets::missing_variable_message(&provider.api_key_environment_variable))
+        })?;
     let client = reqwest::blocking::Client::builder()
         .timeout(ENDPOINT_TIMEOUT)
         .build()
         .map_err(|_| catalog_error("无法初始化 HTTP 客户端"))?;
-    let response = client
-        .get(format!("{base}/models"))
-        .bearer_auth(key.as_str())
-        .send()
-        .map_err(|error| {
+    let response =
+        client.get(format!("{base}/models")).bearer_auth(key.as_str()).send().map_err(|error| {
             catalog_error(if error.is_timeout() {
                 "请求 /models 超时".to_owned()
             } else {
@@ -266,9 +310,7 @@ pub(crate) fn parse_codex_model_list(response: &Value) -> Result<Vec<ModelChoice
 
 /// Parses the `kimi provider list --json` document into choices; the map keys
 /// are the aliases `kimi --model` accepts.
-pub(crate) fn parse_kimi_provider_list(
-    parsed: &Value,
-) -> Result<Vec<ModelChoice>, RuntimeError> {
+pub(crate) fn parse_kimi_provider_list(parsed: &Value) -> Result<Vec<ModelChoice>, RuntimeError> {
     let models = parsed
         .get("models")
         .and_then(Value::as_object)
@@ -457,17 +499,15 @@ mod tests {
         assert_eq!(choices[0].supports_vision, None, "plain endpoints do not say");
         assert_eq!(choices[1].supports_vision, Some(true), "OpenRouter-style modality parsed");
 
-        let many =
-            json!((1..=1100).map(|index| json!({"id": format!("m{index:04}")})).collect::<Vec<_>>());
+        let many = json!(
+            (1..=1100).map(|index| json!({"id": format!("m{index:04}")})).collect::<Vec<_>>()
+        );
         let truncated = parse_endpoint_model_list(&many).expect("parse");
         assert_eq!(truncated.len(), ENDPOINT_CHOICE_LIMIT);
         assert_eq!(truncated.first().expect("first").id, "m0001");
 
         let bare = json!([{"id": "solo"}]);
-        assert_eq!(
-            parse_endpoint_model_list(&bare).expect("parse")[0].id,
-            "solo"
-        );
+        assert_eq!(parse_endpoint_model_list(&bare).expect("parse")[0].id, "solo");
 
         let error = parse_endpoint_model_list(&json!({"error": "nope"})).expect_err("not a list");
         assert!(error.to_string().contains("/models"), "{error}");
@@ -500,8 +540,8 @@ mod tests {
         let choices = parse_endpoint_model_list(&nested).expect("nested list parses");
         assert_eq!(choices[0].id, "glm-5.3");
         // An unrecognized shape reports its structure, not just "missing".
-        let error =
-            parse_endpoint_model_list(&json!({"code": 0, "data": {"unexpected": 1}})).expect_err("not a list");
+        let error = parse_endpoint_model_list(&json!({"code": 0, "data": {"unexpected": 1}}))
+            .expect_err("not a list");
         assert!(error.to_string().contains("data:对象{unexpected}"), "{error}");
     }
 

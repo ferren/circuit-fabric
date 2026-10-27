@@ -1926,10 +1926,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {{
         );
         let chat = app_server_command(
             &settings,
-            &LlmProviderSettings {
-                wire_api: ProviderWireApi::Chat,
-                ..provider.clone()
-            },
+            &LlmProviderSettings { wire_api: ProviderWireApi::Chat, ..provider.clone() },
         );
         assert!(
             chat.get_args()
