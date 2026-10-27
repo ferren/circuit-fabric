@@ -208,6 +208,16 @@ pub enum ProjectStorageError {
     ChangeSetNotFound { id: String },
     #[error("ChangeSet `{id}` was not approved because observed state does not match baseline")]
     ChangeSetBaselineMismatch { id: String },
+    #[error("snapshot hash `{hash}` cannot address a snapshot file")]
+    InvalidSnapshotHash { hash: String },
+    #[error("cannot read snapshot timeline event `{path}`: {source}")]
+    ReadTimelineEvent { path: PathBuf, source: io::Error },
+    #[error("cannot parse snapshot timeline event `{path}`: {source}")]
+    ParseTimelineEvent { path: PathBuf, source: serde_json::Error },
+    #[error("snapshot timeline event `{path}` is invalid: {reason}")]
+    InvalidTimeline { path: PathBuf, reason: &'static str },
+    #[error("snapshot timeline event `{path}` already exists")]
+    TimelineEventExists { path: PathBuf },
 }
 
 /// The only filesystem entry point for a project root.
@@ -328,6 +338,13 @@ impl ProjectStorage {
     pub fn list_logical_snapshots(
         &self,
     ) -> Result<Vec<LogicalCircuitSnapshot>, ProjectStorageError> {
+        Ok(self.read_logical_snapshot_files()?.into_iter().map(|(_, snapshot)| snapshot).collect())
+    }
+
+    /// Snapshot files with their paths, in on-disk identifier order.
+    pub(crate) fn read_logical_snapshot_files(
+        &self,
+    ) -> Result<Vec<(PathBuf, LogicalCircuitSnapshot)>, ProjectStorageError> {
         let directory = self.resolve_relative_path("logic/snapshots")?;
         let entries = fs::read_dir(&directory).map_err(|source| ProjectStorageError::Io {
             action: "list logical snapshots",
@@ -355,8 +372,10 @@ impl ProjectStorage {
                 let raw = fs::read_to_string(&path).map_err(|source| {
                     ProjectStorageError::ReadLogicalSnapshot { path: path.clone(), source }
                 })?;
-                serde_json::from_str(&raw)
-                    .map_err(|source| ProjectStorageError::ParseLogicalSnapshot { path, source })
+                let snapshot = serde_json::from_str(&raw).map_err(|source| {
+                    ProjectStorageError::ParseLogicalSnapshot { path: path.clone(), source }
+                })?;
+                Ok((path, snapshot))
             })
             .collect()
     }
@@ -1108,6 +1127,10 @@ mod tests {
         let root = test_root("changeset-approval");
         let storage = ProjectStorage::create(&root, project("changeset-project")).expect("project");
         let record = StoredChangeSet {
+            preview_validation: crate::ChangeSetStage {
+                status: crate::ChangeSetStageStatus::Passed,
+                detail: String::new(),
+            },
             schema_version: CHANGESET_SCHEMA_VERSION,
             id: "cs-approval".to_owned(),
             base_snapshot_hash: "baseline".to_owned(),

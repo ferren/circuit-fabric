@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 pub enum ChangeSetStageStatus {
     #[default]
     NotRun,
+    Inconclusive,
     Passed,
     Failed,
 }
@@ -65,6 +66,9 @@ pub struct StoredChangeSet {
     pub ir_diff: Vec<String>,
     #[serde(default)]
     pub evidence: Vec<ChangeSetEvidenceRef>,
+    /// Preview validation is separate from post-write verification.
+    #[serde(default)]
+    pub preview_validation: ChangeSetStage,
     #[serde(default)]
     pub execution: ChangeSetExecutionReport,
     /// The hash returned by the last materializer readback, if there was one.
@@ -76,17 +80,27 @@ pub struct StoredChangeSet {
 
 impl StoredChangeSet {
     /// Approval requires a fresh observed state that matches the baseline and a completed,
-    /// successful validation.  Absence is treated as unsafe rather than as a match.
+    /// successful preview validation. Absence is unsafe; post-write verification cannot
+    /// substitute for preview validation, and a started write cannot be reapproved.
     #[must_use]
     pub fn approval_allowed(&self, current_observation: Option<&str>) -> bool {
         current_observation == Some(self.base_snapshot_hash.as_str())
             && self.observed_snapshot_hash.as_deref() == current_observation
-            && self.execution.verification.status == ChangeSetStageStatus::Passed
+            && self.preview_validation.status == ChangeSetStageStatus::Passed
+            && self.execution.write.status == ChangeSetStageStatus::NotRun
     }
 
     #[must_use]
     pub fn decision(&self) -> Option<&ChangeSetAuditEntry> {
         self.audit.last()
+    }
+
+    /// A write acknowledgement alone never establishes a successful change.
+    #[must_use]
+    pub fn verified(&self) -> bool {
+        self.execution.write.status == ChangeSetStageStatus::Passed
+            && self.execution.readback.status == ChangeSetStageStatus::Passed
+            && self.execution.verification.status == ChangeSetStageStatus::Passed
     }
 }
 
@@ -103,6 +117,10 @@ mod tests {
             plan_hash: "plan".into(),
             ir_diff: Vec::new(),
             evidence: Vec::new(),
+            preview_validation: ChangeSetStage {
+                status: ChangeSetStageStatus::Passed,
+                detail: String::new(),
+            },
             execution: ChangeSetExecutionReport {
                 verification: ChangeSetStage {
                     status: ChangeSetStageStatus::Passed,
@@ -118,9 +136,17 @@ mod tests {
 
     #[test]
     fn approval_requires_current_matching_observation() {
-        let record = change_set();
+        let mut record = change_set();
         assert!(record.approval_allowed(Some("base")));
         assert!(!record.approval_allowed(Some("other")));
         assert!(!record.approval_allowed(None));
+        record.preview_validation.status = ChangeSetStageStatus::NotRun;
+        assert!(
+            !record.approval_allowed(Some("base")),
+            "verification cannot impersonate preview validation"
+        );
+        record.preview_validation.status = ChangeSetStageStatus::Passed;
+        record.execution.write.status = ChangeSetStageStatus::Passed;
+        assert!(!record.approval_allowed(Some("base")), "a written plan cannot be reapproved");
     }
 }

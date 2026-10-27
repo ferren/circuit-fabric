@@ -180,7 +180,9 @@ pub fn classify_document_kind(file_name: &str) -> DocumentKind {
         "pdf" => DocumentKind::Pdf,
         "doc" | "docx" | "rtf" | "odt" => DocumentKind::Word,
         "md" | "markdown" => DocumentKind::Markdown,
+        "html" | "htm" => DocumentKind::Html,
         "xls" | "xlsx" => DocumentKind::Excel,
+        "ppt" | "pptx" | "odp" => DocumentKind::Presentation,
         "csv" => DocumentKind::Bom,
         "net" | "cir" | "spice" => DocumentKind::Netlist,
         _ => DocumentKind::Text,
@@ -790,7 +792,10 @@ mod tests {
         assert_eq!(classify_document_kind("mcu.pdf"), DocumentKind::Pdf);
         assert_eq!(classify_document_kind("notes.docx"), DocumentKind::Word);
         assert_eq!(classify_document_kind("notes.md"), DocumentKind::Markdown);
+        assert_eq!(classify_document_kind("spec.html"), DocumentKind::Html);
+        assert_eq!(classify_document_kind("spec.htm"), DocumentKind::Html);
         assert_eq!(classify_document_kind("bom.xlsx"), DocumentKind::Excel);
+        assert_eq!(classify_document_kind("deck.pptx"), DocumentKind::Presentation);
         assert_eq!(classify_document_kind("bom.csv"), DocumentKind::Bom);
         assert_eq!(classify_document_kind("board.net"), DocumentKind::Netlist);
         assert_eq!(classify_document_kind("readme.txt"), DocumentKind::Text);

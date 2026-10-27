@@ -23,6 +23,7 @@ mod documents;
 mod opening;
 mod sessions;
 mod storage;
+mod timeline;
 
 pub use changesets::{
     ChangeSetAuditEntry, ChangeSetEvidenceRef, ChangeSetExecutionReport, ChangeSetStage,
@@ -46,6 +47,10 @@ pub use storage::{
     CHANGESET_SCHEMA_VERSION, PROJECT_REGISTRY_SCHEMA_VERSION, PROJECT_STORAGE_SCHEMA_VERSION,
     ProjectLayoutDiagnostics, ProjectManifest, ProjectRegistry, ProjectRegistryEntry,
     ProjectStorage, ProjectStorageError,
+};
+pub use timeline::{
+    SNAPSHOT_TIMELINE_SCHEMA_VERSION, SnapshotChangeSummary, SnapshotTimelineEvent,
+    TimelineObservation, TimelineSource, timeline_revisits,
 };
 
 #[derive(Debug, Error)]
