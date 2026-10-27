@@ -25,16 +25,23 @@ pub fn canonical_snapshot_bytes(snapshot: &LogicalCircuitSnapshot) -> Result<Vec
 
 /// Computes a content address while excluding the self-referential snapshot hash.
 ///
+/// The parent chain is evolution metadata, not content: the same schematic must
+/// stamp the same snapshot hash no matter which inspect came before it.
+///
 /// # Errors
 ///
 /// Returns [`CoreError::Serialization`] when the snapshot cannot be serialized.
 pub fn snapshot_content_hash(snapshot: &LogicalCircuitSnapshot) -> Result<SnapshotHash, CoreError> {
     let mut projection = snapshot.clone();
     projection.snapshot_hash.clear();
+    projection.parent_snapshot_hash = None;
     Ok(digest(&canonical_snapshot_bytes(&projection)?))
 }
 
 /// Computes the logical hash without physical observation fields or content-address fields.
+///
+/// Like [`snapshot_content_hash`], the parent chain is excluded so a pure lineage
+/// change never mutates the logical identity.
 ///
 /// # Errors
 ///
@@ -44,6 +51,7 @@ pub fn logical_content_hash(snapshot: &LogicalCircuitSnapshot) -> Result<String,
     projection.snapshot_hash.clear();
     projection.logical_hash.clear();
     projection.physical_hash = None;
+    projection.parent_snapshot_hash = None;
     Ok(digest(&canonical_snapshot_bytes(&projection)?))
 }
 
