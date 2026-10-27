@@ -148,9 +148,20 @@ pub struct IrPatch {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PatchOperation {
-    AddComponent { component: Component },
+    SetComponentValue { component_id: ComponentId, value: String },
+    RenameNet { net_id: NetId, name: String },
+    /// 新增元件只描述语义；逻辑 ID（`component:<reference>`）与证据由系统派生，
+    /// 模型不得伪造快照内部字段。`clone_from` 为可选的观测位号：放置复用其库件
+    /// 身份（libraryUuid/componentUuid），缺失或不可解析时该步骤不可物化。
+    AddComponent {
+        reference: String,
+        value: Option<String>,
+        pins: Vec<Pin>,
+        clone_from: Option<String>,
+    },
     RemoveComponent { component_id: ComponentId },
-    AddNet { net: Net },
+    /// 新增网络：同名既有网络视为显式挂接成员，不是隐式合并网络。
+    AddNet { name: String, pins: Vec<PinRef> },
     AnnotateSemantic { key: String, value: String },
 }
 
@@ -169,7 +180,9 @@ pub enum DocumentKind {
     Pdf,
     Word,
     Markdown,
+    Html,
     Excel,
+    Presentation,
     Bom,
     Netlist,
     Text,
@@ -216,5 +229,56 @@ mod tests {
 
         assert_eq!(snapshot.schema_version, LOGICAL_CIRCUIT_SCHEMA_VERSION);
         assert!(snapshot.snapshot_hash.is_empty());
+    }
+
+    #[test]
+    fn patch_operations_use_author_friendly_flat_payloads() {
+        // 模型提交格式：新增元件/网络不携带系统派生的 id/evidence 字段。
+        let patch: IrPatch = serde_json::from_str(
+            r#"{"base_snapshot_hash":"sha256:b","operations":[
+                {"remove_component":{"component_id":"component:U1"}},
+                {"rename_net":{"net_id":"net:","name":"GND"}},
+                {"add_component":{"reference":"J1","value":"HOST_SPI_8P","clone_from":"P1",
+                    "pins":[{"id":"1","name":"VCC"},{"id":"2","name":"GND"}]}},
+                {"add_component":{"reference":"R9","pins":[{"id":"1","name":"A"}]}},
+                {"add_net":{"name":"BS","pins":[{"component_id":"component:R9","pin_id":"1"}]}}
+            ],"rationale":"无源转接板"}"#,
+        )
+        .expect("扁平载荷必须可解析");
+        assert_eq!(
+            patch.operations[2],
+            PatchOperation::AddComponent {
+                reference: "J1".to_owned(),
+                value: Some("HOST_SPI_8P".to_owned()),
+                pins: vec![
+                    Pin { id: "1".to_owned(), name: "VCC".to_owned() },
+                    Pin { id: "2".to_owned(), name: "GND".to_owned() },
+                ],
+                clone_from: Some("P1".to_owned()),
+            },
+            "clone_from 可选携带"
+        );
+
+        assert_eq!(
+            patch.operations[3],
+            PatchOperation::AddComponent {
+                reference: "R9".to_owned(),
+                value: None,
+                pins: vec![Pin { id: "1".to_owned(), name: "A".to_owned() }],
+                clone_from: None,
+            },
+            "value 可省略"
+        );
+        assert_eq!(
+            patch.operations[4],
+            PatchOperation::AddNet {
+                name: "BS".to_owned(),
+                pins: vec![PinRef { component_id: "component:R9".to_owned(), pin_id: "1".to_owned() }],
+            }
+        );
+
+        let serialized = serde_json::to_string(&patch).expect("序列化不应失败");
+        let round_trip: IrPatch = serde_json::from_str(&serialized).expect("往返解析");
+        assert_eq!(round_trip, patch);
     }
 }
