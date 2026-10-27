@@ -2,7 +2,7 @@ use super::*;
 use circuitfabric_contracts::{ConstraintResult, Project, Severity, SnapshotAuthority};
 use circuitfabric_project::{
     ChangeSetAuditEntry, ChangeSetExecutionReport, DocumentCategory, ProjectStorage, SessionSeed,
-    SessionUsage, StoredChangeSet,
+    SessionUsage, SnapshotTimelineEvent, StoredChangeSet,
 };
 use std::{
     fs,
@@ -63,6 +63,7 @@ fn snapshot(hash: &str, parent: Option<&str>) -> LogicalCircuitSnapshot {
 }
 fn change(id: &str, decision: Option<&str>) -> StoredChangeSet {
     StoredChangeSet {
+        preview_validation: Default::default(),
         schema_version: 1,
         id: id.into(),
         base_snapshot_hash: "old".into(),
@@ -180,21 +181,38 @@ fn empty_zero_unloaded_partial_stale_and_removed_projects_are_distinct() {
     assert!(removed.complete());
 }
 
+fn timeline(hashes: &[&str]) -> Vec<SnapshotTimelineEvent> {
+    hashes
+        .iter()
+        .enumerate()
+        .map(|(index, hash)| SnapshotTimelineEvent {
+            schema_version: circuitfabric_project::SNAPSHOT_TIMELINE_SCHEMA_VERSION,
+            seq: index as u64 + 1,
+            snapshot_hash: (*hash).into(),
+            previous_snapshot_hash: index.checked_sub(1).map(|i| hashes[i].into()),
+            observed_at_unix_millis: None,
+            source: circuitfabric_project::TimelineSource::Inspect,
+            session_id: None,
+            change_set_id: None,
+        })
+        .collect()
+}
+
 #[test]
-fn snapshot_branch_cycle_conflict_and_input_order_do_not_invent_current_facts() {
-    let old = snapshot("z-old", None);
-    let tip = snapshot("a-tip", Some("z-old"));
-    for history in [vec![tip.clone(), old.clone()], vec![old.clone(), tip.clone(), old.clone()]] {
-        assert_eq!(current_snapshot(&history).unwrap().unwrap().snapshot_hash, "a-tip");
-    }
-    assert!(current_snapshot(&[old.clone(), snapshot("branch", None)]).is_err());
-    assert!(
-        current_snapshot(&[snapshot("cycle1", Some("cycle2")), snapshot("cycle2", Some("cycle1"))])
-            .is_err()
-    );
-    let mut conflict = old.clone();
+fn timeline_alone_names_current_including_reverts_and_conflicts_stay_unknown() {
+    let a = snapshot("a", None);
+    let b = snapshot("b", Some("a"));
+    let snapshots = [b.clone(), a.clone()];
+    assert!(current_snapshot(&snapshots, &[]).unwrap().is_none());
+    assert_eq!(current_snapshot(&snapshots, &timeline(&["a", "b"])).unwrap().unwrap(), &b);
+    // A → B → A: the revert is current, and a legacy copy differing only in parent is accepted.
+    let legacy_copy = snapshot("a", Some("b"));
+    let with_copy = [a.clone(), b, legacy_copy];
+    assert_eq!(current_snapshot(&with_copy, &timeline(&["a", "b", "a"])).unwrap().unwrap(), &a);
+    assert!(current_snapshot(&with_copy, &timeline(&["missing"])).is_err());
+    let mut conflict = a.clone();
     conflict.constraints.clear();
-    assert!(current_snapshot(&[old, conflict]).is_err());
+    assert!(current_snapshot(&[a, conflict], &timeline(&["a"])).is_err());
 }
 
 #[test]
@@ -300,6 +318,7 @@ fn unknown_approval_and_corrupt_fact_identity_never_claim_pending_or_success() {
     let mut bad = snapshot("tip", None);
     bad.constraints[0].snapshot_hash = "another".into();
     data.semantic_snapshots.push(bad);
+    data.snapshot_timeline = timeline(&["tip"]);
     let model = OverviewModel::build(
         &projects(&["p"]),
         &BTreeMap::from([("p".into(), data)]),

@@ -2,7 +2,7 @@
 use circuitfabric_contracts::{LogicalCircuitSnapshot, ProjectId};
 use circuitfabric_project::{
     ProjectDocument, ProjectRegistry, ProjectStorage, ProjectWorkspace, SessionListing,
-    StoredChangeSet,
+    SnapshotTimelineEvent, StoredChangeSet,
 };
 use std::{
     collections::BTreeMap,
@@ -20,10 +20,16 @@ pub(crate) struct ProjectWorkspaceData {
     pub(crate) document_integrity: std::collections::BTreeMap<String, bool>,
     pub(crate) session_listing: SessionListing,
     pub(crate) semantic_snapshots: Vec<LogicalCircuitSnapshot>,
+    /// Observation order of `semantic_snapshots`; its last event names the current one.
+    pub(crate) snapshot_timeline: Vec<SnapshotTimelineEvent>,
     pub(crate) change_sets: Vec<StoredChangeSet>,
 }
 
 impl ProjectWorkspaceData {
+    pub(crate) fn snapshot(&self, hash: &str) -> Option<&LogicalCircuitSnapshot> {
+        self.semantic_snapshots.iter().find(|snapshot| snapshot.snapshot_hash == hash)
+    }
+
     /// Build the whole replacement before publishing it. A corrupt late-stage file
     /// must never mix new documents/sessions with old ChangeSets in the UI cache.
     pub(crate) fn load(storage: &ProjectStorage) -> Result<Self, String> {
@@ -45,6 +51,9 @@ impl ProjectWorkspaceData {
         }
         let semantic_snapshots =
             storage.list_logical_snapshots().map_err(|error| format!("语义快照未读取：{error}"))?;
+        let snapshot_timeline = storage
+            .list_snapshot_timeline()
+            .map_err(|error| format!("快照时间线未读取：{error}"))?;
         let change_sets = storage.list_change_sets().map_err(|error| error.to_string())?;
         Ok(Self {
             loaded_at_unix_nanos: std::time::SystemTime::now()
@@ -55,6 +64,7 @@ impl ProjectWorkspaceData {
             document_integrity,
             session_listing,
             semantic_snapshots,
+            snapshot_timeline,
             change_sets,
         })
     }

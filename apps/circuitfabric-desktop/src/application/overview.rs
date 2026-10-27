@@ -1,7 +1,7 @@
 //! Cached, read-only workspace projection. No file reads or domain writes occur here.
 use super::project_data::ProjectWorkspaceData;
 use circuitfabric_contracts::{FactStatus, LogicalCircuitSnapshot};
-use circuitfabric_project::SessionStatus;
+use circuitfabric_project::{SessionStatus, SnapshotTimelineEvent};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug)]
@@ -46,7 +46,7 @@ pub(crate) struct OverviewModel {
     pub loaded_projects: usize,
     pub sessions: Vec<SessionRow>,
     pub todos: Vec<TodoRow>,
-    /// passed, failed, inconclusive, not_run, from one unambiguous lineage tip per project.
+    /// passed, failed, inconclusive, not_run, from each project's current timeline snapshot.
     pub facts: [usize; 4],
     pub fact_projects: usize,
     pub ambiguous_projects: usize,
@@ -166,7 +166,7 @@ impl OverviewModel {
                     .diagnostics
                     .push(format!("{id}：未完成的会话写入 / interrupted session write: {file}"));
             }
-            match current_snapshot(&data.semantic_snapshots) {
+            match current_snapshot(&data.semantic_snapshots, &data.snapshot_timeline) {
                 Ok(Some(snapshot)) => {
                     let mut constraint_ids = BTreeSet::new();
                     if snapshot.constraints.iter().any(|fact| {
@@ -221,48 +221,31 @@ impl OverviewModel {
     }
 }
 
-/// Snapshot identifiers and filenames are not clocks. Only a unique lineage tip can
-/// represent current facts; independent branches, conflicting duplicate hashes and cycles
-/// remain unknown. Identical historical copies are deduplicated without rewriting files.
-pub(crate) fn current_snapshot(
-    snapshots: &[LogicalCircuitSnapshot],
-) -> Result<Option<&LogicalCircuitSnapshot>, &'static str> {
-    if snapshots.is_empty() {
+/// The timeline's last event is the only clock for "current"; snapshot files carry content
+/// only. Legacy copies of one identity may differ in their old parent field, which is lineage
+/// metadata and ignored; any other difference under one identity stays unknown.
+pub(crate) fn current_snapshot<'a>(
+    snapshots: &'a [LogicalCircuitSnapshot],
+    timeline: &[SnapshotTimelineEvent],
+) -> Result<Option<&'a LogicalCircuitSnapshot>, &'static str> {
+    let Some(event) = timeline.last() else {
         return Ok(None);
+    };
+    if event.snapshot_hash.is_empty() {
+        return Err("快照缺少身份 / snapshot identity missing");
     }
-    let mut unique = BTreeMap::new();
-    for snapshot in snapshots {
-        if snapshot.snapshot_hash.is_empty() {
-            return Err("快照缺少身份 / snapshot identity missing");
-        }
-        if let Some(previous) = unique.insert(&snapshot.snapshot_hash, snapshot) {
-            if previous != snapshot {
-                return Err("相同快照身份内容冲突 / conflicting snapshot identity");
-            }
-        }
+    let mut copies = snapshots.iter().filter(|s| s.snapshot_hash == event.snapshot_hash);
+    let Some(current) = copies.next() else {
+        return Err("时间线指向的快照缺失 / timeline references a missing snapshot");
+    };
+    let content = |s: &LogicalCircuitSnapshot| LogicalCircuitSnapshot {
+        parent_snapshot_hash: None,
+        ..s.clone()
+    };
+    if copies.any(|copy| content(copy) != content(current)) {
+        return Err("相同快照身份内容冲突 / conflicting snapshot identity");
     }
-    let parents: BTreeSet<_> =
-        snapshots.iter().filter_map(|s| s.parent_snapshot_hash.as_ref()).collect();
-    let tips: Vec<_> =
-        unique.values().filter(|s| !parents.contains(&s.snapshot_hash)).copied().collect();
-    if tips.len() != 1 {
-        return Err(
-            "当前快照不明确（分支或循环），未统计 / ambiguous current snapshot (branches or cycles), excluded",
-        );
-    }
-    let mut visited = BTreeSet::new();
-    let mut cursor = Some(tips[0]);
-    while let Some(snapshot) = cursor {
-        if !visited.insert(&snapshot.snapshot_hash) {
-            return Err("快照谱系循环 / cyclic snapshot lineage");
-        }
-        cursor =
-            snapshot.parent_snapshot_hash.as_ref().and_then(|parent| unique.get(parent).copied());
-    }
-    if visited.len() != unique.len() {
-        return Err("存在独立快照分支 / disconnected snapshot lineage");
-    }
-    Ok(Some(tips[0]))
+    Ok(Some(current))
 }
 
 type CacheKey = (u64, Vec<(String, String, Option<u128>, Option<String>)>);

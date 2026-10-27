@@ -632,6 +632,7 @@ mod tests {
 
     fn change_set() -> StoredChangeSet {
         StoredChangeSet {
+            preview_validation: Default::default(),
             schema_version: 1,
             id: "cs".into(),
             base_snapshot_hash: "base".into(),

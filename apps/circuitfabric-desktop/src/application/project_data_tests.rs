@@ -138,6 +138,7 @@ fn persisted_usage_and_all_audit_sources_survive_reopen_filter_pagination_and_ex
             .unwrap();
     }
     let cs = StoredChangeSet {
+        preview_validation: Default::default(),
         schema_version: 1,
         id: "cs".into(),
         base_snapshot_hash: "base".into(),
