@@ -10,14 +10,16 @@
 //! | PDF | [`pdf-extract`] | MIT |
 //! | Word `.docx` | [`zip`] + [`roxmltree`] | MIT / MIT-OR-Apache-2.0 |
 //! | Excel `.xls`/`.xlsx` | [`calamine`] | MIT |
+//! | HTML `.html`/`.htm` | built-in tokenizer | MIT |
+//! | `PowerPoint` `.pptx` | [`zip`] + [`roxmltree`] | MIT / MIT-OR-Apache-2.0 |
 //! | Markdown | [`pulldown-cmark`] | MIT |
 //!
 //! This is deliberately an in-app parsing pipeline, never an OS-associated viewer: the crate
 //! spawns no processes, opens no files of its own, evaluates no macros or formulas, and
 //! follows no embedded links or external references. Openers receive only the in-memory
 //! verified managed copy (see [`VerifiedDocumentCopy`]) and return structured read-only view
-//! data. Legacy binary Word `.doc` is reported as explicitly unsupported rather than shelled
-//! out to an external application.
+//! data. Legacy binary Word `.doc` and `PowerPoint` `.ppt` are reported as explicitly
+//! unsupported rather than shelled out to an external application.
 //!
 //! [`pdf-extract`]: https://crates.io/crates/pdf-extract
 //! [`zip`]: https://crates.io/crates/zip
@@ -35,10 +37,12 @@ use circuitfabric_plugin_api::{
 pub mod datasheet;
 
 mod excel;
+mod html;
 mod markdown;
 mod pdf;
 mod pdf_navigation;
 mod pdf_selection;
+mod presentation;
 mod word;
 
 pub use datasheet::{
@@ -48,6 +52,7 @@ pub use datasheet::{
 };
 
 pub use excel::ExcelOpener;
+pub use html::HtmlOpener;
 pub use markdown::MarkdownOpener;
 pub use pdf::{PdfOpener, extract_pdf_text_pages};
 #[cfg(feature = "raster-pdf")]
@@ -57,6 +62,7 @@ pub use pdf::{
 };
 pub use pdf_navigation::{PdfHighlightRect, pdf_text_highlight_ranges};
 pub use pdf_selection::{PdfPageText, PdfTextCharacter};
+pub use presentation::PresentationOpener;
 pub use word::WordOpener;
 
 /// Truncates view text to the protocol's per-fragment cap.
@@ -83,6 +89,25 @@ impl Spans {
     /// Whether every accumulated run is whitespace.
     pub(crate) fn is_blank(&self) -> bool {
         self.spans.iter().all(|span| span.text.trim().is_empty())
+    }
+
+    /// Whether nothing has been accumulated yet.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.spans.is_empty()
+    }
+
+    /// Drops trailing whitespace from the accumulated runs so finished blocks end
+    /// cleanly; the plain text stays the exact concatenation of the runs.
+    pub(crate) fn trim_end(&mut self) {
+        while let Some(last) = self.spans.last_mut() {
+            let trimmed = last.text.trim_end();
+            if trimmed.is_empty() {
+                self.spans.pop();
+            } else {
+                last.text = trimmed.to_owned();
+                break;
+            }
+        }
     }
 
     pub(crate) fn clear(&mut self) {
@@ -160,13 +185,16 @@ impl DocumentOpenerRegistry {
         Self { openers: Vec::new() }
     }
 
-    /// A registry preloaded with the built-in PDF, Word, Excel, and Markdown openers.
+    /// A registry preloaded with the built-in PDF, Word, Excel, HTML, presentation, and
+    /// Markdown openers.
     #[must_use]
     pub fn with_builtin_openers() -> Self {
         let mut registry = Self::new();
         registry.register(Box::new(PdfOpener));
         registry.register(Box::new(WordOpener));
         registry.register(Box::new(ExcelOpener));
+        registry.register(Box::new(HtmlOpener));
+        registry.register(Box::new(PresentationOpener));
         registry.register(Box::new(MarkdownOpener));
         registry
     }
@@ -377,8 +405,13 @@ mod tests {
         assert!(extensions.contains(&"docx".to_owned()));
         assert!(extensions.contains(&"xls".to_owned()));
         assert!(extensions.contains(&"xlsx".to_owned()));
+        assert!(extensions.contains(&"html".to_owned()));
+        assert!(extensions.contains(&"htm".to_owned()));
+        assert!(extensions.contains(&"pptx".to_owned()));
         assert!(extensions.contains(&"md".to_owned()));
         assert!(registry.can_open("MCU.PDF"), "routing is case-insensitive");
+        assert!(registry.can_open("REPORT.HTML"));
+        assert!(registry.can_open("deck.pptx"));
         assert!(!registry.can_open("unknown.xyz"));
     }
 
