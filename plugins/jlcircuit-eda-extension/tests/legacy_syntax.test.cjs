@@ -1,18 +1,18 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 
-test('the v0.2.5 page stays byte-identical except for an optional external compatibility script', () => {
+test('the page loads a single connection and event controller', () => {
   const html = fs.readFileSync(path.join(__dirname, '../iframe/index.html'), 'utf8');
-  const injected = '<script src="/iframe/compat.js"></script>';
-  assert.equal(html.includes(injected), true);
-  const baseline = html.replace(injected, '');
-  assert.equal(crypto.createHash('sha256').update(baseline).digest('hex'), '60bf505e57e8b41e12024bb8752957d2281cae1ef4bc5f56373b94ce398d3abc');
+  assert.deepEqual(html.match(/<script\b[^>]*>/g), ['<script src="/iframe/compat.js">']);
+  assert.equal(html.includes('default-project'), false);
+  assert.match(html, /id="send"[^>]*disabled/);
+  assert.match(html, /class="header-controls"[\s\S]*id="projectSelect"[\s\S]*id="sessionSelect"[\s\S]*id="bridge"[\s\S]*<\/header>/);
+  assert.equal(html.includes('class="settings"'), false, 'the bridge address stays under the header selectors');
 });
 
-test('the optional compatibility script uses only conservative startup syntax', () => {
+test('the page controller uses only conservative startup syntax', () => {
   const script = fs.readFileSync(path.join(__dirname, '../iframe/compat.js'), 'utf8');
   for (const unsupported of ['const ', 'let ', '=>', 'async ', 'await ', '?.', '??', '.finally(', '.replaceChildren(', 'new Option', 'selectedOptions', 'localStorage', 'Promise', 'crypto.randomUUID']) {
     assert.equal(script.includes(unsupported), false, `unexpected token: ${unsupported}`);
