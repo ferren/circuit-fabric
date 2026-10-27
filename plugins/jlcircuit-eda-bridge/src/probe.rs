@@ -1,10 +1,11 @@
 //! Health probes for a running `circuitfabric-jlc-bridge`.
 //!
-//! Two levels, because the bridge serves one WebSocket client at a time:
-//! a plain TCP probe is safe to run automatically (it never disturbs an
-//! attached EDA client), while the protocol-level `status` round-trip is a
-//! deliberate connection test — it opens the `/bridge` WebSocket, asks for
-//! the bridge's protocol version and reported capabilities, and closes.
+//! Two levels: a plain TCP probe is safe to run automatically (it never
+//! disturbs an attached EDA client), while the protocol-level `status`
+//! round-trip is a deliberate connection test — it opens the `/bridge`
+//! WebSocket, asks for the bridge's protocol version and reported
+//! capabilities, and closes. The bridge serves any number of concurrent
+//! connections, one thread each, so probes never block the EDA client.
 
 // WebSocket length prefixes are range-checked before they are narrowed.
 #![allow(clippy::cast_possible_truncation)]
@@ -48,9 +49,8 @@ pub fn tcp_reachable(address: &str, timeout: Duration) -> Result<(), String> {
 /// # Errors
 ///
 /// Returns an error when the address is malformed, the bridge is not
-/// reachable, the handshake times out (typically because an EDA client is
-/// already attached — the bridge serves one connection at a time), or the
-/// reply is not a valid `status_ack`.
+/// reachable, the handshake times out, or the reply is not a valid
+/// `status_ack`.
 pub fn status(address: &str, timeout: Duration) -> Result<BridgeStatusReport, String> {
     let mut stream = open_bridge_socket(address, timeout)?;
     write_client_frame(&mut stream, 0x1, br#"{"type":"status"}"#)?;
@@ -166,7 +166,7 @@ fn read_http_headers(stream: &mut TcpStream) -> Result<String, String> {
     let mut byte = [0_u8; 1];
     while bytes.len() < 16_384 {
         stream.read_exact(&mut byte).map_err(|error| {
-            format!("WebSocket 握手超时或失败（{error}）；bridge 可能正被 EDA 客户端占用")
+            format!("WebSocket 握手超时或失败（{error}）；bridge 地址可能已变化或端口未监听")
         })?;
         bytes.push(byte[0]);
         if bytes.ends_with(b"\r\n\r\n") {

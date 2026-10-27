@@ -3595,9 +3595,12 @@ version = "0.1.0"
 dependencies = [
  "circuitfabric-codex-runtime",
  "circuitfabric-contracts",
+ "circuitfabric-core",
  "circuitfabric-plugin-api",
  "circuitfabric-project",
+ "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.20",
 ]
 

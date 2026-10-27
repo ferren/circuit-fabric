@@ -3,12 +3,20 @@
 //! This crate is intentionally independent from JLCircuit-Agent. It only establishes the
 //! `CircuitFabric` plugin contract; no `JLCircuit` SDK or copied bridge code is present here.
 
+pub mod agent_tools;
+pub mod approval;
+pub mod fusion;
+pub mod materialization;
+pub mod observation;
+pub mod operations;
+pub mod plan;
 pub mod probe;
+pub mod review;
 pub mod supervision;
 
 use circuitfabric_plugin_api::{
-    BridgeSessionContext, BridgeSessionRequest, BridgeUiManifest, Capability, EdaBridge,
-    PLUGIN_API_VERSION, PluginKind, PluginManifest,
+    BridgeSessionContext, BridgeSessionRequest, BridgeUiManifest, EdaBridge, PLUGIN_API_VERSION,
+    PluginKind, PluginManifest,
 };
 use thiserror::Error;
 
@@ -33,17 +41,7 @@ impl Default for JlcircuitEdaBridge {
                 kind: PluginKind::EdaBackend,
                 api_version: PLUGIN_API_VERSION.to_owned(),
                 transport: "bridge".to_owned(),
-                capabilities: vec![
-                    Capability::Inspect,
-                    Capability::Preview,
-                    Capability::Apply,
-                    Capability::Readback,
-                    Capability::Rollback,
-                    Capability::Drc,
-                    Capability::VisualCapture,
-                    Capability::BridgeChat,
-                    Capability::BridgeContext,
-                ],
+                capabilities: operations::implemented_capabilities(),
                 bridge_ui: Some(BridgeUiManifest {
                     entrypoint: "jlcircuit-eda-bridge".to_owned(),
                     host: "jlcircuit-eda".to_owned(),
