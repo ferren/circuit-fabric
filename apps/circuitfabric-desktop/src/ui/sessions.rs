@@ -1,6 +1,12 @@
 //! Sessions presentation and event handlers.
 use super::*;
 
+/// External agents such as the EDA bridge write session records directly under
+/// `sessions/<category>/`; the cached listing otherwise updates only on startup or a
+/// manual refresh. The sessions page reloads the selected project's cache once it is
+/// missing or older than this bound, so the same render already lists new records.
+const SESSIONS_CACHE_STALE_AFTER_NANOS: u128 = 2_000_000_000;
+
 pub(super) fn datasheet_display_rows(data: Option<&DatasheetExtraction>) -> Vec<(String, String)> {
     let Some(data) = data else {
         return vec![];
@@ -65,55 +71,71 @@ fn conversation_row_element(
     row: &super::session_markdown::ConversationRow,
     ix: usize,
     language: UiLanguage,
+    reasoning_collapsed: bool,
+    entity: &Entity<ControlPlaneView>,
 ) -> AnyElement {
     use super::session_markdown::ConversationRow;
     match row {
-        ConversationRow::Reasoning { timestamp, text } => div()
-            .px_4()
-            .pb_3()
-            .w_full()
-            .child(
-                div()
-                    .v_flex()
-                    .gap_1p5()
-                    .p_3()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(rgb(BORDER))
-                    .border_l_2()
-                    .bg(rgb(CARD_BG))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .text_xs()
-                            .child(
-                                div()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(rgb(0x000e_7490))
-                                    .child(language.choose("思考摘要", "Reasoning")),
+        ConversationRow::Reasoning { timestamp, text } => {
+            let toggler = entity.clone();
+            let mut card = div()
+                .v_flex()
+                .gap_1p5()
+                .p_3()
+                .rounded_lg()
+                .border_1()
+                .border_color(rgb(BORDER))
+                .border_l_2()
+                .bg(rgb(CARD_BG))
+                .child(
+                    div()
+                        .id(("session-reasoning-toggle", ix))
+                        .debug_selector(move || format!("session-reasoning-toggle-{ix}"))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .text_xs()
+                        .cursor_pointer()
+                        .on_click(move |_, _, cx| {
+                            toggler.update(cx, |view, cx| view.toggle_session_reasoning(ix, cx));
+                        })
+                        .child(
+                            Icon::new(if reasoning_collapsed {
+                                IconName::ChevronRight
+                            } else {
+                                IconName::ChevronDown
+                            })
+                            .xsmall()
+                            .text_color(rgb(TEXT_MUTED)),
+                        )
+                        .child(
+                            div()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(rgb(0x000e_7490))
+                                .child(language.choose("思考摘要", "Reasoning")),
+                        )
+                        .child(div().text_color(rgb(TEXT_MUTED)).child(timestamp.clone())),
+                );
+            if !reasoning_collapsed {
+                card = card.child(
+                    div()
+                        .debug_selector(|| "session-reasoning-panel".into())
+                        .h(px(112.))
+                        .overflow_hidden()
+                        .child(
+                            gpui_component::text::TextView::markdown(
+                                ("session-reasoning-text", ix),
+                                super::session_markdown::bound_plain_paragraphs(text),
                             )
-                            .child(div().text_color(rgb(TEXT_MUTED)).child(timestamp.clone())),
-                    )
-                    .child(
-                        div()
-                            .debug_selector(|| "session-reasoning-panel".into())
-                            .h(px(112.))
-                            .overflow_hidden()
-                            .child(
-                                gpui_component::text::TextView::markdown(
-                                    ("session-reasoning-text", ix),
-                                    super::session_markdown::bound_plain_paragraphs(text),
-                                )
-                                .h_full()
-                                .w_full()
-                                .scrollable(true)
-                                .selectable(true),
-                            ),
-                    ),
-            )
-            .into_any_element(),
+                            .h_full()
+                            .w_full()
+                            .scrollable(true)
+                            .selectable(true),
+                        ),
+                );
+            }
+            div().px_4().pb_3().w_full().child(card).into_any_element()
+        }
         ConversationRow::Turn { actor, timestamp, first, text } => {
             let is_user = matches!(actor, circuitfabric_project::SessionActor::User);
             let actor_label = if is_user {
@@ -201,6 +223,16 @@ fn conversation_row_element(
 }
 
 impl ControlPlaneView {
+    fn toggle_session_reasoning(&mut self, row: usize, cx: &mut Context<Self>) {
+        if let Some(selection) = &mut self.session_replay {
+            if !selection.reasoning_collapsed.remove(&row) {
+                selection.reasoning_collapsed.insert(row);
+            }
+            selection.conversation_list.remeasure_items(row..row + 1);
+            cx.notify();
+        }
+    }
+
     fn update_conversation_rows(
         selection: &mut SessionReplaySelection,
         rows: std::rc::Rc<Vec<super::session_markdown::ConversationRow>>,
@@ -1439,12 +1471,20 @@ impl ControlPlaneView {
                 .into_any_element()
         } else {
             let render_rows = rows.clone();
+            let render_collapsed = selection.reasoning_collapsed.clone();
+            let row_entity = entity.clone();
             div()
                 .size_full()
                 .relative()
                 .child(
                     gpui::list(list_state.clone(), move |ix, _window, _cx| {
-                        conversation_row_element(&render_rows[ix], ix, language)
+                        conversation_row_element(
+                            &render_rows[ix],
+                            ix,
+                            language,
+                            render_collapsed.contains(&ix),
+                            &row_entity,
+                        )
                     })
                     .size_full()
                     .pt_2(),
@@ -1529,6 +1569,19 @@ impl ControlPlaneView {
             .or_else(|| projects.first())
             .cloned();
 
+        // A bridge chat lands on disk without any desktop-side event; reload a missing
+        // or stale cache so this render already shows it. Failures keep the previous
+        // cache and surface through `project_read_errors` next to the project line below.
+        if let Some(project) = &selected {
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+            let stale = self.project_data.get(&project.id).is_none_or(|data| {
+                now.saturating_sub(data.loaded_at_unix_nanos) > SESSIONS_CACHE_STALE_AFTER_NANOS
+            });
+            if stale {
+                let _ = self.refresh_project_data(&project.id);
+            }
+        }
+
         let mut filters = div().flex().flex_wrap().gap_2();
         for project in &projects {
             let project_id = project.id.clone();
@@ -1584,11 +1637,13 @@ impl ControlPlaneView {
         let content = if let Some(project) = selected {
             let project_id = project.id.clone();
             let refresher = entity.clone();
+            let read_error = self.project_read_errors.get(&project.id).cloned();
             div()
                 .v_flex()
                 .gap_3()
                 .size_full()
                 .child(categories)
+                .child(self.render_materialization_states(&project.id, "sessions"))
                 .child(
                     div()
                         .flex()
@@ -1614,6 +1669,21 @@ impl ControlPlaneView {
                                 }),
                         ),
                 )
+                .when_some(read_error, |column, error| {
+                    column.child(
+                        div()
+                            .debug_selector(|| "sessions-project-read-error".into())
+                            .text_xs()
+                            .whitespace_normal()
+                            .text_color(rgb(0x00b4_2323))
+                            .child(language.choose_owned(
+                                format!("项目数据读取失败，列表保留旧缓存：{error}"),
+                                format!(
+                                    "Project data could not be read; the list keeps the previous cache: {error}"
+                                ),
+                            )),
+                    )
+                })
                 .child(div().id("sessions-page-body").flex_1().min_h(px(0.)).scroll_y().child(
                     self.render_category_sessions_tab(&project, self.session_category_filter, cx),
                 ))

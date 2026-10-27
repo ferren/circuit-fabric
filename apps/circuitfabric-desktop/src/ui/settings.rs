@@ -490,10 +490,7 @@ impl ControlPlaneView {
         self.model_choices.pending = true;
         self.model_choices.fetched_for = Some(signature);
         self.model_choices.error = None;
-        self.status = self
-            .language
-            .choose("正在获取模型列表…", "Fetching model list…")
-            .to_owned();
+        self.status = self.language.choose("正在获取模型列表…", "Fetching model list…").to_owned();
         let provider_id = provider.id.clone();
         let codex_settings = settings.codex.clone();
         let kimi_command = settings.adapters.kimi_command.clone();
@@ -603,7 +600,8 @@ impl ControlPlaneView {
     /// page step is instant local windowing — the visible row window grows by
     /// [`super::MODEL_PAGE_SIZE`] and the next scroll lands on fresh rows.
     pub(super) fn extend_model_window(&mut self, cx: &mut Context<Self>) {
-        let cap = circuitfabric_codex_runtime::models::ENDPOINT_CHOICE_LIMIT + super::MODEL_PAGE_SIZE;
+        let cap =
+            circuitfabric_codex_runtime::models::ENDPOINT_CHOICE_LIMIT + super::MODEL_PAGE_SIZE;
         let next = (self.model_choices.window + super::MODEL_PAGE_SIZE).min(cap);
         if next == self.model_choices.window {
             return;
@@ -648,11 +646,7 @@ impl ControlPlaneView {
     /// overlays the dialog instead of taking layout space, and closes on a
     /// row pick, on blur, or on a click anywhere outside it. The catalog
     /// arrives from the automatic background fetch.
-    pub(super) fn render_model_field(
-        &self,
-        provider: &ProviderFields,
-        cx: &Context<Self>,
-    ) -> Div {
+    pub(super) fn render_model_field(&self, provider: &ProviderFields, cx: &Context<Self>) -> Div {
         let language = self.language;
         let entity = cx.entity().clone();
         let caret = cx.entity().clone();
@@ -790,7 +784,9 @@ impl ControlPlaneView {
                 language.choose("Codex 账号目录", "Codex account catalog")
             }
             ProviderConnection::KimiAccount => language.choose("kimi CLI 目录", "kimi CLI catalog"),
-            ProviderConnection::ApiKey => language.choose("端点 GET /models", "endpoint GET /models"),
+            ProviderConnection::ApiKey => {
+                language.choose("端点 GET /models", "endpoint GET /models")
+            }
         };
         let entity = cx.entity().clone();
         let current_model = provider.model.read(cx).value().to_string();
@@ -824,17 +820,21 @@ impl ControlPlaneView {
             );
         } else if let Some(error) = &self.model_choices.error {
             panel = panel.child(
-                div().px_3().py_2().text_xs().whitespace_normal().text_color(rgb(0x00dc_2626)).child(
-                    format!("{source}：{error}"),
-                ),
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_xs()
+                    .whitespace_normal()
+                    .text_color(rgb(0x00dc_2626))
+                    .child(format!("{source}：{error}")),
             );
         } else if self.model_choices.choices.is_empty() {
-            panel = panel.child(
-                div().px_3().py_2().text_xs().text_color(rgb(TEXT_MUTED)).child(language.choose(
+            panel = panel.child(div().px_3().py_2().text_xs().text_color(rgb(TEXT_MUTED)).child(
+                language.choose(
                     "未获取到模型列表；可直接输入模型名。",
                     "No model list fetched; the model name can still be typed.",
-                )),
-            );
+                ),
+            ));
         } else {
             let matches: Vec<&circuitfabric_codex_runtime::models::ModelChoice> = self
                 .model_choices
@@ -853,7 +853,8 @@ impl ControlPlaneView {
             let truncation_note = if provider.connection == ProviderConnection::ApiKey
                 && total == circuitfabric_codex_runtime::models::ENDPOINT_CHOICE_LIMIT
             {
-                language.choose("（目录较大，仅收录前 1000 个）", " (large catalog, first 1000 kept)")
+                language
+                    .choose("（目录较大，仅收录前 1000 个）", " (large catalog, first 1000 kept)")
             } else {
                 ""
             };
@@ -872,14 +873,13 @@ impl ControlPlaneView {
                     )),
             );
             if matches.is_empty() {
-                panel = panel.child(
-                    div().px_3().py_2().text_xs().text_color(rgb(TEXT_MUTED)).child(
+                panel =
+                    panel.child(div().px_3().py_2().text_xs().text_color(rgb(TEXT_MUTED)).child(
                         language.choose(
                             "没有匹配的模型；可直接输入完整模型名。",
                             "No matching model; the full model name can still be typed.",
                         ),
-                    ),
-                );
+                    ));
             } else {
                 let rendered = matches.len().min(self.model_choices.window);
                 // Ten rows stay visible; anything beyond scrolls inside the
@@ -900,8 +900,7 @@ impl ControlPlaneView {
                     let selected = current_model == choice.id;
                     let model = choice.id.clone();
                     let row_selector = format!("model-choice-row-{}", choice.id);
-                    let name =
-                        choice.display_name.clone().unwrap_or_else(|| choice.id.clone());
+                    let name = choice.display_name.clone().unwrap_or_else(|| choice.id.clone());
                     let row_id = choice.id.clone();
                     let is_default = choice.is_default;
                     let vision = choice.supports_vision == Some(true);
@@ -937,18 +936,19 @@ impl ControlPlaneView {
                                     let selected =
                                         view.selected_provider.min(view.providers.len() - 1);
                                     let state = view.providers[selected].model.clone();
-                                    state.update(cx, |state, cx| state.set_value(model, window, cx));
+                                    state
+                                        .update(cx, |state, cx| state.set_value(model, window, cx));
                                     view.model_choices.dropdown_open = false;
                                     cx.notify();
                                 });
                             })
-                            .child(
-                                div().flex_1().min_w(px(0.)).truncate().child(if name != row_id {
+                            .child(div().flex_1().min_w(px(0.)).truncate().child(
+                                if name != row_id {
                                     format!("{name} · {row_id}")
                                 } else {
                                     row_id.clone()
-                                }),
-                            )
+                                },
+                            ))
                             .when(is_default, |row| {
                                 row.child(
                                     div()
@@ -973,9 +973,10 @@ impl ControlPlaneView {
                             })
                             .when(!vision && vision_unknown, |row| {
                                 row.child(
-                                    div().text_xs().text_color(rgb(TEXT_MUTED)).child(
-                                        language.choose("视觉未知", "vision?"),
-                                    ),
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(TEXT_MUTED))
+                                        .child(language.choose("视觉未知", "vision?")),
                                 )
                             }),
                     );
@@ -1005,7 +1006,10 @@ impl ControlPlaneView {
                                 language.choose("已加载", "loaded"),
                                 matches.len(),
                                 language.choose("个匹配", "matched"),
-                                language.choose("滚动到底部或点此继续加载", "scroll to the bottom or click to load more"),
+                                language.choose(
+                                    "滚动到底部或点此继续加载",
+                                    "scroll to the bottom or click to load more"
+                                ),
                             )),
                     );
                 }
@@ -1074,15 +1078,8 @@ impl ControlPlaneView {
         // corner and `left/right: 0` gives it the field's own width. Deferred
         // draw escapes the dialog's scroll clipping; no layout space taken.
         Some(
-            deferred(
-                div()
-                    .absolute()
-                    .left_0()
-                    .right_0()
-                    .top(px(36.))
-                    .child(panel),
-            )
-            .into_any_element(),
+            deferred(div().absolute().left_0().right_0().top(px(36.)).child(panel))
+                .into_any_element(),
         )
     }
 
@@ -1336,9 +1333,7 @@ impl ControlPlaneView {
                 });
             let chip = if compatible {
                 chip.cursor_pointer()
-                    .when(!selected, |this| {
-                        this.bg(rgb(CARD_BG)).text_color(rgb(TEXT_SECONDARY))
-                    })
+                    .when(!selected, |this| this.bg(rgb(CARD_BG)).text_color(rgb(TEXT_SECONDARY)))
                     .on_click(move |_, window, cx| {
                         let id = provider.id.clone();
                         chooser.update(cx, |view, cx| {

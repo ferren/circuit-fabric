@@ -35,10 +35,10 @@ impl ControlPlaneView {
             )
             .into_any_element();
         };
-        let snapshots = self
+        let (snapshots, timeline) = self
             .project_data
             .get(&project_id)
-            .map(|data| data.semantic_snapshots.clone())
+            .map(|data| (data.semantic_snapshots.clone(), data.snapshot_timeline.clone()))
             .unwrap_or_default();
         if snapshots.is_empty() {
             return div()
@@ -83,24 +83,70 @@ impl ControlPlaneView {
             .as_ref()
             .filter(|(selected_project, _)| selected_project == &project_id)
             .map(|(_, hash)| hash.as_str());
+        let find = |hash: &str| snapshots.iter().find(|snapshot| snapshot.snapshot_hash == hash);
         let snapshot = selected_hash
-            .and_then(|hash| snapshots.iter().find(|snapshot| snapshot.snapshot_hash == hash))
+            .and_then(find)
+            .or_else(|| timeline.last().and_then(|event| find(&event.snapshot_hash)))
             .unwrap_or_else(|| snapshots.last().expect("non-empty snapshots"));
         let query = self.semantic_query.read(cx).value().to_owned();
         let query_hits = semantic_query_hits(snapshot, self.semantic_query_scope, &query);
         let authority = Self::authority_style(&snapshot.authority);
 
+        // 时间线按观测顺序排列；同一身份的事件同时高亮，改回原样的事件标出回到的序号。
+        let revisits = circuitfabric_project::timeline_revisits(&timeline);
         let mut lineage = div().flex().flex_wrap().gap_2();
-        for candidate in &snapshots {
-            let candidate_authority = Self::authority_style(&candidate.authority);
-            let selected = candidate.snapshot_hash == snapshot.snapshot_hash;
+        for (index, event) in timeline.iter().enumerate() {
+            let candidate = find(&event.snapshot_hash);
+            let candidate_authority = candidate.map(|c| Self::authority_style(&c.authority));
+            let selected = event.snapshot_hash == snapshot.snapshot_hash;
             let selector = entity.clone();
-            let candidate_hash = candidate.snapshot_hash.clone();
+            let candidate_hash = event.snapshot_hash.clone();
             let candidate_project = project_id.clone();
+            let change =
+                match (index.checked_sub(1).map(|i| find(&timeline[i].snapshot_hash)), candidate) {
+                    (None, _) => language.choose("初始状态", "Initial state").to_owned(),
+                    (Some(Some(before)), Some(after)) => {
+                        let summary =
+                            circuitfabric_project::SnapshotChangeSummary::between(before, after);
+                        if summary.is_empty() {
+                            language
+                                .choose(
+                                    "元件与网络未变，其他字段变化",
+                                    "Components and nets unchanged; other fields changed",
+                                )
+                                .to_owned()
+                        } else {
+                            format!(
+                                "{} +{} −{} ~{} · {} +{} −{} ~{}",
+                                language.choose("元件", "parts"),
+                                summary.components_added,
+                                summary.components_removed,
+                                summary.components_changed,
+                                language.choose("网络", "nets"),
+                                summary.nets_added,
+                                summary.nets_removed,
+                                summary.nets_changed,
+                            )
+                        }
+                    }
+                    _ => language
+                        .choose("快照文件缺失，无法比较", "Snapshot file missing; cannot compare")
+                        .to_owned(),
+                };
+            let source = match event.source {
+                circuitfabric_project::TimelineSource::Inspect => "inspect",
+                circuitfabric_project::TimelineSource::Readback => "readback",
+                circuitfabric_project::TimelineSource::Legacy => "legacy",
+            };
+            let observed_at = event.observed_at_unix_millis.map_or_else(
+                || language.choose("时间未知", "unknown time").to_owned(),
+                |millis| rfc3339(millis / 1000),
+            );
+            let is_current = index + 1 == timeline.len();
             lineage = lineage.child(
                 div()
-                    .id(format!("semantic-snapshot-{}", candidate_hash))
-                    .w(px(214.))
+                    .id(format!("semantic-timeline-{}", event.seq))
+                    .w(px(232.))
                     .p_3()
                     .v_flex()
                     .gap_1()
@@ -121,30 +167,58 @@ impl ControlPlaneView {
                             .flex()
                             .items_center()
                             .justify_between()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .child(short_hash(&candidate.snapshot_hash)),
-                            )
-                            .child(
-                                div()
-                                    .px_1p5()
-                                    .py_0p5()
-                                    .rounded_sm()
-                                    .text_xs()
-                                    .bg(rgb(candidate_authority.0))
-                                    .text_color(rgb(candidate_authority.1))
-                                    .child(candidate_authority.2),
-                            ),
+                            .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(format!(
+                                "#{} · {}",
+                                event.seq,
+                                short_hash(&event.snapshot_hash)
+                            )))
+                            .when_some(candidate_authority, |row, style| {
+                                row.child(
+                                    div()
+                                        .px_1p5()
+                                        .py_0p5()
+                                        .rounded_sm()
+                                        .text_xs()
+                                        .bg(rgb(style.0))
+                                        .text_color(rgb(style.1))
+                                        .child(style.2),
+                                )
+                            }),
                     )
-                    .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(format!(
-                            "parent: {}",
-                            candidate
-                                .parent_snapshot_hash
-                                .as_deref()
-                                .map_or_else(|| "root".to_owned(), short_hash)
-                        ))),
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(TEXT_MUTED))
+                            .child(format!("{observed_at} · {source}")),
+                    )
+                    .child(div().text_xs().text_color(rgb(TEXT_SECONDARY)).child(change))
+                    .when_some(revisits[index], |card, first| {
+                        card.child(
+                            div()
+                                .debug_selector({
+                                    let seq = event.seq;
+                                    move || format!("semantic-timeline-revisit-{seq}")
+                                })
+                                .px_1p5()
+                                .py_0p5()
+                                .rounded_sm()
+                                .text_xs()
+                                .bg(rgb(0x00ff_fbeb))
+                                .text_color(rgb(0x00b4_5309))
+                                .child(format!(
+                                    "↩ {} #{first}",
+                                    language.choose("回到", "returned to")
+                                )),
+                        )
+                    })
+                    .when(is_current, |card| {
+                        card.child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(ACCENT))
+                                .child(language.choose("当前", "current")),
+                        )
+                    }),
             );
         }
 
@@ -479,7 +553,7 @@ impl ControlPlaneView {
                 div().v_flex().gap_1()
                     .child(div().text_sm().text_color(rgb(TEXT_SECONDARY)).child(language.choose("只读项目快照、验证事实与可追溯证据。", "Read-only project snapshots, verification facts, and traceable evidence."))),
             ).child({ let refresher = entity.clone(); action_button("refresh-semantic-snapshots").label(language.choose("刷新快照", "Refresh snapshots")).on_click(move |_, _, cx| { refresher.update(cx, |view, cx| { view.status = match view.refresh_project_data(&project_id) { Ok(()) => language.choose("语义快照已刷新", "Semantic snapshots refreshed").to_owned(), Err(error) => format!("{}: {error}", language.choose("语义快照未刷新", "Semantic snapshots not refreshed")), }; cx.notify(); }); }) }))
-            .child(div().v_flex().gap_2().p_3().rounded_lg().border_1().border_color(rgb(BORDER)).bg(rgb(CARD_BG)).child(div().text_sm().font_weight(FontWeight::MEDIUM).child(language.choose("快照谱系", "Snapshot lineage"))).child(lineage))
+            .child(div().v_flex().gap_2().p_3().rounded_lg().border_1().border_color(rgb(BORDER)).bg(rgb(CARD_BG)).child(div().text_sm().font_weight(FontWeight::MEDIUM).child(language.choose("快照时间线", "Snapshot timeline"))).child(lineage))
             .child(div().flex().flex_wrap().gap_3().child(
                 div().flex_1().min_w(px(260.)).v_flex().gap_1().p_3().rounded_lg().border_1().border_color(rgb(BORDER)).bg(rgb(CARD_BG)).child(div().text_xs().text_color(rgb(TEXT_MUTED)).child("authority")).child(div().px_1p5().py_0p5().rounded_sm().text_xs().bg(rgb(authority.0)).text_color(rgb(authority.1)).child(authority.2)),
             ).child(

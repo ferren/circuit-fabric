@@ -86,10 +86,9 @@ impl ControlPlaneView {
     }
 
     pub(super) fn set_default_runtime(&mut self, adapter: RuntimeAdapter, cx: &mut Context<Self>) {
-        let update =
-            crate::application::settings_persistence::SettingsUpdate::DefaultRuntime(
-                adapter.agent_kind(),
-            );
+        let update = crate::application::settings_persistence::SettingsUpdate::DefaultRuntime(
+            adapter.agent_kind(),
+        );
         self.status = match self.save_update(update) {
             Ok(()) => format!("默认运行时已设为 {}。", adapter.label()),
             Err(error) => format!("默认运行时未保存：{error}"),
@@ -231,7 +230,11 @@ impl ControlPlaneView {
     }
 
     /// Check state without the runtime name, for list cards that already show it.
-    pub(super) fn runtime_check_status(&self, adapter: RuntimeAdapter, language: UiLanguage) -> String {
+    pub(super) fn runtime_check_status(
+        &self,
+        adapter: RuntimeAdapter,
+        language: UiLanguage,
+    ) -> String {
         if self.runtime_checks_pending.contains(&adapter) {
             return language.choose("检查中…", "checking…").to_owned();
         }
@@ -249,7 +252,11 @@ impl ControlPlaneView {
     }
 
     /// Named label for the sidebar chip, detail headers and status lines.
-    pub(super) fn runtime_check_label(&self, adapter: RuntimeAdapter, language: UiLanguage) -> String {
+    pub(super) fn runtime_check_label(
+        &self,
+        adapter: RuntimeAdapter,
+        language: UiLanguage,
+    ) -> String {
         format!("{} {}", adapter.short_label(), self.runtime_check_status(adapter, language))
     }
 
@@ -865,6 +872,12 @@ impl ControlPlaneView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         self.maybe_probe_bridge_health(window, cx);
+        let materialization = if let Some(project) = self.navigation.selected_project.clone() {
+            self.refresh_materialization_data(&project);
+            self.render_materialization_states(&project, "eda")
+        } else {
+            div()
+        };
         let entity = cx.entity().clone();
         let language = self.language;
         let selector = entity;
@@ -963,6 +976,7 @@ impl ControlPlaneView {
             .v_flex()
             .gap_4()
             .p_6()
+            .child(materialization)
             .child(
                 div()
                     .v_flex()
@@ -1483,20 +1497,21 @@ impl ControlPlaneView {
             .runtime_checks
             .get(&adapter)
             .map(|result| (elapsed_label(language, result.at.elapsed()), &result.outcome));
-        let launch_provider_summary = match circuitfabric_codex_runtime::execution::selected_provider(
-            &self.saved_settings,
-            adapter.agent_kind(),
-        ) {
-            Some(provider) => {
-                format!("`{}`（{} · {}）", provider.id, provider.name, provider.model)
-            }
-            None => language
-                .choose(
-                    "尚未配置（请先添加 Provider）",
-                    "none configured yet (add a provider first)",
-                )
-                .to_owned(),
-        };
+        let launch_provider_summary =
+            match circuitfabric_codex_runtime::execution::selected_provider(
+                &self.saved_settings,
+                adapter.agent_kind(),
+            ) {
+                Some(provider) => {
+                    format!("`{}`（{} · {}）", provider.id, provider.name, provider.model)
+                }
+                None => language
+                    .choose(
+                        "尚未配置（请先添加 Provider）",
+                        "none configured yet (add a provider first)",
+                    )
+                    .to_owned(),
+            };
         let description = if adapter == RuntimeAdapter::CodexAppServer {
             language.choose(
                 "检查会用已保存的 Codex 命令与 Provider 临时启动一次 App Server，完成 JSON-RPC 初始化握手后立即结束进程，不驻留。任务、提取与 EDA 会话不依赖此检查，各自即时拉起一次性进程。",
@@ -1540,29 +1555,31 @@ impl ControlPlaneView {
                     launch_provider_summary,
                 ))),
         )
-        .child(div().text_sm().whitespace_normal().child(match last_check {
-            None => language
-                .choose("尚未执行连接检查。", "No connection check has been run yet.")
-                .to_owned(),
-            Some((elapsed, Ok(report))) => format!(
-                "{} · {elapsed}{} · {} · {}{} · {} ms",
-                language.choose("检查通过", "Check passed"),
-                language.choose(" 前", " ago"),
-                report.provider,
-                report.command,
-                if report.version.is_empty() {
-                    String::new()
-                } else {
-                    format!(" · {}", report.version)
-                },
-                report.elapsed.as_millis(),
-            ),
-            Some((elapsed, Err(reason))) => format!(
-                "{} · {elapsed}{} · {reason}",
-                language.choose("检查未通过", "Check failed"),
-                language.choose(" 前", " ago"),
-            ),
-        }))
+        .child(
+            div().text_sm().whitespace_normal().child(match last_check {
+                None => language
+                    .choose("尚未执行连接检查。", "No connection check has been run yet.")
+                    .to_owned(),
+                Some((elapsed, Ok(report))) => format!(
+                    "{} · {elapsed}{} · {} · {}{} · {} ms",
+                    language.choose("检查通过", "Check passed"),
+                    language.choose(" 前", " ago"),
+                    report.provider,
+                    report.command,
+                    if report.version.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · {}", report.version)
+                    },
+                    report.elapsed.as_millis(),
+                ),
+                Some((elapsed, Err(reason))) => format!(
+                    "{} · {elapsed}{} · {reason}",
+                    language.choose("检查未通过", "Check failed"),
+                    language.choose(" 前", " ago"),
+                ),
+            }),
+        )
     }
 
     pub(super) fn run_agent_task(
@@ -1764,6 +1781,7 @@ impl ControlPlaneView {
                     &prompt,
                     image.as_deref(),
                     project_root.as_deref(),
+                    circuitfabric_codex_runtime::execution::TurnCapabilities::default(),
                     secrets.as_ref(),
                     &cancel,
                     &mut |kind, delta| {

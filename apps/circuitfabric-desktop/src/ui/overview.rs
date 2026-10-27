@@ -224,9 +224,11 @@ impl ControlPlaneView {
                 .values()
                 .filter_map(|task| {
                     let (project, session, runtime) = task.identity.as_ref()?;
-                    let phase = if task.cancel.as_ref().is_some_and(|cancel| {
-                        cancel.0.load(Ordering::SeqCst)
-                    }) {
+                    let phase = if task
+                        .cancel
+                        .as_ref()
+                        .is_some_and(|cancel| cancel.0.load(Ordering::SeqCst))
+                    {
                         language.choose("正在取消", "Cancelling")
                     } else {
                         language.choose("运行中", "Running")

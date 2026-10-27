@@ -20,11 +20,18 @@ impl ControlPlaneView {
             )
             .into_any_element();
         };
-        let snapshots = self
+        let (mut snapshots, current_hash) = self
             .project_data
             .get(&project_id)
-            .map(|data| data.semantic_snapshots.clone())
+            .map(|data| {
+                (
+                    data.semantic_snapshots.clone(),
+                    data.snapshot_timeline.last().map(|event| event.snapshot_hash.clone()),
+                )
+            })
             .unwrap_or_default();
+        let mut seen = std::collections::BTreeSet::new();
+        snapshots.retain(|snapshot| seen.insert(snapshot.snapshot_hash.clone()));
         if snapshots.is_empty() {
             let refresher = entity.clone();
             let refresh_project = project_id.clone();
@@ -88,7 +95,8 @@ impl ControlPlaneView {
             .selected_semantic_snapshot
             .as_ref()
             .filter(|(selected_project, _)| selected_project == &project_id)
-            .map(|(_, hash)| hash.as_str());
+            .map(|(_, hash)| hash.as_str())
+            .or(current_hash.as_deref());
         let snapshot = selected_hash
             .and_then(|hash| snapshots.iter().find(|snapshot| snapshot.snapshot_hash == hash))
             .unwrap_or_else(|| snapshots.last().expect("non-empty snapshots"));

@@ -2,10 +2,89 @@
 use super::*;
 
 impl ControlPlaneView {
+    pub(super) fn refresh_materialization_data(&mut self, project: &str) {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+        if self
+            .project_data
+            .get(project)
+            .is_none_or(|data| now.saturating_sub(data.loaded_at_unix_nanos) > 2_000_000_000)
+        {
+            let _ = self.refresh_project_data(project);
+        }
+    }
+
+    /// All three pages use the same persisted states; no green status from write alone.
+    pub(super) fn render_materialization_states(
+        &self,
+        project: &str,
+        surface: &'static str,
+    ) -> Div {
+        let mut rows =
+            div().v_flex().gap_1().debug_selector(move || format!("materialization-{surface}"));
+        if let Some(data) = self.project_data.get(project) {
+            for record in &data.change_sets {
+                let label = |status: &ChangeSetStageStatus| match status {
+                    ChangeSetStageStatus::NotRun => "not_run",
+                    ChangeSetStageStatus::Passed => "passed",
+                    ChangeSetStageStatus::Failed => "failed",
+                    ChangeSetStageStatus::Inconclusive => "inconclusive",
+                };
+                let action = record
+                    .audit
+                    .iter()
+                    .rev()
+                    .find(|entry| {
+                        matches!(
+                            entry.decision.as_str(),
+                            "cancelled" | "rollback_executed" | "rollback_error" | "compensation"
+                        )
+                    })
+                    .map_or("", |entry| entry.decision.as_str());
+                let status = if !action.is_empty() {
+                    action
+                } else if record.verified() {
+                    "verified"
+                } else {
+                    "inconclusive"
+                };
+                let selector = format!("materialization-{surface}-{}-{status}", record.id);
+                rows = rows.child(
+                    div()
+                        .text_xs()
+                        .whitespace_normal()
+                        .debug_selector(move || selector.clone())
+                        .text_color(rgb(if record.verified() && action.is_empty() {
+                            0x0016_a34a
+                        } else {
+                            TEXT_SECONDARY
+                        }))
+                        .child(format!(
+                            "{} · {} · write={} · readback={} · verification={} · rollback={}",
+                            record.id,
+                            status,
+                            label(&record.execution.write.status),
+                            label(&record.execution.readback.status),
+                            label(&record.execution.verification.status),
+                            record.rollback_handle.as_deref().unwrap_or("none")
+                        )),
+                );
+            }
+        }
+        rows
+    }
+
     pub(super) fn current_observation_hash(&self, project_id: &str) -> Option<String> {
-        self.project_data.get(project_id)?.semantic_snapshots.iter().rev().find_map(|snapshot| {
-            (snapshot.authority == SnapshotAuthority::Observed)
-                .then(|| snapshot.snapshot_hash.clone())
+        if let Some(storage) = self.project_storages.get(project_id)
+            && let Ok(Some(hash)) =
+                jlcircuit_eda_bridge::observation::latest_inspect_snapshot_hash(storage.root())
+        {
+            return Some(hash);
+        }
+        let data = self.project_data.get(project_id)?;
+        data.snapshot_timeline.iter().rev().find_map(|event| {
+            data.snapshot(&event.snapshot_hash)
+                .filter(|snapshot| snapshot.authority == SnapshotAuthority::Observed)
+                .map(|snapshot| snapshot.snapshot_hash.clone())
         })
     }
 
@@ -77,6 +156,7 @@ impl ControlPlaneView {
             )
             .into_any_element();
         };
+        self.refresh_materialization_data(&project_id);
         let data = self.project_data.get(&project_id).cloned().unwrap_or_default();
         let selected_id = self
             .selected_change_set
@@ -147,7 +227,7 @@ impl ControlPlaneView {
             let baseline_label = if approval_allowed {
                 "Current observation matches baseline"
             } else {
-                "Current observation differs from baseline — approval disabled"
+                "Baseline or preview validation is not ready — approval disabled"
             };
             let mut diff_rows = div().v_flex().gap_1();
             for operation in &record.ir_diff {
@@ -184,6 +264,7 @@ impl ControlPlaneView {
                     ChangeSetStageStatus::Passed => (0x0016_a34a, "passed"),
                     ChangeSetStageStatus::Failed => (0x00b9_1c1c, "failed"),
                     ChangeSetStageStatus::NotRun => (0x00b4_5309, "not run"),
+                    ChangeSetStageStatus::Inconclusive => (0x00b4_5309, "inconclusive"),
                 };
                 div()
                     .flex()
@@ -331,6 +412,11 @@ impl ControlPlaneView {
                                 .child("Materialization report"),
                         )
                         .child(stage(
+                            "Preview",
+                            &record.preview_validation.status,
+                            &record.preview_validation.detail,
+                        ))
+                        .child(stage(
                             "Write",
                             &record.execution.write.status,
                             &record.execution.write.detail,
@@ -372,6 +458,7 @@ impl ControlPlaneView {
         };
 
         let mut page = page("changes-approvals-page")
+            .child(self.render_materialization_states(&project_id, "changes"))
             .child(div().flex().items_center().justify_between().child(
                 div().v_flex().gap_1()
                     .child(div().text_sm().text_color(rgb(TEXT_SECONDARY)).child("Approval is guarded by current observed state, baseline, and verification."))

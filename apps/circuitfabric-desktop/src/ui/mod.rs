@@ -1,8 +1,8 @@
 //! Native presentation composition root. Business services live in `application`.
 use crate::application::navigation::{ControlPlaneScreen, DesktopShell, app_window_title};
-use assistant::{ASSISTANT_SHORTCUT_LABEL, AssistantState};
 #[cfg(windows)]
 use crate::{pdf_cursors, windows_icon};
+use assistant::{ASSISTANT_SHORTCUT_LABEL, AssistantState};
 use circuitfabric_contracts::ProjectId;
 use language::UiLanguage;
 use state::*;
@@ -73,11 +73,11 @@ use circuitfabric_project::{
     ProjectStorage, ProjectWorkspace, SessionReplay, is_evidence_indexable, rfc3339,
 };
 use gpui::{
-    AnyElement, AppContext, ClickEvent, Context, Div, DragMoveEvent, Entity, FontStyle,
-    FontWeight, HighlightStyle, Image, ImageFormat, InteractiveElement, IntoElement,
-    KeystrokeEvent, MouseButton, ParentElement, Render, Size, StatefulInteractiveElement,
-    StrikethroughStyle, Styled, StyledText, Window, WindowOptions, deferred, div, img,
-    prelude::FluentBuilder as _, px, rgba,
+    AnyElement, AppContext, ClickEvent, Context, Div, DragMoveEvent, Entity, FontStyle, FontWeight,
+    HighlightStyle, Image, ImageFormat, InteractiveElement, IntoElement, KeystrokeEvent,
+    MouseButton, ParentElement, Render, Size, StatefulInteractiveElement, StrikethroughStyle,
+    Styled, StyledText, Window, WindowOptions, deferred, div, img, prelude::FluentBuilder as _, px,
+    rgba,
 };
 use gpui_base::{InputBase, Selectable, input::InputEditorStyle};
 use gpui_component::{
@@ -102,10 +102,7 @@ const APP_ICONS: [(&str, &[u8]); 8] = [
     ("icons/folder-kanban.svg", include_bytes!("../../../../assets/icons/folder-kanban.svg")),
     ("icons/circuit-board.svg", include_bytes!("../../../../assets/icons/circuit-board.svg")),
     ("icons/messages-square.svg", include_bytes!("../../../../assets/icons/messages-square.svg")),
-    (
-        "icons/git-pull-request.svg",
-        include_bytes!("../../../../assets/icons/git-pull-request.svg"),
-    ),
+    ("icons/git-pull-request.svg", include_bytes!("../../../../assets/icons/git-pull-request.svg")),
     ("icons/package.svg", include_bytes!("../../../../assets/icons/package.svg")),
     ("icons/puzzle.svg", include_bytes!("../../../../assets/icons/puzzle.svg")),
     (

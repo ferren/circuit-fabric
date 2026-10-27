@@ -2,9 +2,10 @@
 //! the visible screen, and proposes UI actions that only run after confirmation.
 use super::*;
 use crate::application::assistant::{
-    ACTION_FENCE, ActionStatus, AssistantAction, ChatMessage as AssistantMessage, ProposedAction,
-    Role, ScreenSnapshot, SnapshotField, SnapshotItem, Turn, build_prompt, load_history,
-    parse_reply, save_history,
+    ACTION_FENCE_TAG, ActionStatus, AssistantAction, AssistantMaterials, AssistantSession,
+    AssistantSessions, ChatMessage as AssistantMessage, ImportCategory, ProposedAction, Role,
+    ScreenSnapshot, SnapshotField, SnapshotItem, Turn, build_prompt, clip as clip_text,
+    derive_session_title, load_sessions, new_session_id, parse_reply, save_sessions,
 };
 use gpui::{App, Focusable as _};
 
@@ -71,36 +72,49 @@ impl AssistantDock {
 pub(super) struct DraggedAssistantEdge;
 
 pub(super) struct AssistantRun {
+    /// The conversation the reply belongs to; switching sessions while it
+    /// streams does not redirect it.
+    pub(super) session_id: String,
     pub(super) cancel: circuitfabric_codex_runtime::execution::Cancellation,
     pub(super) stream: Arc<std::sync::Mutex<String>>,
+    pub(super) reasoning: Arc<std::sync::Mutex<String>>,
 }
 
 pub(super) struct AssistantState {
     pub(super) open: bool,
     /// Grows with wrapped content up to [`ASSISTANT_INPUT_MAX_ROWS`], then scrolls.
     pub(super) input: Entity<gpui_component::input::TextareaState>,
-    pub(super) messages: Vec<AssistantMessage>,
+    /// Every conversation, each with its own independent context; the active
+    /// one is what the panel shows.
+    pub(super) sessions: AssistantSessions,
     pub(super) run: Option<AssistantRun>,
     pub(super) list: gpui::ListState,
+    /// Focus the message area claims on mouse-down, so Ctrl+C bubbles to the
+    /// window-level copy handler instead of being swallowed by the composer.
+    pub(super) text_focus: gpui::FocusHandle,
     pub(super) dock: AssistantDock,
     /// Panel width when docked left/right, height when docked top/bottom.
     pub(super) width: f32,
     pub(super) height: f32,
-    /// Where the conversation is kept between launches.
+    /// Where the conversations are kept between launches.
     pub(super) history_path: PathBuf,
+    /// The session picker popup opened from the panel header.
+    pub(super) session_picker_open: bool,
 }
 
 impl AssistantState {
-    /// Restores the saved conversation; returns a status note when it could not
-    /// be read (the unreadable file is left untouched).
+    /// Restores the saved conversations; returns a status note when they could
+    /// not be read (the unreadable file is left untouched).
     pub(super) fn new(
         history_path: PathBuf,
         window: &mut Window,
         cx: &mut Context<ControlPlaneView>,
     ) -> (Self, Option<String>) {
-        let (messages, load_error) = match load_history(&history_path) {
-            Ok(messages) => (messages, None),
-            Err(error) => (Vec::new(), Some(format!("智能助手历史会话未恢复：{error}"))),
+        let (sessions, load_error) = match load_sessions(&history_path) {
+            Ok(sessions) => (sessions, None),
+            Err(error) => {
+                (AssistantSessions::fresh(), Some(format!("智能助手历史会话未恢复：{error}")))
+            }
         };
         let input = cx.new(|cx| {
             gpui_component::input::TextareaState::new(window, cx)
@@ -115,27 +129,70 @@ impl AssistantState {
             _ => {}
         })
         .detach();
-        let list = gpui::ListState::new(messages.len(), gpui::ListAlignment::Bottom, px(512.));
+        let list = gpui::ListState::new(
+            sessions.active().messages.len(),
+            gpui::ListAlignment::Bottom,
+            px(512.),
+        );
         list.set_follow_mode(gpui::FollowMode::Tail);
         let state = Self {
             open: false,
             input,
-            messages,
+            sessions,
             run: None,
             list,
+            text_focus: cx.focus_handle(),
             dock: AssistantDock::Right,
             width: ASSISTANT_DEFAULT_WIDTH,
             height: ASSISTANT_DEFAULT_HEIGHT,
             history_path,
+            session_picker_open: false,
         };
         (state, load_error)
     }
 }
 
 /// Text shown while a reply streams: the action block is withheld until it is
-/// complete and validated.
+/// complete and validated. The whole fence line is cut, whatever info string
+/// decorates it.
 fn visible_stream_text(stream: &str) -> &str {
-    stream.find(ACTION_FENCE).map_or(stream, |index| &stream[..index])
+    stream.find(ACTION_FENCE_TAG).map_or(stream, |index| {
+        let line_start = stream[..index].rfind('\n').map_or(0, |at| at + 1);
+        &stream[..line_start]
+    })
+}
+
+/// Lists files under the materials directory as `/`-separated relative paths,
+/// bounded so a runaway collector cannot flood the snapshot.
+fn collect_material_files(
+    directory: &std::path::Path,
+    prefix: &str,
+    depth: usize,
+    files: &mut Vec<String>,
+) {
+    /// Keeps the snapshot bounded even if a runtime writes a large tree.
+    const MAX_FILES: usize = 200;
+    const MAX_DEPTH: usize = 4;
+    if depth > MAX_DEPTH || files.len() >= MAX_FILES {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if files.len() >= MAX_FILES {
+            return;
+        }
+        let (Ok(file_type), Ok(name)) = (entry.file_type(), entry.file_name().into_string()) else {
+            continue;
+        };
+        let relative = if prefix.is_empty() { name } else { format!("{prefix}/{name}") };
+        if file_type.is_dir() {
+            collect_material_files(&entry.path(), &relative, depth + 1, files);
+        } else {
+            files.push(relative);
+        }
+    }
 }
 
 impl ControlPlaneView {
@@ -288,6 +345,37 @@ impl ControlPlaneView {
             | ControlPlaneScreen::BomAndExport => {}
         }
         fields
+    }
+
+    /// The assistant's material directory for the selected project —
+    /// `<project root>/assistant-materials` — and the files in it right now.
+    /// The runtime may write collected material here while material collection
+    /// is enabled; `None` when no project is selected.
+    fn assistant_materials(&self) -> Option<AssistantMaterials> {
+        let (_, root) = self.current_project_context()?;
+        let directory = root.join("assistant-materials");
+        let mut files = Vec::new();
+        collect_material_files(&directory, "", 0, &mut files);
+        Some(AssistantMaterials { directory: directory.to_string_lossy().into_owned(), files })
+    }
+
+    /// Whether the assistant's saved runtime can act on material-collection
+    /// permissions (Codex via its sandbox, Claude Code via its tools).
+    fn assistant_material_runtime_supported(&self) -> bool {
+        let kind = self
+            .saved_settings
+            .assistant
+            .runtime
+            .unwrap_or(self.saved_settings.adapters.default_runtime);
+        matches!(
+            kind,
+            circuitfabric_codex_runtime::execution::AgentKind::Codex
+                | circuitfabric_codex_runtime::execution::AgentKind::Claude
+        )
+    }
+
+    fn assistant_collects_material(&self) -> bool {
+        self.navigation.selected_project.is_some() && self.assistant_material_runtime_supported()
     }
 
     /// Controls the assistant may press on the current screen; each maps to the
@@ -461,6 +549,7 @@ impl ControlPlaneView {
                 .into_iter()
                 .map(|(id, label)| SnapshotItem { id: id.into(), label: label.into() })
                 .collect(),
+            materials: self.assistant_materials(),
         }
     }
 
@@ -474,40 +563,87 @@ impl ControlPlaneView {
         let Some(settings) = self.settings_for_execution(cx) else {
             return;
         };
+        let (kind, settings) = settings.for_assistant();
         let language = self.language;
         let snapshot = self.assistant_snapshot(cx);
+        // Material collection: a folder inside the selected project's root the
+        // runtime may write into, offered only to runtimes that can act on it.
+        let workspace = self
+            .assistant_collects_material()
+            .then(|| {
+                snapshot.materials.as_ref().map(|materials| PathBuf::from(&materials.directory))
+            })
+            .flatten();
+        if let Some(directory) = &workspace
+            && let Err(error) = std::fs::create_dir_all(directory)
+        {
+            self.status = format!("资料目录创建失败，本次不收集资料：{error}");
+            cx.notify();
+            return;
+        }
+        let capabilities = if workspace.is_some() {
+            circuitfabric_codex_runtime::execution::TurnCapabilities::COLLECT_MATERIAL
+        } else {
+            circuitfabric_codex_runtime::execution::TurnCapabilities::default()
+        };
+        let prompt_materials = workspace.as_ref().and(snapshot.materials.clone());
         let history: Vec<Turn> = self
             .assistant
+            .sessions
+            .active()
             .messages
             .iter()
             .filter(|m| !m.pending && !m.text.is_empty())
             .map(|m| Turn { role: m.role, text: m.text.clone() })
             .collect();
-        let prompt =
-            build_prompt(&snapshot, &history, &request, language.choose("简体中文", "English"));
-        self.assistant.messages.push(AssistantMessage {
+        let prompt = build_prompt(
+            &snapshot,
+            &history,
+            &request,
+            language.choose("简体中文", "English"),
+            prompt_materials.as_ref(),
+        );
+        let run_session_id = self.assistant.sessions.active_id.clone();
+        // Sending bumps the conversation to the front of the picker.
+        self.assistant.sessions.move_to_front(&run_session_id);
+        let session = self.assistant.sessions.active_mut();
+        session.messages.push(AssistantMessage {
             role: Role::User,
             text: request,
+            reasoning: String::new(),
             context: snapshot.screen_label.clone(),
             pending: false,
             actions: Vec::new(),
             error: None,
+            reasoning_collapsed: false,
         });
-        self.assistant.messages.push(AssistantMessage {
+        // The topic summarizes the conversation once it has its first request.
+        if session.title.is_empty() {
+            session.title = derive_session_title(&session.messages);
+        }
+        session.messages.push(AssistantMessage {
             role: Role::Assistant,
             text: String::new(),
+            reasoning: String::new(),
             context: String::new(),
             pending: true,
             actions: Vec::new(),
             error: None,
+            reasoning_collapsed: false,
         });
         self.assistant.input.update(cx, |state, cx| state.set_value("", window, cx));
         let cancel = Cancellation::default();
         let stream = Arc::new(std::sync::Mutex::new(String::new()));
-        self.assistant.run = Some(AssistantRun { cancel: cancel.clone(), stream: stream.clone() });
+        let reasoning = Arc::new(std::sync::Mutex::new(String::new()));
+        self.assistant.run = Some(AssistantRun {
+            session_id: run_session_id.clone(),
+            cancel: cancel.clone(),
+            stream: stream.clone(),
+            reasoning: reasoning.clone(),
+        });
         let secrets = self.vault.as_ref().map(|vault| vault.values().clone());
         let writer = stream.clone();
-        let (kind, settings) = settings.for_assistant();
+        let reasoning_writer = reasoning.clone();
         let work = cx.background_spawn(async move {
             circuitfabric_codex_runtime::execution::run_task_streaming(
                 &settings,
@@ -515,13 +651,16 @@ impl ControlPlaneView {
                 &ToolAuthorizationSettings::default(),
                 &prompt,
                 None,
-                None,
+                workspace.as_deref(),
+                capabilities,
                 secrets.as_ref(),
                 &cancel,
                 &mut |kind, delta| {
-                    if kind == circuitfabric_codex_runtime::TurnDelta::Answer
-                        && let Ok(mut buffer) = writer.lock()
-                    {
+                    let target = match kind {
+                        circuitfabric_codex_runtime::TurnDelta::Answer => &writer,
+                        circuitfabric_codex_runtime::TurnDelta::Reasoning => &reasoning_writer,
+                    };
+                    if let Ok(mut buffer) = target.lock() {
                         buffer.push_str(delta);
                     }
                 },
@@ -541,16 +680,24 @@ impl ControlPlaneView {
                             if !Arc::ptr_eq(&run.stream, &repaint_stream) {
                                 return false;
                             }
+                            let session_id = run.session_id.clone();
                             let text = run
                                 .stream
                                 .lock()
                                 .map(|buffer| visible_stream_text(&buffer).to_owned())
                                 .unwrap_or_default();
-                            if let Some(last) = view.assistant.messages.last_mut()
+                            let thinking = run
+                                .reasoning
+                                .lock()
+                                .map(|buffer| buffer.clone())
+                                .unwrap_or_default();
+                            if let Some(session) = view.assistant.sessions.session_mut(&session_id)
+                                && let Some(last) = session.messages.last_mut()
                                 && last.pending
-                                && last.text != text
+                                && (last.text != text || last.reasoning != thinking)
                             {
                                 last.text = text;
+                                last.reasoning = thinking;
                                 cx.notify();
                             }
                             true
@@ -564,16 +711,26 @@ impl ControlPlaneView {
             }
         })
         .detach();
+        let completion_reasoning = reasoning;
         cx.spawn_in(window, async move |view, cx| {
             let result = work.await;
+            let final_reasoning =
+                completion_reasoning.lock().map(|buffer| buffer.clone()).unwrap_or_default();
             cx.update(|_, cx| {
                 view.update(cx, |view, cx| {
                     view.assistant.run = None;
                     let chinese = view.language == UiLanguage::SimplifiedChinese;
-                    if let Some(last) = view.assistant.messages.last_mut()
+                    if let Some(session) = view.assistant.sessions.session_mut(&run_session_id)
+                        && let Some(last) = session.messages.last_mut()
                         && last.pending
                     {
                         last.pending = false;
+                        if !final_reasoning.is_empty() {
+                            last.reasoning = final_reasoning;
+                        }
+                        // Streaming shows thinking expanded; the finished reply
+                        // tucks it away.
+                        last.reasoning_collapsed = true;
                         match result {
                             Ok(reply) => {
                                 let parsed = parse_reply(&reply);
@@ -610,10 +767,10 @@ impl ControlPlaneView {
         cx.notify();
     }
 
-    /// Writes the finished conversation to disk after every change; a failure is
-    /// surfaced in the status bar and the in-memory conversation is kept.
+    /// Writes every conversation to disk after each change; a failure is
+    /// surfaced in the status bar and the in-memory state is kept.
     fn persist_assistant(&mut self) {
-        if let Err(error) = save_history(&self.assistant.history_path, &self.assistant.messages) {
+        if let Err(error) = save_sessions(&self.assistant.history_path, &self.assistant.sessions) {
             self.status = format!("智能助手会话未保存：{error}");
         }
     }
@@ -625,12 +782,233 @@ impl ControlPlaneView {
         cx.notify();
     }
 
+    /// Switches the panel to another conversation. A streaming reply keeps
+    /// flowing into the session that started it, so switching never mixes
+    /// contexts.
+    fn switch_assistant_session(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.assistant.session_picker_open = false;
+        if !self.assistant.sessions.sessions.iter().any(|s| s.id == id) {
+            cx.notify();
+            return;
+        }
+        if self.assistant.sessions.active_id != id {
+            self.assistant.sessions.move_to_front(id);
+            id.clone_into(&mut self.assistant.sessions.active_id);
+            let count = self.assistant.sessions.active().messages.len();
+            self.assistant.list.reset(count);
+            self.assistant.input.update(cx, |state, cx| state.focus(window, cx));
+            self.persist_assistant();
+        }
+        cx.notify();
+    }
+
+    /// Starts a new, empty conversation and switches to it; an existing empty
+    /// draft is reused so they do not pile up.
+    fn new_assistant_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.assistant.sessions.active().messages.is_empty() {
+            self.assistant.session_picker_open = false;
+            cx.notify();
+            return;
+        }
+        let fresh_id = if let Some(draft) =
+            self.assistant.sessions.sessions.iter().find(|s| s.messages.is_empty())
+        {
+            draft.id.clone()
+        } else {
+            let session = AssistantSession::fresh(new_session_id());
+            let id = session.id.clone();
+            self.assistant.sessions.sessions.insert(0, session);
+            id
+        };
+        self.switch_assistant_session(&fresh_id, window, cx);
+    }
+
+    /// Deletes a conversation; the one a streaming reply belongs to is refused
+    /// until it finishes. Deleting the last conversation starts a fresh one.
+    fn delete_assistant_session(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.assistant.run.as_ref().is_some_and(|run| run.session_id == id) {
+            self.status = self.language.choose_owned(
+                "会话正在回复，无法删除".to_owned(),
+                "This conversation is replying and cannot be deleted".to_owned(),
+            );
+            cx.notify();
+            return;
+        }
+        let Some(index) = self.assistant.sessions.sessions.iter().position(|s| s.id == id) else {
+            return;
+        };
+        let was_active = self.assistant.sessions.active_id == id;
+        self.assistant.sessions.sessions.remove(index);
+        if self.assistant.sessions.sessions.is_empty() {
+            let session = AssistantSession::fresh(new_session_id());
+            self.assistant.sessions.active_id.clone_from(&session.id);
+            self.assistant.sessions.sessions.push(session);
+        } else if was_active {
+            let neighbor = index.min(self.assistant.sessions.sessions.len() - 1);
+            let neighbor_id = self.assistant.sessions.sessions[neighbor].id.clone();
+            self.assistant.sessions.active_id = neighbor_id;
+        }
+        if was_active {
+            let count = self.assistant.sessions.active().messages.len();
+            self.assistant.list.reset(count);
+        }
+        self.persist_assistant();
+        cx.notify();
+    }
+
     fn clear_assistant(&mut self, cx: &mut Context<Self>) {
         if self.assistant.run.is_none() {
-            self.assistant.messages.clear();
+            let session = self.assistant.sessions.active_mut();
+            session.messages.clear();
+            session.title.clear();
+            self.assistant.list.reset(0);
             self.persist_assistant();
             cx.notify();
         }
+    }
+
+    fn toggle_assistant_reasoning(&mut self, message: usize, cx: &mut Context<Self>) {
+        if let Some(message) = self.assistant.sessions.active_mut().messages.get_mut(message) {
+            message.reasoning_collapsed = !message.reasoning_collapsed;
+            cx.notify();
+        }
+    }
+
+    /// Copies an on-disk file into managed storage and refreshes the project —
+    /// the shared core of every assistant import path.
+    fn assistant_import_file(
+        &mut self,
+        source: &std::path::Path,
+        category: ImportCategory,
+        cx: &mut Context<Self>,
+    ) -> Result<String, String> {
+        let Some((project_id, _)) = self.current_project_context() else {
+            return Err("项目根目录未打开".to_owned());
+        };
+        let Some(storage) = self.project_storages.get(&project_id).cloned() else {
+            return Err("项目根目录未打开".to_owned());
+        };
+        let document_category = match category {
+            ImportCategory::Datasheet => DocumentCategory::Datasheet,
+            ImportCategory::ReferenceDesign => DocumentCategory::ReferenceDesign,
+        };
+        let imported = self
+            .workspace
+            .import_project_document(&project_id, &storage, source, document_category)
+            .map_err(|error| error.to_string())?;
+        let document = &imported.document;
+        if !imported.created {
+            return Ok(format!(
+                "`{}` 已导入过（{}），未新增记录",
+                document.original_file_name, document.id
+            ));
+        }
+        self.refresh_project_data(&project_id)
+            .map_err(|error| format!("文档已导入，但列表未刷新：{error}"))?;
+        self.schedule_pdf_indexing(&project_id, cx);
+        self.refresh_evidence_search(cx);
+        Ok(format!("已导入 `{}`（{}）", document.original_file_name, document.id))
+    }
+
+    /// Runs an import the assistant proposed: the same copy-into-storage,
+    /// listing refresh and PDF indexing as the document screen's import
+    /// button, but from a file the runtime already collected.
+    fn assistant_import_collected(
+        &mut self,
+        snapshot: &ScreenSnapshot,
+        path: &str,
+        category: ImportCategory,
+        cx: &mut Context<Self>,
+    ) -> Result<String, String> {
+        let directory = snapshot
+            .materials
+            .as_ref()
+            .map(|materials| PathBuf::from(&materials.directory))
+            .ok_or_else(|| "未选择项目，不能导入收集的文档".to_owned())?;
+        self.assistant_import_file(&directory.join(path), category, cx)
+    }
+
+    /// Starts a confirmed download: the card moves to Running, the fetch and
+    /// optional import run off the UI thread, and the completion handler
+    /// writes the final Done/Failed status into the proposing message.
+    #[allow(clippy::too_many_arguments)]
+    fn assistant_fetch_document(
+        &mut self,
+        snapshot: &ScreenSnapshot,
+        message: usize,
+        index: usize,
+        url: &str,
+        file_name: &str,
+        category: Option<ImportCategory>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let directory = snapshot
+            .materials
+            .as_ref()
+            .map(|materials| PathBuf::from(&materials.directory))
+            .unwrap_or_default();
+        let url = url.trim().to_owned();
+        let file_name = file_name.to_owned();
+        let session_id = self.assistant.sessions.active_id.clone();
+        let project_open = self.current_project_context().is_some();
+        let language = self.language;
+        if let Some(proposed) = self
+            .assistant
+            .sessions
+            .active_mut()
+            .messages
+            .get_mut(message)
+            .and_then(|m| m.actions.get_mut(index))
+        {
+            proposed.status =
+                ActionStatus::Running(self.language.choose("正在下载…", "Downloading…").to_owned());
+        }
+        cx.spawn_in(window, async move |view, cx| {
+            let fetched = cx
+                .background_spawn(async move {
+                    circuitfabric_codex_runtime::models::fetch_url_bytes(&url)
+                        .map_err(|error| error.to_string())
+                })
+                .await;
+            cx.update(|_, cx| {
+                view.update(cx, |view, cx| {
+                    let outcome = fetched.and_then(|bytes| {
+                        let target = directory.join(&file_name);
+                        std::fs::write(&target, bytes)
+                            .map_err(|error| format!("写入失败：{error}"))?;
+                        let size_kb =
+                            std::fs::metadata(&target).map_or(0, |meta| meta.len() / 1024);
+                        match category {
+                            Some(category) if project_open => {
+                                view.assistant_import_file(&target, category, cx)
+                            }
+                            _ => Ok(language.choose_owned(
+                                format!("已下载 `{file_name}`（{size_kb} KB）"),
+                                format!("Downloaded `{file_name}` ({size_kb} KB)"),
+                            )),
+                        }
+                    });
+                    let Some(session) = view.assistant.sessions.session_mut(&session_id) else {
+                        return;
+                    };
+                    if let Some(proposed) =
+                        session.messages.get_mut(message).and_then(|m| m.actions.get_mut(index))
+                        && let ActionStatus::Running(_) = proposed.status
+                    {
+                        proposed.status = match outcome {
+                            Ok(text) => ActionStatus::Done(text),
+                            Err(error) => ActionStatus::Failed(error),
+                        };
+                    }
+                    view.persist_assistant();
+                    cx.notify();
+                })
+                .ok();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Runs one proposed action after re-validating it against the screen as it is now.
@@ -643,6 +1021,8 @@ impl ControlPlaneView {
     ) -> bool {
         let Some(proposed) = self
             .assistant
+            .sessions
+            .active()
             .messages
             .get(message)
             .and_then(|m| m.actions.get(index))
@@ -652,43 +1032,73 @@ impl ControlPlaneView {
         };
         let action = proposed.action.clone();
         let snapshot = self.assistant_snapshot(cx);
-        let outcome = action.validate(&snapshot).map(|()| {
-            match &action {
-                AssistantAction::Navigate { screen } => {
-                    if let Some(target) =
-                        ControlPlaneScreen::ALL.into_iter().find(|s| s.slug() == screen)
-                    {
-                        self.navigation.screen = target;
-                    }
-                }
-                AssistantAction::SelectProject { project } => {
-                    self.select_project(project.clone(), cx);
-                }
-                AssistantAction::SetInput { field, value } => {
-                    if let Some((_, _, state)) =
-                        self.assistant_fields().into_iter().find(|(id, _, _)| id == field)
-                    {
-                        state.update(cx, |state, cx| state.set_value(value.clone(), window, cx));
-                    }
-                }
-                AssistantAction::Press { control } => {
-                    self.press_assistant_control(control, window, cx);
-                }
-                AssistantAction::SetTheme { theme } => {
-                    let theme = match theme.as_str() {
-                        "light" => GlobalTheme::Light,
-                        "system" => GlobalTheme::System,
-                        _ => GlobalTheme::Dark,
-                    };
-                    self.set_global_theme(theme, cx);
-                }
-                AssistantAction::ToggleLanguage => self.toggle_global_language(cx),
+        let outcome = if let AssistantAction::ImportDocument { path, category } = &action {
+            action
+                .validate(&snapshot)
+                .and_then(|()| self.assistant_import_collected(&snapshot, path, *category, cx))
+        } else if let AssistantAction::FetchDocument { url, file_name, category } = &action {
+            if let Err(error) = action.validate(&snapshot) {
+                Err(error)
+            } else {
+                self.assistant_fetch_document(
+                    &snapshot, message, index, url, file_name, *category, window, cx,
+                );
+                // The helper moved the card to Running and owns its
+                // completion; the generic status write below must not
+                // overwrite it.
+                self.persist_assistant();
+                cx.notify();
+                return true;
             }
-            self.language.choose("已执行", "Done").to_owned()
-        });
+        } else {
+            action.validate(&snapshot).map(|()| {
+                match &action {
+                    AssistantAction::Navigate { screen } => {
+                        if let Some(target) =
+                            ControlPlaneScreen::ALL.into_iter().find(|s| s.slug() == screen)
+                        {
+                            self.navigation.screen = target;
+                        }
+                    }
+                    AssistantAction::SelectProject { project } => {
+                        self.select_project(project.clone(), cx);
+                    }
+                    AssistantAction::SetInput { field, value } => {
+                        if let Some((_, _, state)) =
+                            self.assistant_fields().into_iter().find(|(id, _, _)| id == field)
+                        {
+                            state.update(cx, |state, cx| {
+                                state.set_value(value.clone(), window, cx);
+                            });
+                        }
+                    }
+                    AssistantAction::Press { control } => {
+                        self.press_assistant_control(control, window, cx);
+                    }
+                    AssistantAction::SetTheme { theme } => {
+                        let theme = match theme.as_str() {
+                            "light" => GlobalTheme::Light,
+                            "system" => GlobalTheme::System,
+                            _ => GlobalTheme::Dark,
+                        };
+                        self.set_global_theme(theme, cx);
+                    }
+                    AssistantAction::ToggleLanguage => self.toggle_global_language(cx),
+                    // Routed through their own handlers above.
+                    AssistantAction::ImportDocument { .. }
+                    | AssistantAction::FetchDocument { .. } => {}
+                }
+                self.language.choose("已执行", "Done").to_owned()
+            })
+        };
         let ok = outcome.is_ok();
-        if let Some(proposed) =
-            self.assistant.messages.get_mut(message).and_then(|m| m.actions.get_mut(index))
+        if let Some(proposed) = self
+            .assistant
+            .sessions
+            .active_mut()
+            .messages
+            .get_mut(message)
+            .and_then(|m| m.actions.get_mut(index))
         {
             proposed.status = match outcome {
                 Ok(text) => ActionStatus::Done(text),
@@ -706,10 +1116,11 @@ impl ControlPlaneView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let count = self.assistant.messages.get(message).map_or(0, |m| m.actions.len());
+        let count =
+            self.assistant.sessions.active().messages.get(message).map_or(0, |m| m.actions.len());
         for index in 0..count {
-            let pending =
-                self.assistant.messages[message].actions[index].status == ActionStatus::Pending;
+            let pending = self.assistant.sessions.active().messages[message].actions[index].status
+                == ActionStatus::Pending;
             if pending && !self.run_assistant_action(message, index, window, cx) {
                 break;
             }
@@ -717,8 +1128,13 @@ impl ControlPlaneView {
     }
 
     fn skip_assistant_action(&mut self, message: usize, index: usize, cx: &mut Context<Self>) {
-        if let Some(proposed) =
-            self.assistant.messages.get_mut(message).and_then(|m| m.actions.get_mut(index))
+        if let Some(proposed) = self
+            .assistant
+            .sessions
+            .active_mut()
+            .messages
+            .get_mut(message)
+            .and_then(|m| m.actions.get_mut(index))
             && proposed.status == ActionStatus::Pending
         {
             proposed.status = ActionStatus::Skipped;
@@ -795,7 +1211,13 @@ impl ControlPlaneView {
         let entity = cx.entity().clone();
         let busy = self.assistant.run.is_some();
         let screen_label = language.screen_label(self.navigation.screen);
-        let messages = std::rc::Rc::new(self.assistant.messages.clone());
+        let project_selected = self.navigation.selected_project.is_some();
+        let collecting = self.assistant_collects_material();
+        // A selected project but a runtime without collection tools: tell the
+        // user why the assistant will answer "I cannot fetch" instead.
+        let collecting_unavailable =
+            project_selected && !self.assistant_material_runtime_supported();
+        let messages = std::rc::Rc::new(self.assistant.sessions.active().messages.clone());
         let list = self.assistant.list.clone();
         if list.item_count() != messages.len() {
             list.reset(messages.len());
@@ -828,6 +1250,46 @@ impl ControlPlaneView {
             );
         }
 
+        // The header title is the session picker: current topic plus a caret.
+        let session_title = self.assistant.sessions.active().title.clone();
+        let trigger_label = if session_title.is_empty() {
+            language.choose("新会话", "New chat").to_owned()
+        } else {
+            clip_text(&session_title, 12)
+        };
+        let trigger_tooltip = if session_title.is_empty() {
+            language.choose("新会话 · 点击切换会话", "New chat · click to switch").to_owned()
+        } else {
+            session_title.clone()
+        };
+        let picker_entity = entity.clone();
+        let session_picker = gpui_component::popover::Popover::new("assistant-session-selector")
+            // The header sits at the panel's top on every dock, so the popup
+            // always opens into the panel, below the trigger.
+            .anchor(gpui::Anchor::TopLeft)
+            .open(self.assistant.session_picker_open)
+            .on_open_change({
+                let entity = entity.clone();
+                move |open, _, cx| {
+                    entity.update(cx, |view, cx| {
+                        view.assistant.session_picker_open = *open;
+                        cx.notify();
+                    });
+                }
+            })
+            .trigger(
+                Button::new("assistant-session-selector-trigger")
+                    .debug_selector(|| "assistant-session-selector-trigger".into())
+                    .ghost()
+                    .xsmall()
+                    .label(trigger_label)
+                    .dropdown_caret(true)
+                    .tooltip(trigger_tooltip),
+            )
+            .content(move |_, _, cx| {
+                picker_entity.read(cx).render_assistant_session_panel(&picker_entity)
+            });
+
         let header = div()
             .flex_none()
             .flex()
@@ -859,9 +1321,15 @@ impl ControlPlaneView {
                     .flex_1()
                     .min_w(px(0.))
                     .v_flex()
-                    .child(div().truncate().text_sm().font_weight(FontWeight::SEMIBOLD).child(
-                        language.choose("CircuitFabric 智能助手", "CircuitFabric Assistant"),
-                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .min_w(px(0.))
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(session_picker),
+                    )
                     .child(
                         div()
                             .flex()
@@ -941,6 +1409,7 @@ impl ControlPlaneView {
             }
             div()
                 .id("assistant-empty-state")
+                .debug_selector(|| "assistant-empty-state".into())
                 .flex_1()
                 .min_h(px(0.))
                 .v_flex()
@@ -970,12 +1439,31 @@ impl ControlPlaneView {
         } else {
             let render_messages = messages.clone();
             let item_entity = entity.clone();
+            let text_focus = self.assistant.text_focus.clone();
             div()
                 .flex_1()
                 .min_h(px(0.))
                 .relative()
                 .overflow_hidden()
                 .py_2()
+                // Clicking or drag-selecting a message moves focus off the composer;
+                // otherwise the composer's own Copy handler swallows Ctrl+C and the
+                // selected message text never reaches the clipboard.
+                .track_focus(&text_focus)
+                .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                    window.focus(&text_focus, cx);
+                })
+                // Selectable text repaints only when a frame is drawn. Without
+                // this the drag highlight appears only after the next unrelated
+                // repaint — for example once the whole window is switched away.
+                .on_mouse_move(|event, window, _| {
+                    if event.pressed_button == Some(MouseButton::Left) {
+                        window.refresh();
+                    }
+                })
+                .on_mouse_up(MouseButton::Left, |_, window, _| {
+                    window.refresh();
+                })
                 .child(
                     gpui::list(list.clone(), move |ix, _, _| {
                         assistant_message_element(&render_messages[ix], ix, language, &item_entity)
@@ -995,53 +1483,53 @@ impl ControlPlaneView {
             cx,
         ));
         let composer = div()
-                    .debug_selector(|| "assistant-composer".into())
-                    .flex()
-                    .items_end()
-                    .gap_2()
-                    .pl_3()
-                    .pr_1()
+            .debug_selector(|| "assistant-composer".into())
+            .flex()
+            .items_end()
+            .gap_2()
+            .pl_3()
+            .pr_1()
+            .py_1p5()
+            .min_h(px(44.))
+            .rounded_xl()
+            .border_1()
+            .border_color(rgb_alpha(ACCENT, 0.45))
+            .bg(rgb(SURFACE_BG))
+            .child(
+                InputBase::new("assistant-input")
+                    .flex_1()
+                    .min_w(px(0.))
                     .py_1p5()
-                    .min_h(px(44.))
-                    .rounded_xl()
-                    .border_1()
-                    .border_color(rgb_alpha(ACCENT, 0.45))
-                    .bg(rgb(SURFACE_BG))
-                    .child(
-                        InputBase::new("assistant-input")
-                            .flex_1()
-                            .min_w(px(0.))
-                            .py_1p5()
-                            .text_sm()
-                            .child(self.assistant.input.clone()),
-                    )
-                    // `action_button` pins itself to the start of the cross axis;
-                    // keep it on the last line as the input grows.
-                    .child(if busy {
-                        action_button("assistant-stop")
-                            .self_end()
-                            .icon(IconName::Square)
-                            .tooltip(language.choose("停止", "Stop"))
-                            .on_click({
-                                let entity = entity.clone();
-                                move |_, _, cx| entity.update(cx, Self::stop_assistant)
-                            })
-                    } else {
-                        action_button("assistant-send")
-                            .self_end()
-                            .primary()
-                            .icon(IconName::ArrowUp)
-                            .disabled(empty)
-                            .tooltip(language.choose("发送（Enter）", "Send (Enter)"))
-                            .on_click({
-                                let entity = entity.clone();
-                                move |_, window, cx| {
-                                    entity.update(cx, |view, cx| {
-                                        view.send_assistant_message(window, cx);
-                                    });
-                                }
-                            })
-                    });
+                    .text_sm()
+                    .child(self.assistant.input.clone()),
+            )
+            // `action_button` pins itself to the start of the cross axis;
+            // keep it on the last line as the input grows.
+            .child(if busy {
+                action_button("assistant-stop")
+                    .self_end()
+                    .icon(IconName::Square)
+                    .tooltip(language.choose("停止", "Stop"))
+                    .on_click({
+                        let entity = entity.clone();
+                        move |_, _, cx| entity.update(cx, Self::stop_assistant)
+                    })
+            } else {
+                action_button("assistant-send")
+                    .self_end()
+                    .primary()
+                    .icon(IconName::ArrowUp)
+                    .disabled(empty)
+                    .tooltip(language.choose("发送（Enter）", "Send (Enter)"))
+                    .on_click({
+                        let entity = entity.clone();
+                        move |_, window, cx| {
+                            entity.update(cx, |view, cx| {
+                                view.send_assistant_message(window, cx);
+                            });
+                        }
+                    })
+            });
         let footer = div()
             .flex_none()
             .v_flex()
@@ -1059,12 +1547,28 @@ impl ControlPlaneView {
                     .text_xs()
                     .text_color(rgb(TEXT_MUTED))
                     .child(Icon::new(IconName::Eye).xsmall())
-                    .child(language.choose_owned(
-                        format!("上下文：{screen_label} · 界面快照随消息发送"),
-                        format!(
-                            "Context: {screen_label} · screen snapshot is sent with each message"
-                        ),
-                    )),
+                    .child(div().truncate().child(language.choose_owned(
+                        match (collecting, collecting_unavailable) {
+                            (true, _) => format!(
+                                "上下文：{screen_label} · 界面快照随消息发送 · 可联网收集资料到 assistant-materials"
+                            ),
+                            (_, true) => format!(
+                                "上下文：{screen_label} · 当前运行时不支持联网收集（Codex / Claude Code 支持）"
+                            ),
+                            _ => format!("上下文：{screen_label} · 界面快照随消息发送"),
+                        },
+                        match (collecting, collecting_unavailable) {
+                            (true, _) => format!(
+                                "Context: {screen_label} · snapshot per message · web collection into assistant-materials"
+                            ),
+                            (_, true) => format!(
+                                "Context: {screen_label} · this runtime cannot collect from the web (Codex / Claude Code can)"
+                            ),
+                            _ => format!(
+                                "Context: {screen_label} · screen snapshot is sent with each message"
+                            ),
+                        },
+                    ))),
             )
             .map(|footer| {
                 if dock.is_horizontal_edge() {
@@ -1170,6 +1674,133 @@ impl ControlPlaneView {
             )
             .child(resize_handle)
     }
+
+    /// The session picker popup: every conversation, most recently used first,
+    /// each with its topic, plus new and delete.
+    fn render_assistant_session_panel(&self, entity: &Entity<Self>) -> Div {
+        let language = self.language;
+        let active_id = self.assistant.sessions.active_id.clone();
+        let streaming_id = self.assistant.run.as_ref().map(|run| run.session_id.clone());
+        let mut list = div()
+            .id("assistant-session-list")
+            .max_h(px(300.))
+            .overflow_y_scroll()
+            .v_flex()
+            .gap_0p5();
+        for (index, session) in self.assistant.sessions.sessions.iter().enumerate() {
+            let active = session.id == active_id;
+            let streaming = streaming_id.as_deref() == Some(session.id.as_str());
+            list = list
+                .child(assistant_session_row(language, entity, index, session, active, streaming));
+        }
+        div()
+            .debug_selector(|| "assistant-session-panel".into())
+            .w(px(280.))
+            .v_flex()
+            .gap_2()
+            .child(
+                action_button("assistant-session-new")
+                    .primary()
+                    .compact()
+                    .icon(IconName::Plus)
+                    .label(language.choose("新建会话", "New conversation"))
+                    .on_click({
+                        let entity = entity.clone();
+                        move |_, window, cx| {
+                            entity.update(cx, |view, cx| {
+                                view.new_assistant_session(window, cx);
+                            });
+                        }
+                    }),
+            )
+            .child(list)
+    }
+}
+
+/// One conversation row of the session picker: topic, message count, and a
+/// delete action — hidden while the session streams a reply.
+fn assistant_session_row(
+    language: UiLanguage,
+    entity: &Entity<ControlPlaneView>,
+    index: usize,
+    session: &AssistantSession,
+    active: bool,
+    streaming: bool,
+) -> gpui::Stateful<Div> {
+    let switcher = entity.clone();
+    let id = session.id.clone();
+    let title = if session.title.is_empty() {
+        language.choose("新会话", "New chat").to_owned()
+    } else {
+        session.title.clone()
+    };
+    let meta = if streaming {
+        language.choose("正在回复…", "Replying…").to_owned()
+    } else if session.messages.is_empty() {
+        language.choose("空会话", "Empty").to_owned()
+    } else {
+        language.choose_owned(
+            format!("{} 条消息", session.messages.len()),
+            format!("{} messages", session.messages.len()),
+        )
+    };
+    let row_selector = format!("assistant-session-item-{index}");
+    let mut row = div()
+        .id(gpui::ElementId::Name(row_selector.clone().into()))
+        .debug_selector(move || row_selector.clone())
+        .flex()
+        .items_center()
+        .gap_2()
+        .px_2()
+        .py_1p5()
+        .rounded_md()
+        .cursor_pointer()
+        .when(active, |this| this.bg(rgb(0x00f0_f9ff)).text_color(rgb(ACCENT)))
+        .hover(|this| this.bg(rgb(SURFACE_BG)))
+        .on_click(move |_, window, cx| {
+            switcher.update(cx, |view, cx| view.switch_assistant_session(&id, window, cx));
+        })
+        .child(
+            div()
+                .flex_none()
+                .text_color(if active { rgb(ACCENT) } else { rgb(TEXT_MUTED) })
+                // The conversations icon is embedded with the app assets, not
+                // the component bundle.
+                .child(Icon::default().path("icons/messages-square.svg").xsmall()),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .v_flex()
+                .child(
+                    div()
+                        .truncate()
+                        .text_sm()
+                        .font_weight(if active { FontWeight::SEMIBOLD } else { FontWeight::NORMAL })
+                        .child(title),
+                )
+                .child(div().truncate().text_xs().text_color(rgb(TEXT_MUTED)).child(meta)),
+        );
+    if !streaming {
+        let entity = entity.clone();
+        let delete_id = session.id.clone();
+        row = row.child(
+            action_button(format!("assistant-session-delete-{index}"))
+                .ghost()
+                .compact()
+                .icon(IconName::Delete)
+                .tooltip(language.choose("删除会话", "Delete conversation"))
+                .on_click(move |_, _, cx| {
+                    // Without this the row's switch handler fires too.
+                    cx.stop_propagation();
+                    entity.update(cx, |view, cx| {
+                        view.delete_assistant_session(&delete_id, cx);
+                    });
+                }),
+        );
+    }
+    row
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1181,6 +1812,7 @@ fn assistant_message_element(
 ) -> AnyElement {
     let user = message.role == Role::User;
     let mut bubble = div()
+        .debug_selector(move || format!("assistant-message-bubble-{message_index}"))
         .max_w(gpui::relative(0.88))
         .v_flex()
         .gap_1p5()
@@ -1201,6 +1833,51 @@ fn assistant_message_element(
     } else {
         bubble.bg(rgb(SURFACE_BG)).border_1().border_color(rgb(BORDER))
     };
+    if !message.reasoning.is_empty() {
+        let collapsed = message.reasoning_collapsed;
+        let toggler = entity.clone();
+        let mut block = div().w_full().v_flex().gap_1().child(
+            div()
+                .id(("assistant-reasoning-toggle", message_index))
+                .debug_selector(move || format!("assistant-reasoning-toggle-{message_index}"))
+                .flex()
+                .items_center()
+                .gap_1()
+                .text_xs()
+                .text_color(rgb(TEXT_MUTED))
+                .cursor_pointer()
+                .child(
+                    Icon::new(if collapsed {
+                        IconName::ChevronRight
+                    } else {
+                        IconName::ChevronDown
+                    })
+                    .xsmall(),
+                )
+                .child(language.choose("思考过程", "Thinking"))
+                .on_click(move |_, _, cx| {
+                    toggler.update(cx, |view, cx| {
+                        view.toggle_assistant_reasoning(message_index, cx);
+                    });
+                }),
+        );
+        if !collapsed {
+            block = block.child(
+                div()
+                    .id(("assistant-reasoning-scroll", message_index))
+                    .debug_selector(move || format!("assistant-reasoning-{message_index}"))
+                    .w_full()
+                    .max_h(px(112.))
+                    .scroll_y()
+                    .cursor(gpui::CursorStyle::IBeam)
+                    .child(gpui_base::SelectableText::new(
+                        ("assistant-reasoning-text", message_index),
+                        message.reasoning.clone(),
+                    )),
+            );
+        }
+        bubble = bubble.child(block);
+    }
     if message.pending && message.text.is_empty() {
         bubble = bubble.child(
             div()
@@ -1212,14 +1889,40 @@ fn assistant_message_element(
                 .child(language.choose("正在分析当前界面…", "Analyzing the current screen…")),
         );
     } else if !message.text.is_empty() {
-        bubble = bubble.child(gpui_base::SelectableText::new(
-            ("assistant-message", message_index),
-            message.text.clone(),
+        bubble = bubble.child(div().cursor(gpui::CursorStyle::IBeam).child(
+            gpui_base::SelectableText::new(
+                ("assistant-message", message_index),
+                message.text.clone(),
+            ),
         ));
     }
     if let Some(error) = &message.error {
         bubble = bubble.child(
             div().text_xs().text_color(rgb(0x00dc_2626)).whitespace_normal().child(error.clone()),
+        );
+    }
+    // A guaranteed copy path that never depends on focus or selection state.
+    if !message.pending && !message.text.is_empty() {
+        let copier = entity.clone();
+        let copied_text = message.text.clone();
+        bubble = bubble.child(
+            div().flex().justify_end().pt_0p5().child(
+                action_button(("assistant-copy", message_index))
+                    .ghost()
+                    .compact()
+                    .icon(IconName::Copy)
+                    .tooltip(language.choose("复制本条消息", "Copy this message"))
+                    .on_click(move |_, _, cx| {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(copied_text.clone()));
+                        copier.update(cx, |view, cx| {
+                            view.status = view.language.choose_owned(
+                                "已复制该消息".to_owned(),
+                                "Message copied".to_owned(),
+                            );
+                            cx.notify();
+                        });
+                    }),
+            ),
         );
     }
     let pending_count =
@@ -1256,6 +1959,7 @@ fn assistant_message_element(
         for (index, proposed) in message.actions.iter().enumerate() {
             let (badge, color) = match &proposed.status {
                 ActionStatus::Pending => (String::new(), ACCENT),
+                ActionStatus::Running(text) => (text.clone(), ACCENT),
                 ActionStatus::Done(text) => (text.clone(), 0x0016_a34a),
                 ActionStatus::Failed(error) => (error.clone(), 0x00dc_2626),
                 ActionStatus::Skipped => {

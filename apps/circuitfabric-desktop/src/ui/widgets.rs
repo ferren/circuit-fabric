@@ -117,31 +117,27 @@ pub(super) fn labeled_field(
         .min_w(px(240.))
         .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(label))
         .child(
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(
-                    div()
-                        .h(px(36.))
-                        .px_2()
-                        .flex()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .items_center()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(rgb(BORDER))
-                        .bg(rgb(CARD_BG))
-                        .child(
-                            InputBase::new(id)
-                                .flex_1()
-                                .h_full()
-                                .flex()
-                                .items_center()
-                                .child(state.clone()),
-                        ),
-                ),
+            div().flex().items_center().gap_2().child(
+                div()
+                    .h(px(36.))
+                    .px_2()
+                    .flex()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .items_center()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .bg(rgb(CARD_BG))
+                    .child(
+                        InputBase::new(id)
+                            .flex_1()
+                            .h_full()
+                            .flex()
+                            .items_center()
+                            .child(state.clone()),
+                    ),
+            ),
         )
         .when_some(hint, |this, hint| {
             this.child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(hint))

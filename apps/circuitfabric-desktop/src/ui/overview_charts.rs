@@ -81,7 +81,7 @@ pub(super) fn fact_chart(model: &OverviewModel, language: UiLanguage) -> Div {
         "{} · {} {} · {} {}",
         scope(model, language),
         model.fact_projects,
-        language.choose("个唯一谱系末端快照", "unique lineage-tip snapshots"),
+        language.choose("个时间线当前快照", "current timeline snapshots"),
         model.ambiguous_projects,
         language.choose("项目当前快照不明确", "projects with ambiguous current snapshot")
     )))

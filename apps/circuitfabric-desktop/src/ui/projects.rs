@@ -224,6 +224,7 @@ impl ControlPlaneView {
                     conversation,
                     conversation_list,
                     conversation_at_end: std::rc::Rc::new(std::cell::Cell::new(true)),
+                    reasoning_collapsed: std::collections::BTreeSet::new(),
                     followup_prompt: None,
                     followup_unavailable,
                     datasheet,

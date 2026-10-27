@@ -37,7 +37,8 @@ pub(super) enum RuntimeAdapter {
 }
 
 impl RuntimeAdapter {
-    pub(super) const ALL: [Self; 4] = [Self::CodexAppServer, Self::ClaudeCode, Self::Dsh, Self::KimiCode];
+    pub(super) const ALL: [Self; 4] =
+        [Self::CodexAppServer, Self::ClaudeCode, Self::Dsh, Self::KimiCode];
 
     pub(super) const fn agent_kind(self) -> circuitfabric_codex_runtime::execution::AgentKind {
         use circuitfabric_codex_runtime::execution::AgentKind;
@@ -439,6 +440,8 @@ pub(super) struct SessionReplaySelection {
     pub(super) conversation_base: std::rc::Rc<Vec<super::session_markdown::ConversationRow>>,
     pub(super) conversation_list: gpui::ListState,
     pub(super) conversation_at_end: std::rc::Rc<std::cell::Cell<bool>>,
+    /// Reasoning rows the user folded away, by conversation row index.
+    pub(super) reasoning_collapsed: std::collections::BTreeSet<usize>,
     pub(super) followup_prompt: Option<Entity<gpui_component::input::TextareaState>>,
     pub(super) followup_unavailable: Option<String>,
     pub(super) datasheet: Option<DatasheetExtraction>,
@@ -715,7 +718,8 @@ pub(super) struct ControlPlaneView {
     /// provider detail pane can badge account-direct providers whose selected
     /// model reports vision support. Populated by editor fetches and by the
     /// startup prefetch of direct providers; keyed by provider id.
-    pub(super) model_catalogs: BTreeMap<String, Vec<circuitfabric_codex_runtime::models::ModelChoice>>,
+    pub(super) model_catalogs:
+        BTreeMap<String, Vec<circuitfabric_codex_runtime::models::ModelChoice>>,
     /// Catalog fetches the assistant's model selector started for saved
     /// providers: `None` while running, `Some(error)` once failed (not retried
     /// until the app restarts or the provider editor fetches it).

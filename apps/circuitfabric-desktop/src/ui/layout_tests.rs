@@ -14,6 +14,99 @@ use std::{
 };
 
 static NEXT_PROFILE: AtomicU64 = AtomicU64::new(0);
+
+#[gpui::test]
+fn materialization_states_are_visible_on_changes_sessions_and_eda_pages(cx: &mut TestAppContext) {
+    use circuitfabric_contracts::Project;
+    use circuitfabric_project::{
+        ChangeSetAuditEntry, ChangeSetStage, ChangeSetStageStatus as Status, ProjectStorage,
+        StoredChangeSet,
+    };
+    let profile = Profile::new();
+    let root = profile.0.join("project");
+    std::fs::create_dir_all(&root).unwrap();
+    let store = ProjectStorage::create(
+        &root,
+        Project { id: "p".into(), name: "测试".into(), description: None },
+    )
+    .unwrap();
+    let mut record = StoredChangeSet {
+        schema_version: 1,
+        id: "cs".into(),
+        base_snapshot_hash: "base".into(),
+        target_snapshot_hash: "target".into(),
+        plan_hash: "plan".into(),
+        ir_diff: vec![],
+        evidence: vec![],
+        preview_validation: Default::default(),
+        execution: Default::default(),
+        observed_snapshot_hash: None,
+        rollback_handle: Some("handle".into()),
+        audit: vec![],
+    };
+    record.execution.write =
+        ChangeSetStage { status: Status::Passed, detail: "已确认写入".into() };
+    record.execution.readback =
+        ChangeSetStage { status: Status::Inconclusive, detail: "回读缺失".into() };
+    record.execution.verification =
+        ChangeSetStage { status: Status::Inconclusive, detail: "尚无法判定".into() };
+    store.save_change_set(&record).unwrap();
+    let (view, cx) = mount_profile(cx, &profile, ControlPlaneScreen::ChangesAndApprovals);
+    cx.simulate_resize(gpui::size(px(1600.), px(1000.)));
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            crate::application::project_data::attach_project_storage(
+                &mut view.workspace,
+                &mut view.project_storages,
+                &mut view.project_data,
+                store,
+            )
+            .unwrap();
+            view.navigation.selected_project = Some("p".into());
+            cx.notify();
+        })
+    });
+    for status in ["inconclusive", "verified", "cancelled", "rollback_executed"] {
+        if status == "verified" {
+            record.execution.readback.status = Status::Passed;
+            record.execution.verification.status = Status::Passed;
+        }
+        if status == "cancelled" || status == "rollback_executed" {
+            record.audit.push(ChangeSetAuditEntry {
+                timestamp_unix_seconds: 1,
+                actor: "bridge".into(),
+                decision: status.into(),
+                reason: "验收".into(),
+                observed_snapshot_hash: None,
+                rollback_handle: Some("handle".into()),
+            });
+        }
+        ProjectStorage::open(&root).unwrap().save_change_set(&record).unwrap();
+        cx.update(|_, cx| view.update(cx, |view, _| view.refresh_project_data("p").unwrap()));
+        for (surface, screen) in [
+            ("changes", ControlPlaneScreen::ChangesAndApprovals),
+            ("sessions", ControlPlaneScreen::SessionsAndTasks),
+            ("eda", ControlPlaneScreen::EdaServices),
+        ] {
+            cx.update(|_, cx| {
+                view.update(cx, |view, cx| {
+                    view.navigation.screen = screen;
+                    cx.notify();
+                })
+            });
+            draw(cx);
+            let selector: &'static str =
+                Box::leak(format!("materialization-{surface}-cs-{status}").into_boxed_str());
+            assert!(cx.debug_bounds(selector).is_some(), "{surface} must show {status}");
+            if status == "inconclusive" {
+                let selector: &'static str =
+                    Box::leak(format!("materialization-{surface}-cs-verified").into_boxed_str());
+                assert!(cx.debug_bounds(selector).is_none(), "write alone cannot look successful");
+            }
+        }
+    }
+}
+
 struct Profile(PathBuf);
 impl Profile {
     fn new() -> Self {
@@ -131,6 +224,268 @@ fn assistant_cascader_saves_each_level_and_sits_beside_the_input_on_horizontal_d
     let trigger = cx.debug_bounds("assistant-model-selector-trigger").unwrap();
     assert!(trigger.left() >= composer.right());
     assert!(trigger.bottom() <= composer.bottom() + px(1.));
+}
+
+#[gpui::test]
+fn assistant_sessions_switch_via_the_picker_and_keep_contexts_separate(cx: &mut TestAppContext) {
+    use crate::application::assistant::{
+        AssistantSession, AssistantSessions, ChatMessage, Role, load_sessions,
+    };
+    let profile = Profile::new();
+    let (view, cx) = mount_profile(cx, &profile, ControlPlaneScreen::Overview);
+    cx.simulate_resize(gpui::size(px(1400.), px(900.)));
+    cx.update(|window, cx| view.update(cx, |v, cx| v.toggle_assistant(window, cx)));
+    draw(cx);
+    let message = |role: Role, text: &str| ChatMessage {
+        role,
+        text: text.into(),
+        reasoning: String::new(),
+        context: String::new(),
+        pending: false,
+        actions: Vec::new(),
+        error: None,
+        reasoning_collapsed: true,
+    };
+    cx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.assistant.sessions = AssistantSessions {
+                sessions: vec![
+                    AssistantSession {
+                        id: "s1".into(),
+                        title: "电源项目".into(),
+                        messages: vec![message(Role::User, "打开电源项目")],
+                    },
+                    AssistantSession {
+                        id: "s2".into(),
+                        title: "BOM 导出".into(),
+                        messages: vec![
+                            message(Role::User, "导出 BOM"),
+                            message(Role::Assistant, "好的。"),
+                        ],
+                    },
+                ],
+                active_id: "s1".into(),
+            };
+            cx.notify();
+        })
+    });
+    draw(cx);
+    // The header topic opens the picker, above the composer.
+    let composer = cx.debug_bounds("assistant-composer").unwrap();
+    let trigger = cx.debug_bounds("assistant-session-selector-trigger").expect("trigger");
+    assert!(trigger.bottom() <= composer.top(), "the picker trigger sits in the header");
+    cx.simulate_click(trigger.center(), Default::default());
+    draw(cx);
+    assert!(cx.debug_bounds("assistant-session-panel").is_some(), "picker opens");
+    // Switching swaps the visible conversation's context.
+    let item = cx.debug_bounds("assistant-session-item-1").expect("session row");
+    cx.simulate_click(item.center(), Default::default());
+    draw(cx);
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.assistant.sessions.active_id, "s2");
+        assert_eq!(v.assistant.sessions.active().messages.len(), 2, "context swapped");
+        assert_eq!(v.assistant.sessions.sessions[0].id, "s2", "most recently used first");
+    });
+    assert!(cx.debug_bounds("assistant-session-panel").is_none(), "picker closes on switch");
+    // Both conversations persist with their own messages and the new active one.
+    let reloaded = load_sessions(&profile.0.join("assistant-history.json")).unwrap();
+    assert_eq!(reloaded.active_id, "s2");
+    assert_eq!(reloaded.sessions.len(), 2);
+    assert_eq!(reloaded.sessions.iter().find(|s| s.id == "s1").unwrap().messages.len(), 1);
+}
+
+#[gpui::test]
+fn assistant_new_session_starts_a_fresh_context_and_reuses_the_draft(cx: &mut TestAppContext) {
+    use crate::application::assistant::{AssistantSession, AssistantSessions, ChatMessage, Role};
+    let profile = Profile::new();
+    let (view, cx) = mount_profile(cx, &profile, ControlPlaneScreen::Overview);
+    cx.simulate_resize(gpui::size(px(1400.), px(900.)));
+    cx.update(|window, cx| view.update(cx, |v, cx| v.toggle_assistant(window, cx)));
+    draw(cx);
+    let message = |role: Role, text: &str| ChatMessage {
+        role,
+        text: text.into(),
+        reasoning: String::new(),
+        context: String::new(),
+        pending: false,
+        actions: Vec::new(),
+        error: None,
+        reasoning_collapsed: true,
+    };
+    cx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.assistant.sessions = AssistantSessions {
+                sessions: vec![AssistantSession {
+                    id: "s1".into(),
+                    title: "电源项目".into(),
+                    messages: vec![message(Role::User, "打开电源项目")],
+                }],
+                active_id: "s1".into(),
+            };
+            cx.notify();
+        })
+    });
+    draw(cx);
+    let trigger = cx.debug_bounds("assistant-session-selector-trigger").expect("trigger");
+    cx.simulate_click(trigger.center(), Default::default());
+    draw(cx);
+    let new = cx.debug_bounds("action-button-assistant-session-new").expect("new-session button");
+    cx.simulate_click(new.center(), Default::default());
+    draw(cx);
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.assistant.sessions.sessions.len(), 2);
+        assert!(v.assistant.sessions.active().messages.is_empty(), "fresh context");
+        assert!(v.assistant.sessions.active().title.is_empty());
+        assert_ne!(v.assistant.sessions.active_id, "s1");
+    });
+    assert!(
+        cx.debug_bounds("assistant-empty-state").is_some(),
+        "the fresh conversation shows the empty state"
+    );
+    // Asking for another new session while on the empty draft reuses it.
+    cx.simulate_click(trigger.center(), Default::default());
+    draw(cx);
+    let new = cx.debug_bounds("action-button-assistant-session-new").unwrap();
+    cx.simulate_click(new.center(), Default::default());
+    draw(cx);
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.assistant.sessions.sessions.len(), 2, "no duplicate drafts");
+    });
+}
+
+#[gpui::test]
+fn assistant_message_text_selects_and_copies_to_the_clipboard(cx: &mut TestAppContext) {
+    use crate::application::assistant::{AssistantSession, AssistantSessions, ChatMessage, Role};
+    let profile = Profile::new();
+    let (view, cx) = mount_profile(cx, &profile, ControlPlaneScreen::Overview);
+    cx.simulate_resize(gpui::size(px(1400.), px(900.)));
+    // Opening the panel focuses the composer — the state a copy must escape.
+    cx.update(|window, cx| view.update(cx, |v, cx| v.toggle_assistant(window, cx)));
+    draw(cx);
+    let text = "LM1117 是一款三端稳压器\n输出电流最高 800mA\n输入电压最高 15V";
+    let message = |role: Role| ChatMessage {
+        role,
+        text: text.to_owned(),
+        reasoning: String::new(),
+        context: "总览".into(),
+        pending: false,
+        actions: Vec::new(),
+        error: None,
+        reasoning_collapsed: true,
+    };
+    cx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.assistant.sessions = AssistantSessions {
+                sessions: vec![AssistantSession {
+                    id: "s1".into(),
+                    title: "资料收集".into(),
+                    messages: vec![message(Role::User), message(Role::Assistant)],
+                }],
+                active_id: "s1".into(),
+            };
+            cx.notify();
+        })
+    });
+    draw(cx);
+    let bubble = cx.debug_bounds("assistant-message-bubble-1").expect("assistant bubble");
+    // Inside the bubble's px-3/py-2 padding, on the text itself.
+    let start = point(bubble.left() + px(14.), bubble.top() + px(12.));
+    let end = point(bubble.right() - px(14.), bubble.bottom() - px(12.));
+    // A span that crosses into the next message — how a user copies a
+    // conversation snippet.
+    let first = cx.debug_bounds("assistant-message-bubble-0").expect("first bubble");
+    let cross_start = point(first.left() + px(14.), first.top() + px(12.));
+    cx.simulate_mouse_down(start, gpui::MouseButton::Left, Default::default());
+    cx.simulate_mouse_move(end, Some(gpui::MouseButton::Left), Default::default());
+    cx.simulate_mouse_up(end, gpui::MouseButton::Left, Default::default());
+    draw(cx);
+    cx.simulate_keystrokes("ctrl-c");
+    cx.update(|_, cx| {
+        assert_eq!(cx.read_from_clipboard().unwrap().text().unwrap(), text);
+    });
+    // Cross-message span: both bubbles join one selection document.
+    cx.simulate_mouse_down(cross_start, gpui::MouseButton::Left, Default::default());
+    cx.simulate_mouse_move(end, Some(gpui::MouseButton::Left), Default::default());
+    cx.simulate_mouse_up(end, gpui::MouseButton::Left, Default::default());
+    draw(cx);
+    cx.simulate_keystrokes("ctrl-c");
+    cx.update(|_, cx| {
+        assert_eq!(
+            cx.read_from_clipboard().unwrap().text().unwrap(),
+            format!("{text}\n{text}"),
+            "dragging across messages copies both in order"
+        );
+    });
+    // The per-message copy button writes regardless of focus or selection.
+    let copy = cx.debug_bounds("action-button-assistant-copy-0").expect("copy button");
+    cx.simulate_click(copy.center(), Default::default());
+    cx.update(|_, cx| {
+        assert_eq!(cx.read_from_clipboard().unwrap().text().unwrap(), text);
+    });
+}
+
+#[gpui::test]
+fn assistant_session_delete_removes_only_that_conversation(cx: &mut TestAppContext) {
+    use crate::application::assistant::{AssistantSession, AssistantSessions, ChatMessage, Role};
+    let profile = Profile::new();
+    let (view, cx) = mount_profile(cx, &profile, ControlPlaneScreen::Overview);
+    cx.simulate_resize(gpui::size(px(1400.), px(900.)));
+    cx.update(|window, cx| view.update(cx, |v, cx| v.toggle_assistant(window, cx)));
+    draw(cx);
+    let message = |role: Role, text: &str| ChatMessage {
+        role,
+        text: text.into(),
+        reasoning: String::new(),
+        context: String::new(),
+        pending: false,
+        actions: Vec::new(),
+        error: None,
+        reasoning_collapsed: true,
+    };
+    cx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.assistant.sessions = AssistantSessions {
+                sessions: vec![
+                    AssistantSession {
+                        id: "s1".into(),
+                        title: "电源项目".into(),
+                        messages: vec![message(Role::User, "打开电源项目")],
+                    },
+                    AssistantSession {
+                        id: "s2".into(),
+                        title: "BOM 导出".into(),
+                        messages: vec![message(Role::User, "导出 BOM")],
+                    },
+                ],
+                active_id: "s1".into(),
+            };
+            cx.notify();
+        })
+    });
+    draw(cx);
+    let trigger = cx.debug_bounds("assistant-session-selector-trigger").expect("trigger");
+    cx.simulate_click(trigger.center(), Default::default());
+    draw(cx);
+    // Deleting the active conversation moves to its neighbor.
+    let delete = cx.debug_bounds("action-button-assistant-session-delete-0").expect("delete");
+    cx.simulate_click(delete.center(), Default::default());
+    draw(cx);
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.assistant.sessions.sessions.len(), 1);
+        assert_eq!(v.assistant.sessions.active_id, "s2");
+    });
+    assert!(
+        cx.debug_bounds("assistant-session-panel").is_some(),
+        "the picker stays open for more deletes"
+    );
+    // Deleting the last conversation leaves one fresh empty session.
+    let delete = cx.debug_bounds("action-button-assistant-session-delete-0").unwrap();
+    cx.simulate_click(delete.center(), Default::default());
+    draw(cx);
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.assistant.sessions.sessions.len(), 1);
+        assert!(v.assistant.sessions.active().messages.is_empty());
+    });
 }
 
 #[gpui::test]
@@ -446,6 +801,92 @@ fn session_entry_renders_only_selected_category_and_opens_the_original_category(
         "runtime",
         "closing details must keep the record selected for continuation"
     );
+}
+
+#[gpui::test]
+fn session_entry_auto_refresh_lists_externally_written_eda_sessions(cx: &mut TestAppContext) {
+    use circuitfabric_project::{ProjectStorage, SessionCategory, SessionSeed};
+    let profile = Profile::new();
+    let root = profile.0.join("project");
+    std::fs::create_dir_all(&root).unwrap();
+    let store = ProjectStorage::create(
+        &root,
+        circuitfabric_contracts::Project {
+            id: "p".into(),
+            name: "桥接会话".into(),
+            description: None,
+        },
+    )
+    .unwrap();
+    let seed = |id: &str| SessionSeed {
+        session_id: id.into(),
+        runtime_profile_id: "provider".into(),
+        backend_id: Some("jlcircuit".into()),
+    };
+    store.start_categorized_session(seed("eda-before"), SessionCategory::Eda, None).unwrap();
+    store
+        .start_categorized_session(seed("runtime-before"), SessionCategory::Runtime, None)
+        .unwrap();
+    let (view, cx) = mount_profile(cx, &profile, ControlPlaneScreen::SessionsAndTasks);
+    cx.simulate_resize(gpui::size(px(1400.), px(1200.)));
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            crate::application::project_data::attach_project_storage(
+                &mut view.workspace,
+                &mut view.project_storages,
+                &mut view.project_data,
+                store.clone(),
+            )
+            .unwrap();
+            view.navigation.selected_project = Some("p".into());
+            view.session_category_filter = SessionCategory::Eda;
+            cx.notify();
+        })
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("session-row-eda-before").is_some());
+
+    // The EDA bridge writes its record straight into the same project storage, as an
+    // external process would; the desktop cache has no knowledge of it yet.
+    store.start_categorized_session(seed("eda-after"), SessionCategory::Eda, None).unwrap();
+    // A cache fresh enough is not rescanned on redraw.
+    cx.update(|_, cx| view.update(cx, |_, cx| cx.notify()));
+    draw(cx);
+    assert!(
+        cx.debug_bounds("session-row-eda-after").is_none(),
+        "a cache inside the staleness threshold must not be rescanned"
+    );
+
+    // Age the cache past the threshold; the next render picks the bridge record up.
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.project_data.get_mut("p").unwrap().loaded_at_unix_nanos = 0;
+            cx.notify();
+        })
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("session-row-eda-after").is_some(),
+        "a stale cache is refreshed during render and lists the bridge session"
+    );
+    assert!(cx.debug_bounds("session-row-eda-before").is_some());
+    assert!(
+        cx.debug_bounds("session-row-runtime-before").is_none(),
+        "the EDA category must not mix in other categories"
+    );
+    assert!(view.read_with(cx, |view, _| view.project_read_errors.is_empty()));
+    assert!(cx.debug_bounds("sessions-project-read-error").is_none());
+
+    // The runtime category shows its own records and never the new EDA one.
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.session_category_filter = SessionCategory::Runtime;
+            cx.notify();
+        })
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("session-row-runtime-before").is_some());
+    assert!(cx.debug_bounds("session-row-eda-after").is_none());
 }
 
 #[gpui::test]
@@ -873,8 +1314,9 @@ fn provider_editor_model_dropdown_filters_and_never_takes_layout_space(cx: &mut 
     });
     draw(cx);
     let card = cx.debug_bounds("provider-settings-card").expect("provider dialog rendered");
-    let wire =
-        cx.debug_bounds("action-button-provider-wire-chat").expect("wire protocol control rendered");
+    let wire = cx
+        .debug_bounds("action-button-provider-wire-chat")
+        .expect("wire protocol control rendered");
     assert!(
         wire.size.height > px(20.) && wire.top() >= card.top() && wire.bottom() <= card.bottom(),
         "wire protocol control must stay inside the dialog: {wire:?}"
@@ -1246,7 +1688,10 @@ fn provider_editor_model_field_click_opens_the_dropdown(cx: &mut TestAppContext)
     draw(cx);
     cx.update(|_, cx| {
         view.update(cx, |view, _| {
-            assert!(view.model_choices.dropdown_open, "clicking the model field opens the dropdown");
+            assert!(
+                view.model_choices.dropdown_open,
+                "clicking the model field opens the dropdown"
+            );
         })
     });
     // The automatically started fetch signs itself with the current draft.
@@ -1289,16 +1734,24 @@ fn quick_verification_sessions_are_isolated_per_runtime(cx: &mut TestAppContext)
     cx.simulate_click(cancel.center(), Default::default());
     cx.update(|_, cx| {
         view.update(cx, |view, _| {
-            assert!(view.quick_task(RuntimeAdapter::CodexAppServer).cancel.as_ref().is_some_and(
-                |cancel| cancel.0.load(Ordering::SeqCst)
-            ));
             assert!(
-                !view.quick_task(RuntimeAdapter::KimiCode).cancel.as_ref().is_some_and(
-                    |cancel| cancel.0.load(Ordering::SeqCst)
-                ),
+                view.quick_task(RuntimeAdapter::CodexAppServer)
+                    .cancel
+                    .as_ref()
+                    .is_some_and(|cancel| cancel.0.load(Ordering::SeqCst))
+            );
+            assert!(
+                !view
+                    .quick_task(RuntimeAdapter::KimiCode)
+                    .cancel
+                    .as_ref()
+                    .is_some_and(|cancel| cancel.0.load(Ordering::SeqCst)),
                 "the other runtime's run is not cancelled"
             );
-            assert_eq!(view.quick_task(RuntimeAdapter::CodexAppServer).result, "正在取消并清理进程…");
+            assert_eq!(
+                view.quick_task(RuntimeAdapter::CodexAppServer).result,
+                "正在取消并清理进程…"
+            );
             assert_eq!(
                 view.quick_task(RuntimeAdapter::KimiCode).result,
                 "result-kimi-code",
@@ -1332,9 +1785,12 @@ fn quick_verification_sessions_are_isolated_per_runtime(cx: &mut TestAppContext)
     cx.update(|_, cx| {
         view.update(cx, |view, _| {
             view.cancel_all_quick_tasks();
-            assert!(view.quick_task(RuntimeAdapter::KimiCode).cancel.as_ref().is_some_and(
-                |cancel| cancel.0.load(Ordering::SeqCst)
-            ));
+            assert!(
+                view.quick_task(RuntimeAdapter::KimiCode)
+                    .cancel
+                    .as_ref()
+                    .is_some_and(|cancel| cancel.0.load(Ordering::SeqCst))
+            );
         })
     });
 }
@@ -2322,4 +2778,51 @@ fn datasheet_data_tables_keep_headers_on_one_line_and_align_columns(cx: &mut Tes
         cx.debug_bounds("parameter-header-cell-conditions").is_some(),
         "a conditions column appears when any row carries conditions"
     );
+}
+
+#[gpui::test]
+fn semantics_timeline_marks_a_revert_to_an_earlier_state(cx: &mut TestAppContext) {
+    use circuitfabric_contracts::{LogicalCircuitSnapshot, Project, SnapshotAuthority};
+    use circuitfabric_project::{ProjectStorage, TimelineObservation, TimelineSource};
+    let profile = Profile::new();
+    let root = profile.0.join("project");
+    std::fs::create_dir_all(&root).unwrap();
+    let store = ProjectStorage::create(
+        &root,
+        Project { id: "p".into(), name: "timeline".into(), description: None },
+    )
+    .unwrap();
+    let observed = |hash: &str| {
+        let mut snapshot = LogicalCircuitSnapshot::empty(SnapshotAuthority::Observed);
+        snapshot.snapshot_hash = format!("sha256:{hash}");
+        snapshot
+    };
+    for (index, hash) in ["aa", "aa", "bb", "aa"].into_iter().enumerate() {
+        let observation = TimelineObservation {
+            source: TimelineSource::Inspect,
+            observed_at_unix_millis: index as u64 * 1000,
+            session_id: None,
+            change_set_id: None,
+        };
+        store.record_observed_snapshot(&observed(hash), observation).unwrap();
+    }
+    let (view, cx) = mount_profile(cx, &profile, ControlPlaneScreen::Semantics);
+    cx.simulate_resize(gpui::size(px(1600.), px(1000.)));
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            crate::application::project_data::attach_project_storage(
+                &mut view.workspace,
+                &mut view.project_storages,
+                &mut view.project_data,
+                store,
+            )
+            .unwrap();
+            view.navigation.selected_project = Some("p".into());
+            cx.notify();
+        })
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("semantic-timeline-revisit-3").is_some(), "A -> B -> A is visible");
+    assert!(cx.debug_bounds("semantic-timeline-revisit-2").is_none());
+    assert!(cx.debug_bounds("semantic-timeline-revisit-4").is_none(), "unchanged inspect adds no event");
 }

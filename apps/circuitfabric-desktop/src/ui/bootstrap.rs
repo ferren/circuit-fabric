@@ -341,11 +341,8 @@ impl ControlPlaneView {
                     PluginGovernanceStore::default()
                 }
             };
-        let (assistant, assistant_restore_error) = AssistantState::new(
-            settings_path.with_file_name("assistant-history.json"),
-            window,
-            cx,
-        );
+        let (assistant, assistant_restore_error) =
+            AssistantState::new(settings_path.with_file_name("assistant-history.json"), window, cx);
         let status = match assistant_restore_error {
             Some(error) => format!("{status}；{error}"),
             None => status,
