@@ -1,5 +1,7 @@
 # CircuitFabric 嘉立创 EDA 扩展
 
+v0.2.24 会话真实流式与思考链。Bridge 把 Codex 回合的 Answer/Reasoning 增量按帧转发为 `chat_delta`（新增 `kind` 字段区分 `answer`/`reasoning`，缺省按 answer 兼容旧帧），扩展端逐帧渲染，达到与桌面智能助手一致的打字机效果；会话消息内新增可折叠「思考过程」区块（流式中展开跟随、完成后自动折叠、限高独立滚动），思考链仅展示、不持久化、不作为审批依据。`hello` 新增 `chatDeltaKinds` 能力声明：旧扩展连新 Bridge 只收到 answer 增量、不混入思考链；新扩展连旧 Bridge 的整段帧照常显示。小窗布局重排：批准区改为固定操作条 + 独立滚动明细（批准操作始终可达），预览到达时自动收起思考链并滚动批准区到可见。需同时更新 Bridge。
+
 v0.2.23 重做器件重建（删除回滚与放置）。实测图元 `getState_Component()` 返回的 16 位 `uuid` 是工程内引用，`lib_Device.get` 对图上全部元件都返回 `undefined`，旧的"先核验库身份"永远不通过。现在依次尝试：精确库查找 → 按观测记录的立创编号（`getState_SupplierId()`）调用 `lib_Device.getByLcscIds` 取回 EDA 核验过的器件（离线客户端改传系统库 UUID 重试）→ 仍失败时直接用原库身份调用 `create` 兜底（未经核验，可能失败或结果未知）。结果回报 `restoreMethod`（`exact`/`lcsc`/`original_unverified`）和逐步诊断。配套 Bridge 不再因删除不可回滚而阻止批准，改在计划中给出 `rollbackWarnings`，扩展审批面板醒目显示，批准按钮改为"已知晓回滚风险"。观测附带只读 `libraryProbe` 诊断，不进入快照哈希。需同时更新 Bridge。
 
 v0.2.21 修正重建器件时把工程 UUID 当作工程库 UUID 的问题：工程库改由 `lib_LibrariesList.getProjectLibraryUuid()` 取得；原库与工程库都查不到时，再以不指定库的 `lib_Device.get(uuid)` 让 EDA 定位，只接受返回的同一器件及其自报所属库。EDA 以普通对象拒绝时，诊断输出其 JSON 而非 `[object Object]`。45 项扩展测试通过；真实 U1 恢复及回读验收尚未完成。

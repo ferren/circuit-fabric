@@ -4,7 +4,10 @@
   var cfReady = false;
   var cfProject = "";
   var cfPendingProject = "";
-  var cfMessage = null;
+  // 流式中的会话消息（思考链 + 回复两块）；完成后置 null，折叠状态由各消息自理。
+  var cfStream = null;
+  // 会话内全部思考链块：预览到达时统一收起，保证批准区可见。
+  var cfReasoningBlocks = [];
   var cfBusy = false;
   var cfTimer = null;
   var cfStartedAt = 0;
@@ -165,6 +168,12 @@
     lines.push(message.approvalAllowed ? "可以记录审批决定；批准后需单独执行。" : "前置条件未满足，不能批准。");
     document.getElementById("planDetails").textContent = lines.join("\n");
     document.getElementById("planReview").style.display = "";
+    // 预览到达：自动收起思考链并把批准区滚到可见，批准操作始终可达。
+    collapseReasoningBlocks();
+    var reviewSection = document.getElementById("planReview");
+    if (typeof reviewSection.scrollIntoView === "function") {
+      try { reviewSection.scrollIntoView(false); } catch (ignored) {}
+    }
     setControls();
   }
   function decidePlan(decision) {
@@ -219,6 +228,56 @@
     conversation.scrollTop = conversation.scrollHeight;
     return bubble;
   }
+  // 思考链块的折叠状态只作用于自身；流式中默认展开并跟随，预览到达或回合
+  // 完成时统一收起（对齐桌面端「思考过程」交互）。
+  function renderReasoning(state) {
+    state.reasoning.style.display = state.hasReasoning ? "" : "none";
+    state.head.textContent = state.collapsed ? "▸ 思考过程" : "▾ 思考过程";
+    state.body.style.display = state.collapsed ? "none" : "";
+  }
+  function createStreamMessage() {
+    var welcome = document.getElementById("welcome");
+    var conversation = document.getElementById("conversation");
+    var row = document.createElement("article");
+    var bubble = document.createElement("div");
+    var reasoning = document.createElement("div");
+    var head = document.createElement("div");
+    var body = document.createElement("div");
+    var answer = document.createElement("div");
+    var state = {reasoning:reasoning, head:head, body:body, answer:answer, collapsed:false, hasReasoning:false};
+    welcome.style.display = "none";
+    row.className = "message assistant";
+    bubble.className = "bubble";
+    reasoning.className = "reasoning";
+    head.className = "reasoning-head";
+    body.className = "reasoning-body";
+    answer.className = "bubble-text";
+    head.onclick = function () {
+      state.collapsed = !state.collapsed;
+      renderReasoning(state);
+      if (!state.collapsed) body.scrollTop = body.scrollHeight;
+    };
+    renderReasoning(state);
+    reasoning.appendChild(head);
+    reasoning.appendChild(body);
+    bubble.appendChild(reasoning);
+    bubble.appendChild(answer);
+    row.appendChild(bubble);
+    conversation.appendChild(row);
+    cfStream = state;
+    cfReasoningBlocks.push(state);
+    return state;
+  }
+  function collapseReasoningBlocks() {
+    for (var i = 0; i < cfReasoningBlocks.length; i += 1) {
+      cfReasoningBlocks[i].collapsed = true;
+      renderReasoning(cfReasoningBlocks[i]);
+    }
+  }
+  function followConversation() {
+    var conversation = document.getElementById("conversation");
+    conversation.scrollTop = conversation.scrollHeight;
+  }
   function showError(text) {
     stopTimer();
     addMessage("error", text);
@@ -270,7 +329,8 @@
   function newSession() {
     if (cfBusy) return;
     cfSession = "compat-" + new Date().getTime() + "-" + Math.floor(Math.random() * 1000000);
-    cfMessage = null;
+    cfStream = null;
+    cfReasoningBlocks = [];
     cfModelRequests = 0;
     cfOperationKind = null;
     cfOperationId = null;
@@ -331,7 +391,9 @@
     cfSocket = ws;
     ws.onopen = function () {
       if (cfSocket !== ws) return;
-      ws.send(JSON.stringify({type:"hello",protocolVersion:1}));
+      // 声明可接收的 chat_delta 帧种类；未声明的旧 Bridge 只发 answer，缺省
+      // kind 也按 answer 处理，两个方向都向后兼容。
+      ws.send(JSON.stringify({type:"hello",protocolVersion:1,chatDeltaKinds:["answer","reasoning"]}));
     };
     ws.onmessage = function (event) {
       var message, detail;
@@ -367,16 +429,34 @@
       } else if (message.type === "chat_started") {
         document.getElementById("livePhase").textContent = "Codex 正在处理请求…";
       } else if (message.type === "chat_delta") {
-        if (!cfMessage) cfMessage = addMessage("assistant", "");
-        cfMessage.textContent += message.delta || "";
+        if (!cfStream) createStreamMessage();
+        if (message.kind === "reasoning") {
+          if (!cfStream.hasReasoning) {
+            cfStream.hasReasoning = true;
+            renderReasoning(cfStream);
+          }
+          cfStream.body.textContent += message.delta || "";
+          if (!cfStream.collapsed) {
+            cfStream.body.scrollTop = cfStream.body.scrollHeight;
+            followConversation();
+          }
+        } else {
+          cfStream.answer.textContent += message.delta || "";
+          followConversation();
+        }
       } else if (message.type === "chat_completed") {
+        if (cfStream) {
+          // 回合结束：思考链自动折叠（用户仍可点击重新展开），流式状态结束。
+          cfStream.collapsed = true;
+          renderReasoning(cfStream);
+          cfStream = null;
+        }
         stopTimer();
         cfBusy = false;
         setControls();
         document.getElementById("live").className = "live done";
         document.getElementById("liveState").textContent = "当前状态：执行完成";
         document.getElementById("livePhase").textContent = "最近一次请求已完成";
-        cfMessage = null;
         requestSessions();
       } else if (message.type === "operation_started") {
         if (cfBusy && cfOperationKind === message.operation) {
@@ -446,7 +526,13 @@
         }
         setControls();
         showError(detail);
-        cfMessage = null;
+        if (cfStream) {
+          // 流式中断：折叠思考链并结束流式状态，已有部分文本保留，终态由
+          // showError 的错误气泡与失败状态条给出。
+          cfStream.collapsed = true;
+          renderReasoning(cfStream);
+          cfStream = null;
+        }
       }
     };
     ws.onerror = function () {
@@ -471,7 +557,7 @@
   function reconnect() {
     if (cfBusy) showError("已重新连接；如需继续请求，请选择项目后重试。");
     cfBusy = false;
-    cfMessage = null;
+    cfStream = null;
     cfOperationKind = null;
     cfOperationId = null;
     pushBridgeAddress();
@@ -485,7 +571,7 @@
     var text = instruction.value.replace(/^\s+|\s+$/g, "");
     if (!text || cfBusy || !cfReady || !cfProject || !cfSocket || cfSocket.readyState !== 1) return;
     cfBusy = true;
-    cfMessage = null;
+    cfStream = null;
     cfStartedAt = new Date().getTime();
     cfModelRequests += 1;
     updateElapsed();

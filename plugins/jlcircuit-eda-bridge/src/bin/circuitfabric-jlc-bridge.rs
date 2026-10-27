@@ -30,7 +30,7 @@ use std::{
 };
 
 use circuitfabric_codex_runtime::{
-    RuntimeSettings,
+    RuntimeSettings, TurnDelta,
     execution::{AgentKind, Cancellation, run_session_observed},
 };
 use circuitfabric_plugin_api::EdaBridge as _;
@@ -293,6 +293,16 @@ fn executor_unavailable_event(request_id: &str, message: &str) -> Value {
 // 会话通道（协议文档第 1、3 节）
 // ---------------------------------------------------------------------------
 
+/// 客户端在 `hello` 上声明的 `chat_delta` 可接收种类：`chatDeltaKinds` 数组包含
+/// `"reasoning"` 时，chat 增量按帧转发 Answer 与 Reasoning；未声明的旧客户端
+/// 只收到 answer 帧（Reasoning 增量不下发，避免思考链混入回复文本）。
+fn hello_wants_reasoning_deltas(message: &Value) -> bool {
+    message
+        .get("chatDeltaKinds")
+        .and_then(Value::as_array)
+        .is_some_and(|kinds| kinds.iter().any(|kind| kind.as_str() == Some("reasoning")))
+}
+
 #[allow(clippy::too_many_lines)]
 fn serve_session(
     stream: TcpStream,
@@ -300,6 +310,7 @@ fn serve_session(
     state: &Arc<SharedState>,
 ) -> Result<(), String> {
     let mut project_id: Option<String> = None;
+    let mut chat_reasoning_client = false;
 
     // 读线程把入站帧送入队列；处理循环用 recv_timeout 轮转，以便等待操作
     // 结果期间仍能响应 cancel_operation。chat 等长阻塞分支保持简单：队列
@@ -331,6 +342,7 @@ fn serve_session(
         let message = parsed.expect("is_err 已检查");
         match message.get("type").and_then(Value::as_str) {
             Some("hello") => {
+                chat_reasoning_client = hello_wants_reasoning_deltas(&message);
                 if message
                     .get("projectId")
                     .and_then(Value::as_str)
@@ -482,6 +494,24 @@ fn serve_session(
                     format!("{}\n{prompt}", configuration.agent_instructions.unwrap_or_default());
                 let cancel = Cancellation::default();
                 let done = std::sync::atomic::AtomicBool::new(false);
+                // 按序把 Answer/Reasoning 增量转发为 chat_delta 帧（`kind` 为
+                // v0.2.24 新增字段，旧客户端忽略；reasoning 帧只发给已声明的
+                // 客户端）。运行时对增量做的脱敏照旧；回复最终文本等于 answer
+                // 帧拼接，完成后不再重发整段。
+                let mut forward_delta = |kind, delta: &str| {
+                    let frame_kind = match kind {
+                        TurnDelta::Answer => "answer",
+                        TurnDelta::Reasoning => "reasoning",
+                    };
+                    if frame_kind == "reasoning" && !chat_reasoning_client {
+                        return;
+                    }
+                    let _ = send_json(
+                        &stream,
+                        json!({"type":"chat_delta","sessionId":session_id,"delta":delta,
+                            "kind":frame_kind}),
+                    );
+                };
                 let project_path = storage.configuration_path();
                 let configuration_files = [config_path.to_owned(), project_path];
                 let snapshots = vec![runtime_snapshot, project_snapshot];
@@ -557,7 +587,7 @@ fn serve_session(
                         &history,
                         None,
                         &cancel,
-                        &mut |_, _| {},
+                        &mut forward_delta,
                         &mut |reported| usage = Some(reported),
                     );
                     done.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -607,10 +637,8 @@ fn serve_session(
                                 message: output.clone(),
                             },
                         )?;
-                        send_json(
-                            &stream,
-                            json!({"type":"chat_delta","sessionId":session_id,"delta":output}),
-                        )?;
+                        // 回复已由 forward_delta 按帧流式下发（answer 帧拼接即
+                        // 最终文本），此处只持久化，不再重发整段 chat_delta。
                         // 文本补丁通道已移除：发现模型误用时纠正它改用受控工具。
                         if output.contains(jlcircuit_eda_bridge::review::PATCH_FENCE_MARKER) {
                             let notice = "文本补丁不会被处理：候选补丁必须通过受控工具 \

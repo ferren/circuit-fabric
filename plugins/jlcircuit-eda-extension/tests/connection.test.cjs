@@ -33,7 +33,7 @@ function loadPage(){
 
 function connectAndList(page,projects){
   const socket=page.Socket.instances.at(-1);socket.open();
-  assert.deepEqual(socket.sent[0],{type:'hello',protocolVersion:1});
+  assert.deepEqual(socket.sent[0],{type:'hello',protocolVersion:1,chatDeltaKinds:['answer','reasoning']});
   socket.reply({type:'hello_ack'});
   assert.equal(socket.sent[1].type,'list_projects');
   socket.reply({type:'projects',projects});
@@ -78,7 +78,7 @@ test('project dropdown refreshes on open without losing the selection',()=>{
   assert.equal(Socket.instances.length,1);
   // reconnect resets both dropdowns and asks for a fresh list
   get('refresh').onclick();const next=Socket.instances[1];next.open();
-  assert.deepEqual(next.sent[0],{type:'hello',protocolVersion:1});
+  assert.deepEqual(next.sent[0],{type:'hello',protocolVersion:1,chatDeltaKinds:['answer','reasoning']});
   assert.equal(get('projectSelect').children[0].textContent,'连接后选择项目');
   assert.equal(get('projectSelect').disabled,true);
 });

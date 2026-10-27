@@ -115,7 +115,33 @@ Bridge → 入口：
 { "type": "apply", "sessionId": "s1", "planHash": "sha256:<计划摘要>" }
 ```
 
+`hello`（v0.2.24 起）可声明客户端能接收的 `chat_delta` 帧种类；未声明即旧客户端：
+
+```json
+{ "type": "hello", "protocolVersion": 1, "chatDeltaKinds": ["answer", "reasoning"] }
+```
+
 ### 3.2 Bridge → iframe
+
+#### 3.2.1 会话聊天流式帧（v0.2.24）
+
+`chat` 回合期间 Bridge 按到达顺序转发增量帧，替代 v0.2.23 前的「整段回复一次性下发」：
+
+```json
+{ "type": "chat_started", "sessionId": "s1", "threadId": "p1:s1", "agentTools": ["eda_inspect", "eda_propose_patch", "eda_request_preview"] }
+{ "type": "chat_delta", "sessionId": "s1", "delta": "…", "kind": "answer" }
+{ "type": "chat_delta", "sessionId": "s1", "delta": "…", "kind": "reasoning" }
+{ "type": "chat_completed", "sessionId": "s1" }
+```
+
+- `kind` 是 v0.2.24 新增字段，取值 `answer`（回复增量）或 `reasoning`（思考链增量）；缺省视为 `answer`，旧 Bridge 的整段帧因此无需改动客户端即可继续显示。
+- reasoning 帧只发给在 `hello` 上声明 `chatDeltaKinds` 含 `"reasoning"` 的客户端；旧客户端不会收到 reasoning 帧，思考链文本不会混入其回复。answer 增量对全部客户端照常按帧转发。
+- 回复最终文本 = answer 帧按序拼接；回合成功后 Bridge 不再重发整段 `chat_delta`（增量本身即完整回复）。
+- reasoning 帧仅用于界面展示（可折叠思考链），不持久化、不作为审批依据；answer 最终文本照旧持久化为该 EDA 会话的智能体轮次。
+- 增量沿用运行时现有脱敏；传输保持 `/bridge` WebSocket 会话通道，与桌面端进程内流一致，不引入独立 HTTP SSE 端点。
+- 回合失败时发 `error`（含 `sessionId`）且不再发 `chat_completed`；客户端据此展示明确终态，部分已流式文本保留。
+
+#### 3.2.2 操作帧
 
 ```json
 { "type": "operation_started", "requestId": "op-3", "operation": "inspect" }
@@ -315,5 +341,7 @@ ChangeSet 审计是桌面端和 Bridge 共用的审批事实源；`observations/
 | 相同快照、替换图元 ID | 保留历史并标记 drifted | 未执行 |
 | 过期基线、跨会话、篡改计划、观测不完整 | 拒绝批准，不出现写入成功 | 未执行 |
 | 取消及迟到结果 | 审计取消、丢弃迟到结果、会话继续可用 | 未执行 |
+| chat 增量转发（声明 `chatDeltaKinds`） | reasoning/answer 帧按序到达，answer 拼接即最终文本，思考链不持久化 | 未执行 |
+| chat 增量转发（旧客户端未声明） | 只收到 answer 增量帧，reasoning 不下发、不混入回复 | 未执行 |
 
 `apiTypesVersion: 0.4.26` 是当前夹具声明，不是已确认的真实客户端版本。iframe MessageBus、WebSocket 回调/Blob、分组 DRC、属性及网络改名 API 的实际同步时序仍需在真实嘉立创 EDA 专业版验证。PCB 观测、新增/删除器件、新建网络与自动写后 DRC 尚未接通；不能视为 TASK-5-35 整体完成。写入 API 核对日期：2026-10-23，依据官方 [器件 modify](https://prodocs.lceda.cn/cn/api/reference/pro-api.sch_primitivecomponent.modify.html) 与 [导线 modify](https://prodocs.lceda.cn/cn/api/reference/pro-api.sch_primitivewire.modify.html)；回读使用重新观测，避免复用陈旧图元对象。

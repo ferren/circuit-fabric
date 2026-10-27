@@ -2,7 +2,7 @@
 /* CircuitFabric JLC EDA extension entry point. No JLCircuit-Agent code is used. */
 var edaEsbuildExportName = (() => {
 const OPERATIONS_PROTOCOL_VERSION = 1;
-const EXTENSION_VERSION = "0.2.23";
+const EXTENSION_VERSION = "0.2.24";
 const EXECUTOR_WS_ID = "circuitfabric-executor";
 const DEFAULT_BRIDGE_HOST = "ws://127.0.0.1:49630";
 const DEFAULT_EXECUTOR_PATH = "/eda-operations";

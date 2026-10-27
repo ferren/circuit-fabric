@@ -48,7 +48,7 @@ function loadPage() {
 function selectProject(page) {
   const {get,Socket}=page;
   const socket=Socket.instances.at(-1);socket.open();
-  assert.deepEqual(socket.sent[0],{type:'hello',protocolVersion:1});
+  assert.deepEqual(socket.sent[0],{type:'hello',protocolVersion:1,chatDeltaKinds:['answer','reasoning']});
   socket.reply({type:'hello_ack'});
   socket.reply({type:'projects',projects:[{id:'power-supply',name:'电源'}]});
   const projectSelect=get('projectSelect');
@@ -194,4 +194,86 @@ test('the capture button requests visual evidence and renders its content hash',
   assert.match(last.children[0].textContent,/0011223344556677/);
   assert.match(last.children[0].textContent,/12345 字节/);
   assert.equal(get('captureBtn').disabled,false);
+});
+
+// 发送一条消息并流式回放给定帧；返回流式消息的 {reasoning, head, body, answer}。
+function streamChat(page,socket,frames){
+  page.get('instruction').value='检查电源';
+  page.get('send').onclick();
+  socket.reply({type:'chat_started'});
+  for(const frame of frames) socket.reply(frame);
+  const conversation=page.get('conversation');
+  const message=conversation.children[conversation.children.length-1];
+  const bubble=message.children[0];
+  return {reasoning:bubble.children[0],head:bubble.children[0].children[0],body:bubble.children[0].children[1],answer:bubble.children[1]};
+}
+
+test('chat streams reasoning and the answer separately and folds the thinking block on completion',()=>{
+  const page=loadPage();const socket=selectProject(page);const {get}=page;
+  const stream=streamChat(page,socket,[
+    {type:'chat_delta',kind:'reasoning',delta:'先看输入，'},
+    {type:'chat_delta',kind:'answer',delta:'电压'},
+    {type:'chat_delta',kind:'reasoning',delta:'再核对容差'},
+    {type:'chat_delta',kind:'answer',delta:'偏高'},
+  ]);
+  // 流式期间：思考链可见且展开，回复独立累积。
+  assert.equal(stream.reasoning.style.display,'');
+  assert.equal(stream.body.style.display,'');
+  assert.equal(stream.body.textContent,'先看输入，再核对容差');
+  assert.equal(stream.answer.textContent,'电压偏高');
+  assert.match(stream.head.textContent,/思考过程/);
+  socket.reply({type:'chat_completed'});
+  // 完成后自动折叠；点击可重新展开。
+  assert.equal(stream.body.style.display,'none');
+  assert.match(stream.head.textContent,/思考过程/);
+  stream.head.onclick();
+  assert.equal(stream.body.style.display,'');
+  assert.equal(stream.answer.textContent,'电压偏高');
+  assert.equal(get('send').disabled,false);
+});
+
+test('frames without a kind keep streaming into the answer like the legacy bridge',()=>{
+  const page=loadPage();const socket=selectProject(page);
+  const stream=streamChat(page,socket,[{type:'chat_delta',delta:'整段'},{type:'chat_delta',delta:'回复'}]);
+  assert.equal(stream.answer.textContent,'整段回复');
+  assert.equal(stream.reasoning.style.display,'none','没有 reasoning 帧时思考链不出现');
+  socket.reply({type:'chat_completed'});
+  assert.equal(page.get('liveState').textContent,'当前状态：执行完成');
+});
+
+test('a preview during streaming collapses the thinking chain and keeps approval reachable',()=>{
+  const page=loadPage();const socket=selectProject(page);const {get}=page;
+  const stream=streamChat(page,socket,[
+    {type:'chat_delta',kind:'reasoning',delta:'评估删除 R1'},
+    {type:'chat_delta',kind:'answer',delta:'建议先核对基线'},
+  ]);
+  socket.reply({type:'preview_result',planHash:'plan',baselineSnapshotHash:'base',approvalAllowed:true,
+    plan:{steps:[],diff:[{detail:'删除 R1'}],risks:[],rollbackable:true}});
+  // 预览到达：批准区显示、思考链自动收起、回复文本保留——三块互不遮挡。
+  assert.equal(get('planReview').style.display,'');
+  assert.equal(stream.body.style.display,'none');
+  assert.match(get('planDetails').textContent,/删除 R1/);
+  socket.reply({type:'chat_completed'});
+  // 三块同时可见时批准可操作、回复可读。
+  assert.equal(get('approvePlan').disabled,false);
+  assert.equal(stream.answer.textContent,'建议先核对基线');
+  assert.equal(stream.body.style.display,'none');
+});
+
+test('a mid-stream error ends in a terminal state instead of staying busy',()=>{
+  const page=loadPage();const socket=selectProject(page);const {get}=page;
+  const stream=streamChat(page,socket,[
+    {type:'chat_delta',kind:'reasoning',delta:'思考到一半'},
+    {type:'chat_delta',kind:'answer',delta:'部分回复'},
+  ]);
+  socket.reply({type:'error',message:'Provider 不可用'});
+  assert.equal(get('live').className,'live failed');
+  assert.equal(get('liveState').textContent,'当前状态：执行失败');
+  assert.equal(get('send').disabled,false,'错误终态后不得停留在处理中');
+  assert.equal(page.timers.size,0);
+  assert.equal(stream.body.style.display,'none','错误终态同样折叠思考链');
+  assert.equal(stream.answer.textContent,'部分回复');
+  const conversation=get('conversation');
+  const last=conversation.children[conversation.children.length-1];
+  assert.match(last.children[0].textContent,/Provider 不可用/);
 });
