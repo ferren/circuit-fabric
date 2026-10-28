@@ -19,10 +19,44 @@ impl ControlPlaneView {
         let Some(path) = std::env::var_os("CF_OVERVIEW_CAPTURE").map(PathBuf::from) else {
             return;
         };
+        // Optional screen/panel selection for the capture: overview (default),
+        // changes, eda, sessions, or messages (message panel open).
+        let capture_screen = std::env::var("CF_CAPTURE_SCREEN").unwrap_or_default();
+        let capture_wait = std::env::var("CF_CAPTURE_WAIT")
+            .ok()
+            .and_then(|wait| wait.parse::<u64>().ok())
+            .unwrap_or(3);
         cx.spawn_in(window, async move |view, cx| {
-            cx.background_executor().timer(Duration::from_secs(3)).await;
+            cx.background_executor().timer(Duration::from_secs(capture_wait)).await;
             cx.update(|window, cx| {
-                let model = view.update(cx, |view, cx| { cx.notify(); view.overview_model() }).ok();
+                let model = view.update(cx, |view, cx| {
+                    match capture_screen.as_str() {
+                        "changes" | "eda" | "sessions" => {
+                            let busiest = view
+                                .project_data
+                                .iter()
+                                .max_by_key(|(id, data)| {
+                                    (data.change_sets.len(), data.session_listing.sessions.len(), id.as_str())
+                                })
+                                .map(|(id, _)| id.clone());
+                            if let Some(project) = busiest {
+                                view.select_project(project, cx);
+                            }
+                            view.navigation.screen = match capture_screen.as_str() {
+                                "changes" => ControlPlaneScreen::ChangesAndApprovals,
+                                "eda" => ControlPlaneScreen::EdaServices,
+                                _ => ControlPlaneScreen::SessionsAndTasks,
+                            };
+                        }
+                        "messages" => {
+                            view.message_panel_open = true;
+                        }
+                        _ => (),
+                    }
+                    cx.notify();
+                    view.overview_model()
+                })
+                .ok();
                 let _ = window.draw(cx);
                 // Uses the real Windows platform renderer, including native glyph shaping,
                 // clipping, chart paths, and layout. No mock/raster reconstruction is involved.

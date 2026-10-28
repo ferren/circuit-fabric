@@ -6,6 +6,7 @@ pub mod datasheet_checkpoint;
 pub mod datasheet_dialogue;
 #[cfg(feature = "native-ui")]
 pub mod datasheet_recovery;
+pub mod messages;
 pub mod navigation;
 pub mod overview;
 pub mod plugin_governance;

@@ -20,6 +20,7 @@ impl ControlPlaneView {
 
     pub(super) fn open_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.command_palette_open = true;
+        self.message_panel_open = false;
         self.command_selected = 0;
         self.command_search.update(cx, |state, cx| {
             state.set_value("", window, cx);
@@ -66,6 +67,13 @@ impl ControlPlaneView {
         if self.session_modal_open && self.session_replay.is_some() {
             if keystroke.key == "escape" {
                 self.close_session_replay(cx);
+            }
+            return;
+        }
+
+        if self.message_panel_open {
+            if keystroke.key == "escape" {
+                self.close_message_panel(cx);
             }
             return;
         }

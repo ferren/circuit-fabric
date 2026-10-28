@@ -75,6 +75,7 @@ impl Render for ControlPlaneView {
     #[allow(clippy::too_many_lines)]
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.refresh_bridge_lifecycle();
+        self.refresh_message_center();
         self.sync_window_title(window);
         let command_palette = if self.command_palette_open {
             Some(self.render_command_palette(cx).into_any_element())
@@ -119,6 +120,11 @@ impl Render for ControlPlaneView {
             && self.datasheet_stream.is_some())
         .then(|| self.render_datasheet_stream_modal(cx).into_any_element());
         let assistant_layer = self.render_assistant_layer(cx);
+        let message_panel = if self.message_panel_open {
+            Some(self.render_message_panel(cx).into_any_element())
+        } else {
+            None
+        };
         let entity = cx.entity().clone();
         let active_screen = self.navigation.screen;
         let language = self.language;
@@ -635,6 +641,9 @@ impl Render for ControlPlaneView {
                                             })),
                                     )
                                     .child(self.render_assistant_trigger(cx))
+                                    .child(super::messages_panel::render_message_center_trigger(
+                                        self, cx,
+                                    ))
                                     .child(
                                         action_button("toggle-language")
                                             .ghost()
@@ -765,6 +774,7 @@ impl Render for ControlPlaneView {
                             ),
                     )
                     .child(assistant_layer)
+                    .when_some(message_panel, ParentElement::child)
                     .when_some(command_palette, ParentElement::child)
                     .when_some(vault_prompt, ParentElement::child)
                     .when_some(vault_quick_unlock, ParentElement::child)

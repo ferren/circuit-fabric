@@ -715,6 +715,12 @@ pub(super) struct ControlPlaneView {
     pub(super) selected_change_set: Option<(ProjectId, String)>,
     pub(super) approval_drawer_open: bool,
     pub(super) approval_note: Entity<InputState>,
+    // Message center: the read model plus its store path and open state.
+    // Messages are presentation-layer aggregation only; approval and
+    // verification facts stay in the persisted records they point at.
+    pub(super) message_center: crate::application::messages::MessageCenter,
+    pub(super) message_store_path: PathBuf,
+    pub(super) message_panel_open: bool,
     pub(super) bom_export_format: BomExportFormat,
     pub(super) window_title: String,
     pub(super) project_search: Entity<InputState>,

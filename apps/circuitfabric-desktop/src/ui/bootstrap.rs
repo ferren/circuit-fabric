@@ -360,6 +360,8 @@ impl ControlPlaneView {
             window,
             cx,
         );
+        let message_store_path = settings_path.with_file_name("messages.json");
+        let message_center = crate::application::messages::MessageCenter::load(&message_store_path);
         Self {
             sidebar_mark: Arc::new(Image::from_bytes(ImageFormat::Png, SIDEBAR_MARK.to_vec())),
             saved_settings: settings.clone(),
@@ -447,6 +449,9 @@ impl ControlPlaneView {
             selected_change_set: None,
             approval_drawer_open: false,
             approval_note,
+            message_center,
+            message_store_path,
+            message_panel_open: false,
             bom_export_format: BomExportFormat::Csv,
             window_title: String::new(),
             project_search,

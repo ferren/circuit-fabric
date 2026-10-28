@@ -279,7 +279,7 @@ impl ControlPlaneView {
         let config_path = self.settings_path.clone();
         let address = settings.bridge.listen_address.clone();
         let launch_address = address.clone();
-        self.bridge_status = RuntimeLifecycleStatus::Starting;
+        self.set_bridge_status_noted(RuntimeLifecycleStatus::Starting);
         self.bridge_active_address = Some(address.clone());
         self.bridge_health = BridgeHealth::Unknown;
         self.bridge_probed_at = None;
@@ -319,16 +319,19 @@ impl ControlPlaneView {
                     match result {
                         Ok(handle) => {
                             let pid = handle.pid();
-                            view.bridge_health = BridgeHealth::Listening { at: Instant::now() };
+                            view.set_bridge_health_noted(BridgeHealth::Listening {
+                                at: Instant::now(),
+                            });
                             view.bridge_process = Some(handle);
-                            view.bridge_status = RuntimeLifecycleStatus::Running { pid };
+                            view.set_bridge_status_noted(RuntimeLifecycleStatus::Running { pid });
                             view.status =
                                 format!("bridge 已启动（PID {pid}）：ws://{address}/bridge");
                         }
                         Err(reason) => {
                             view.bridge_active_address = None;
-                            view.bridge_status =
-                                RuntimeLifecycleStatus::Failed { reason: reason.clone() };
+                            view.set_bridge_status_noted(RuntimeLifecycleStatus::Failed {
+                                reason: reason.clone(),
+                            });
                             view.status = format!("bridge 启动失败：{reason}");
                         }
                     }
@@ -358,7 +361,7 @@ impl ControlPlaneView {
         let pid = process.pid();
         match process.stop() {
             Ok(()) => {
-                self.bridge_status = RuntimeLifecycleStatus::Stopped;
+                self.set_bridge_status_noted(RuntimeLifecycleStatus::Stopped);
                 self.bridge_active_address = None;
                 self.bridge_health = BridgeHealth::Unknown;
                 self.bridge_probed_at = None;
@@ -366,7 +369,9 @@ impl ControlPlaneView {
                 self.status = format!("已停止 bridge 服务（PID {pid}）。");
             }
             Err(error) => {
-                self.bridge_status = RuntimeLifecycleStatus::Failed { reason: error.clone() };
+                self.set_bridge_status_noted(RuntimeLifecycleStatus::Failed {
+                    reason: error.clone(),
+                });
                 self.status = format!("停止 bridge 失败（PID {pid}）：{error}");
             }
         }
@@ -386,16 +391,16 @@ impl ControlPlaneView {
             self.bridge_process = None;
             self.bridge_active_address = None;
             if exit.success() {
-                self.bridge_status = RuntimeLifecycleStatus::Stopped;
+                self.set_bridge_status_noted(RuntimeLifecycleStatus::Stopped);
             } else {
                 let detail = if diagnostics.is_empty() {
                     String::new()
                 } else {
                     format!("：{diagnostics}")
                 };
-                self.bridge_status = RuntimeLifecycleStatus::Failed {
+                self.set_bridge_status_noted(RuntimeLifecycleStatus::Failed {
                     reason: format!("bridge 进程已退出（{exit}）{detail}"),
-                };
+                });
             }
         }
     }
@@ -426,10 +431,11 @@ impl ControlPlaneView {
             cx.update(|_, cx| {
                 view.update(cx, |view, cx| {
                     view.bridge_probe_pending = false;
-                    view.bridge_health = match result {
+                    let health = match result {
                         Ok(()) => BridgeHealth::Listening { at: Instant::now() },
                         Err(reason) => BridgeHealth::Unreachable { reason },
                     };
+                    view.set_bridge_health_noted(health);
                     cx.notify();
                 })
                 .ok();
@@ -468,15 +474,16 @@ impl ControlPlaneView {
                         Ok(report) => {
                             let version = report.protocol_version;
                             let bridge_name = report.bridge_name.clone();
-                            view.bridge_health = BridgeHealth::Listening { at };
+                            view.set_bridge_health_noted(BridgeHealth::Listening { at });
                             view.bridge_test = Some(BridgeTestResult { at, outcome: Ok(report) });
                             view.status =
                                 format!("bridge 连接测试成功：协议 v{version} · {bridge_name}");
                         }
                         Err((reason, offline)) => {
                             if offline {
-                                view.bridge_health =
-                                    BridgeHealth::Unreachable { reason: reason.clone() };
+                                view.set_bridge_health_noted(BridgeHealth::Unreachable {
+                                    reason: reason.clone(),
+                                });
                             }
                             view.bridge_test = Some(BridgeTestResult { at, outcome: Err(reason) });
                         }
@@ -872,11 +879,13 @@ impl ControlPlaneView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         self.maybe_probe_bridge_health(window, cx);
+        // Read-only aggregate plus deep link; per-record stage detail lives
+        // on the changes page, and stage transitions message the center.
         let materialization = if let Some(project) = self.navigation.selected_project.clone() {
             self.refresh_materialization_data(&project);
-            self.render_materialization_states(&project, "eda")
+            self.render_materialization_summary(&project, cx).into_any_element()
         } else {
-            div()
+            div().into_any_element()
         };
         let entity = cx.entity().clone();
         let language = self.language;

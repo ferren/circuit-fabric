@@ -1,5 +1,6 @@
 //! Changes presentation and event handlers.
 use super::*;
+use circuitfabric_project::StoredChangeSet;
 
 impl ControlPlaneView {
     pub(super) fn refresh_materialization_data(&mut self, project: &str) {
@@ -13,64 +14,85 @@ impl ControlPlaneView {
         }
     }
 
-    /// All three pages use the same persisted states; no green status from write alone.
-    pub(super) fn render_materialization_states(
+    /// Compact materialization outcome for one change set, shared by the
+    /// changes-page list row and the EDA-page summary. Rollback-class audit
+    /// decisions outrank the three stages; write alone is never "verified".
+    pub(super) fn change_set_outcome(record: &StoredChangeSet) -> &'static str {
+        let action = record
+            .audit
+            .iter()
+            .rev()
+            .find(|entry| {
+                matches!(
+                    entry.decision.as_str(),
+                    "cancelled" | "rollback_executed" | "rollback_error" | "compensation"
+                )
+            })
+            .map_or("", |entry| entry.decision.as_str());
+        if !action.is_empty() {
+            "rollback-class"
+        } else if record.verified() {
+            "verified"
+        } else {
+            "inconclusive"
+        }
+    }
+
+    /// The EDA services page's read-only materialization summary: aggregate
+    /// counts plus a deep link. Per-record stage detail lives on the changes
+    /// page; stage transitions arrive as message-center events.
+    pub(super) fn render_materialization_summary(
         &self,
         project: &str,
-        surface: &'static str,
+        cx: &Context<Self>,
     ) -> Div {
-        let mut rows =
-            div().v_flex().gap_1().debug_selector(move || format!("materialization-{surface}"));
+        let language = self.language;
+        let entity = cx.entity().clone();
+        let link_project = project.to_owned();
+        let mut verified = 0;
+        let mut inconclusive = 0;
+        let mut rollback_class = 0;
         if let Some(data) = self.project_data.get(project) {
             for record in &data.change_sets {
-                let label = |status: &ChangeSetStageStatus| match status {
-                    ChangeSetStageStatus::NotRun => "not_run",
-                    ChangeSetStageStatus::Passed => "passed",
-                    ChangeSetStageStatus::Failed => "failed",
-                    ChangeSetStageStatus::Inconclusive => "inconclusive",
-                };
-                let action = record
-                    .audit
-                    .iter()
-                    .rev()
-                    .find(|entry| {
-                        matches!(
-                            entry.decision.as_str(),
-                            "cancelled" | "rollback_executed" | "rollback_error" | "compensation"
-                        )
-                    })
-                    .map_or("", |entry| entry.decision.as_str());
-                let status = if !action.is_empty() {
-                    action
-                } else if record.verified() {
-                    "verified"
-                } else {
-                    "inconclusive"
-                };
-                let selector = format!("materialization-{surface}-{}-{status}", record.id);
-                rows = rows.child(
-                    div()
-                        .text_xs()
-                        .whitespace_normal()
-                        .debug_selector(move || selector.clone())
-                        .text_color(rgb(if record.verified() && action.is_empty() {
-                            0x0016_a34a
-                        } else {
-                            TEXT_SECONDARY
-                        }))
-                        .child(format!(
-                            "{} · {} · write={} · readback={} · verification={} · rollback={}",
-                            record.id,
-                            status,
-                            label(&record.execution.write.status),
-                            label(&record.execution.readback.status),
-                            label(&record.execution.verification.status),
-                            record.rollback_handle.as_deref().unwrap_or("none")
-                        )),
-                );
+                match Self::change_set_outcome(record) {
+                    "verified" => verified += 1,
+                    "rollback-class" => rollback_class += 1,
+                    _ => inconclusive += 1,
+                }
             }
         }
-        rows
+        let total = verified + inconclusive + rollback_class;
+        div()
+            .debug_selector(move || "materialization-summary-eda".into())
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_3()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(TEXT_SECONDARY))
+                    .whitespace_normal()
+                    .child(format!(
+                        "{}：{total} · verified {verified} · inconclusive {inconclusive} · rollback {rollback_class}",
+                        language.choose(
+                            "物化汇总（详情在变更页，状态变化进消息中心）",
+                            "Materialization summary (details on the changes page; state changes go to the message center)"
+                        ),
+                    )),
+            )
+            .child(
+                action_button("eda-open-changes")
+                    .ghost()
+                    .label(language.choose("查看物化详情", "Open materialization details"))
+                    .on_click(move |_, _, cx| {
+                        entity.update(cx, |view, cx| {
+                            view.select_project(link_project.clone(), cx);
+                            view.navigation.screen = ControlPlaneScreen::ChangesAndApprovals;
+                            cx.notify();
+                        });
+                    }),
+            )
     }
 
     pub(super) fn current_observation_hash(&self, project_id: &str) -> Option<String> {
@@ -176,6 +198,13 @@ impl ControlPlaneView {
             let select_project = project_id.clone();
             let select_id = record.id.clone();
             let decision = record.decision().map_or("pending", |entry| entry.decision.as_str());
+            let outcome = Self::change_set_outcome(record);
+            let (outcome_color, outcome_label) = match outcome {
+                "verified" => (0x0016_a34a, language.choose("verified", "verified")),
+                "rollback-class" => (0x00b4_5309, language.choose("rollback", "rollback")),
+                _ => (0x00b4_5309, "inconclusive"),
+            };
+            let outcome_selector = format!("changeset-outcome-{}-{outcome}", record.id);
             change_set_rows = change_set_rows.child(
                 div()
                     .id(format!("changeset-{}", record.id))
@@ -204,9 +233,26 @@ impl ControlPlaneView {
                             )
                             .child(
                                 div()
-                                    .text_xs()
-                                    .text_color(rgb(TEXT_MUTED))
-                                    .child(decision.to_owned()),
+                                    .flex()
+                                    .items_center()
+                                    .gap_1p5()
+                                    .child(
+                                        div()
+                                            .px_1p5()
+                                            .py_0p5()
+                                            .rounded_sm()
+                                            .text_xs()
+                                            .bg(rgb(0x00f1_f5f9))
+                                            .text_color(rgb(outcome_color))
+                                            .debug_selector(move || outcome_selector.clone())
+                                            .child(outcome_label),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(TEXT_MUTED))
+                                            .child(decision.to_owned()),
+                                    ),
                             ),
                     )
                     .child(div().mt_1().text_xs().text_color(rgb(TEXT_SECONDARY)).child(format!(
@@ -273,6 +319,7 @@ impl ControlPlaneView {
                     .p_2()
                     .rounded_md()
                     .bg(rgb(SURFACE_BG))
+                    .debug_selector(move || format!("changes-stage-{}", name.to_lowercase()).into())
                     .child(status_dot(color))
                     .child(div().w(px(80.)).text_sm().child(name))
                     .child(div().w(px(62.)).text_xs().text_color(rgb(TEXT_SECONDARY)).child(label))
@@ -458,7 +505,6 @@ impl ControlPlaneView {
         };
 
         let mut page = page("changes-approvals-page")
-            .child(self.render_materialization_states(&project_id, "changes"))
             .child(div().flex().items_center().justify_between().child(
                 div().v_flex().gap_1()
                     .child(div().text_sm().text_color(rgb(TEXT_SECONDARY)).child("Approval is guarded by current observed state, baseline, and verification."))

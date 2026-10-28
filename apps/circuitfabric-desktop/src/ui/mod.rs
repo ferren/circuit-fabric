@@ -20,6 +20,7 @@ mod evidence;
 mod export;
 mod jev;
 mod language;
+mod messages_panel;
 mod overview;
 #[cfg(feature = "ui-test-support")]
 mod overview_capture;
@@ -100,7 +101,7 @@ const SIDEBAR_MARK: &[u8] =
 /// Lucide icons (ISC, see `assets/icons/LICENSE-LUCIDE`) the navigation needs
 /// beyond the default component bundle, embedded individually instead of the
 /// complete catalog.
-const APP_ICONS: [(&str, &[u8]); 8] = [
+const APP_ICONS: [(&str, &[u8]); 9] = [
     ("icons/folder-kanban.svg", include_bytes!("../../../../assets/icons/folder-kanban.svg")),
     ("icons/circuit-board.svg", include_bytes!("../../../../assets/icons/circuit-board.svg")),
     ("icons/messages-square.svg", include_bytes!("../../../../assets/icons/messages-square.svg")),
@@ -112,6 +113,7 @@ const APP_ICONS: [(&str, &[u8]); 8] = [
         include_bytes!("../../../../assets/icons/chart-no-axes-column.svg"),
     ),
     ("icons/vault.svg", include_bytes!("../../../../assets/icons/vault.svg")),
+    ("icons/bell.svg", include_bytes!("../../../../assets/icons/bell.svg")),
 ];
 
 /// The component icon bundle plus [`APP_ICONS`].
@@ -168,6 +170,22 @@ pub(crate) fn run() {
 
                     let view = cx.new(|cx| ControlPlaneView::new(window, cx));
                     view.update(cx, |view, cx| view.prefetch_direct_model_catalogs(cx));
+                    // Idle tick: external processes (bridge, agent runtimes)
+                    // write ChangeSets and observations without any desktop
+                    // event, so a periodic notify keeps the render-driven
+                    // message scan and bridge reconciliation running while
+                    // the window sits untouched. Stops once the view is gone.
+                    let ticker = view.downgrade();
+                    cx.spawn(async move |cx| {
+                        loop {
+                            cx.background_executor().timer(Duration::from_millis(2500)).await;
+                            let tick = cx.update(|cx| ticker.update(cx, |_, cx| cx.notify()));
+                            if tick.is_err() {
+                                break;
+                            }
+                        }
+                    })
+                    .detach();
                     #[cfg(feature = "ui-test-support")]
                     view.update(cx, |view, cx| view.schedule_overview_capture(window, cx));
                     cx.observe_keystrokes({

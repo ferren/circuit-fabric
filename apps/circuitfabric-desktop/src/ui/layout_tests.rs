@@ -16,7 +16,9 @@ use std::{
 static NEXT_PROFILE: AtomicU64 = AtomicU64::new(0);
 
 #[gpui::test]
-fn materialization_states_are_visible_on_changes_sessions_and_eda_pages(cx: &mut TestAppContext) {
+fn materialization_detail_lives_on_changes_page_with_eda_summary_and_no_sessions_copy(
+    cx: &mut TestAppContext,
+) {
     use circuitfabric_contracts::Project;
     use circuitfabric_project::{
         ChangeSetAuditEntry, ChangeSetStage, ChangeSetStageStatus as Status, ProjectStorage,
@@ -66,16 +68,16 @@ fn materialization_states_are_visible_on_changes_sessions_and_eda_pages(cx: &mut
             cx.notify();
         })
     });
-    for status in ["inconclusive", "verified", "cancelled", "rollback_executed"] {
+    for status in ["inconclusive", "verified", "rollback-class"] {
         if status == "verified" {
             record.execution.readback.status = Status::Passed;
             record.execution.verification.status = Status::Passed;
         }
-        if status == "cancelled" || status == "rollback_executed" {
+        if status == "rollback-class" {
             record.audit.push(ChangeSetAuditEntry {
                 timestamp_unix_seconds: 1,
                 actor: "bridge".into(),
-                decision: status.into(),
+                decision: "rollback_executed".into(),
                 reason: "验收".into(),
                 observed_snapshot_hash: None,
                 rollback_handle: Some("handle".into()),
@@ -83,27 +85,66 @@ fn materialization_states_are_visible_on_changes_sessions_and_eda_pages(cx: &mut
         }
         ProjectStorage::open(&root).unwrap().save_change_set(&record).unwrap();
         cx.update(|_, cx| view.update(cx, |view, _| view.refresh_project_data("p").unwrap()));
-        for (surface, screen) in [
-            ("changes", ControlPlaneScreen::ChangesAndApprovals),
-            ("sessions", ControlPlaneScreen::SessionsAndTasks),
-            ("eda", ControlPlaneScreen::EdaServices),
-        ] {
-            cx.update(|_, cx| {
-                view.update(cx, |view, cx| {
-                    view.navigation.screen = screen;
-                    cx.notify();
-                })
-            });
-            draw(cx);
-            let selector: &'static str =
-                Box::leak(format!("materialization-{surface}-cs-{status}").into_boxed_str());
-            assert!(cx.debug_bounds(selector).is_some(), "{surface} must show {status}");
-            if status == "inconclusive" {
-                let selector: &'static str =
-                    Box::leak(format!("materialization-{surface}-cs-verified").into_boxed_str());
-                assert!(cx.debug_bounds(selector).is_none(), "write alone cannot look successful");
-            }
+
+        // The changes page keeps the full detail: the three stages in the
+        // selected record's pane plus a per-record outcome chip on the list.
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.navigation.screen = ControlPlaneScreen::ChangesAndApprovals;
+                cx.notify();
+            })
+        });
+        draw(cx);
+        for stage in ["write", "readback", "verification"] {
+            let selector: &'static str = Box::leak(format!("changes-stage-{stage}").into_boxed_str());
+            assert!(cx.debug_bounds(selector).is_some(), "changes page must show the {stage} stage");
         }
+        let selector: &'static str =
+            Box::leak(format!("changeset-outcome-cs-{status}").into_boxed_str());
+        assert!(cx.debug_bounds(selector).is_some(), "changes list must badge the {status} outcome");
+        if status == "inconclusive" {
+            let selector: &'static str =
+                Box::leak("changeset-outcome-cs-verified".to_string().into_boxed_str());
+            assert!(cx.debug_bounds(selector).is_none(), "write alone cannot look successful");
+        }
+
+        // The EDA page keeps a read-only aggregate and a deep link, not the
+        // per-record stage rows.
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.navigation.screen = ControlPlaneScreen::EdaServices;
+                cx.notify();
+            })
+        });
+        draw(cx);
+        assert!(
+            cx.debug_bounds("materialization-summary-eda").is_some(),
+            "EDA page shows the aggregate summary"
+        );
+        let selector: &'static str =
+            Box::leak(format!("changeset-outcome-cs-{status}").into_boxed_str());
+        assert!(
+            cx.debug_bounds(selector).is_none(),
+            "EDA page no longer repeats per-record materialization rows"
+        );
+
+        // The sessions page carries no materialization copy at all.
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.navigation.screen = ControlPlaneScreen::SessionsAndTasks;
+                cx.notify();
+            })
+        });
+        draw(cx);
+        assert!(
+            cx.debug_bounds("materialization-summary-eda").is_none()
+                && cx
+                    .debug_bounds(Box::leak(
+                        format!("changeset-outcome-cs-{status}").into_boxed_str()
+                    ))
+                    .is_none(),
+            "sessions page carries no materialization copy"
+        );
     }
 }
 
@@ -698,6 +739,8 @@ fn session_followup_composer_is_scoped_and_missing_history_keeps_the_draft(
 #[cfg(windows)]
 #[path = "session_followup_tests.rs"]
 mod session_followup_tests;
+#[path = "message_center_tests.rs"]
+mod message_center_tests;
 
 #[gpui::test]
 fn session_entry_renders_only_selected_category_and_opens_the_original_category(

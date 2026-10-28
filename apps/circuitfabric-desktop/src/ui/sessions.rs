@@ -1659,7 +1659,6 @@ impl ControlPlaneView {
                 .gap_3()
                 .size_full()
                 .child(categories)
-                .child(self.render_materialization_states(&project.id, "sessions"))
                 .child(
                     div()
                         .flex()
