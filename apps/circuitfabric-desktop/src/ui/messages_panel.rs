@@ -71,7 +71,7 @@ pub(super) fn render_message_center_trigger(
                 .with_size(px(15.))
                 .text_color(rgb(if view.message_panel_open { ACCENT_SOFT } else { TEXT_MUTED })),
         )
-        .child(badge)
+        .child(deferred(badge).with_priority(1))
 }
 
 /// One renderable row: a persisted event or a live derived entry.
@@ -256,7 +256,7 @@ impl ControlPlaneView {
         let unread = self.message_center.unread_count();
         let total = self.message_center.messages().len() + self.message_center.derived().len();
 
-        let mut body = capped_scroll_body("message-panel-body", px(560.)).p_3();
+        let mut body = capped_scroll_body("message-panel-body", px(560.)).px_3().pt_3().pb_6();
         let mut any_rows = false;
         for source in MessageSource::ALL {
             let rows = self.message_rows(&self.message_center, source);
@@ -427,9 +427,9 @@ impl ControlPlaneView {
                         div()
                             .flex()
                             .items_center()
-                            .gap_2()
-                            .px_4()
-                            .h(px(44.))
+                            .gap_3()
+                            .px_6()
+                            .h(px(48.))
                             .border_b_1()
                             .border_color(rgb(BORDER))
                             .child(
