@@ -26,6 +26,7 @@ pub const DEFAULT_API_KEY_ENV: &str = "OPENAI_API_KEY";
 pub const DEFAULT_PROVIDER_ID: &str = "zai";
 
 pub mod execution;
+pub mod capability_evidence;
 pub mod judge;
 pub mod models;
 pub mod secrets;
