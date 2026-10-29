@@ -104,6 +104,13 @@ def main():
         except (OSError, ValueError, RuntimeError, TimeoutError, queue.Empty) as exc:
             result["protocolError"] = type(exc).__name__ + ": " + str(exc)
         finally:
+            # App Server can start helpers inheriting stdout. Closing stdin or
+            # killing only the parent leaves the pipe reader blocked on Windows.
+            # End this exact probe tree while its root PID is still live.
+            if os.name == "nt" and proc.poll() is None:
+                cleanup = subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                                         capture_output=True, timeout=10)
+                result["cleanupExitCode"] = cleanup.returncode
             proc.stdin.close()
             try:
                 proc.wait(timeout=5)
