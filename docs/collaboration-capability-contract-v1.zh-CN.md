@@ -1,5 +1,29 @@
 # 协作能力探测契约 v1.1
 
+## 2026-10-30 连接后实测增补（评论 9086）
+
+连接障碍已解除：真实 Bridge hello/status 均为 `executorConnected=true`。本轮通过用户插件中已选的 CircuitFabric 项目 `MojianC3` 发起只读回读，并通过 EDA「高级 → 运行脚本」执行原生 SDK 探测，结果为 `artifacts/collaboration-584-connected/native-readonly.json`。这两条路径均为真实宿主调用；Bridge 读取在该 CF 项目新增探测会话及观测审计，没有修改 EDA 图纸。
+
+宿主 API 报告版本 `4.1.78`。类型查询与构建通过：`@jlceda/pro-api-types 0.4.27`（声明 SHA-256 `3e91ca9432bc6a640d5a7983c044ec63630ca94e5398744e17e0ac162674d5aa`），TypeScript `5.9.3`。安装资源 `pro-api/0.3.53.61b2011d` 与声明包版本不同，npm 没有同名 `0.3.53` 包；不据类型检查推定宿主支持全部新 API。
+
+已实测成功：`getCurrentProjectInfo` 完整工程树、`getAllSchematicsInfo`、`getAllSchematicPagesInfo`、`getCurrentSchematicPageInfo` 和 `getSplitScreenTree`。工程内有两个板子、两个原理图、两个同名 P1 图页及两个 PCB；这是已有工程的两页现场，不是新建的专用双图页测试工程。
+
+| 对象 | 实际 UUID |
+|---|---|
+| 原生工程“4寸墨水屏日历相框” | `135d2e3c9573727175c3c7596ab2f66b90484cf174de38bfb60d0c03aa72d9ea` |
+| 原理图 Schematic1_2 | `6fd29b34354b42d3` |
+| 其 P1 图页 | `5dfc602f34949c83` |
+| 原理图 Schematic1_3 | `3294ada314a7bc43` |
+| 其 P1 图页 | `929f75373a8c7455` |
+
+当前 P1 连续两次 inspect 均为 40 器件、13 网络、inconclusive 空，快照哈希相同：`sha256:afb98667d474380f6156f874dfff31d1d29e77f5ecb5c5035e8ce7fca5462e32`。工程 UUID 和当前页 UUID 重复读取一致；**只验证同页即时身份，不代表切图、重开或重启后身份稳定**。原生树证明不能只用页名 P1 做绑定。
+
+脚本首次 WebSocket 回传被真实宿主拒绝，提示“未启用扩展和脚本的外部交互权限”。没有修改宿主权限设置，改用 SDK 原生保存对话框成功导出 JSON。这是原生脚本入口权限，与已获外部交互权限的 CircuitFabric 扩展执行器不同。
+
+新增关键约束：类型查询得到的 `DMT_Project.openProject` JSDoc 明确说明，原工程如有未保存变更会被**直接丢失**；当前 SDK 查询未找到可靠 dirty/unsaved 状态接口，也未找到独立文档 sync API。因此“打开工程”不能自动当作无害的可重试命令。继续创建/切换独立测试工程前，需要用户确认当前工程已保存；不替用户保存当前工程，也不静默切换。已准备 `eda-host/lifecycle.ts`，默认门闩在任何写入前阻止执行，目标为独立 `CF584-Lifecycle-20261030` 工程；尚未执行，不计入现场通过项。
+
+已确认连接和真实工程树，但文档创建/打开/改名/保存/同步、专用双图页测试工程、未保存分支、原生检查点、重启与多实例身份，以及四运行时原生问答/图像/恢复仍未完成验收。阶段门禁继续关闭；父任务应按实际安全约束确认后续探测方式。
+
 2026-10-30 增补（评论 9082）：验收覆盖当前桌面端的 **Codex、Claude Code、Kimi Code、DSH 全部四种运行时**。下方 2026-10-29 的结果保留为历史基线，以本增补的现场结果为准；证据数据结构仍为 schemaVersion 1，探测脚本版本为 1.1.0。
 
 ## 2026-10-30 重新确认

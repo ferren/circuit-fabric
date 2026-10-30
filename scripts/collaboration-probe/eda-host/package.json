@@ -1,0 +1,8 @@
+{
+  "private": true,
+  "scripts": { "build": "tsc -p tsconfig.json" },
+  "devDependencies": {
+    "@jlceda/pro-api-types": "^0.4.27",
+    "typescript": "5.9.3"
+  }
+}
