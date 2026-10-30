@@ -29,21 +29,33 @@ def command(name):
     return path
 
 
+def version_command(name):
+    """Use the installed Node entry directly so timeout owns the real process."""
+    if os.name == "nt" and name == "dsh":
+        wrapper = shutil.which("dsh.cmd")
+        if wrapper:
+            root = Path(wrapper).resolve().parent
+            entry = root / "node_modules/@deepseek-ai/dsh/lib/bin.js"
+            if entry.is_file():
+                return [str(root / "node.exe"), str(entry), "--version"]
+    return [command(name), "--version"]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     result = {"schemaVersion": 1, "collectedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-              "probeVersion": "1.0.0", "scope": "local protocol; no inference; no EDA writes",
+              "probeVersion": "1.1.0", "scope": "four runtime versions; local protocol; no inference; no EDA writes",
               "versions": {}, "bridge": {}, "conversationResume": "unverified",
               "questionAnswer": "unverified", "imageInput": "unverified"}
-    for name in ("codex", "claude"):
+    for name in ("codex", "claude", "kimi", "dsh"):
         try:
-            completed = subprocess.run([command(name), "--version"], capture_output=True,
+            completed = subprocess.run(version_command(name), capture_output=True,
                                        text=True, encoding="utf-8", errors="replace", timeout=15)
             result["versions"][name] = {"exitCode": completed.returncode, "stdout": completed.stdout.strip()}
-        except (OSError, subprocess.TimeoutExpired) as exc:
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
             result["versions"][name] = {"error": str(exc)}
     for port in (49630, 49640):
         try:

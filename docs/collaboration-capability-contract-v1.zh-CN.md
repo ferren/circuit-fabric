@@ -1,4 +1,40 @@
-# 协作能力探测契约 v1
+# 协作能力探测契约 v1.1
+
+2026-10-30 增补（评论 9082）：验收覆盖当前桌面端的 **Codex、Claude Code、Kimi Code、DSH 全部四种运行时**。下方 2026-10-29 的结果保留为历史基线，以本增补的现场结果为准；证据数据结构仍为 schemaVersion 1，探测脚本版本为 1.1.0。
+
+## 2026-10-30 重新确认
+
+实际版本命令均成功：Codex `0.165.0`、Claude Code `2.1.302`、Kimi Code `2.3.1`、DSH `0.1.2-rc.1`。这证明本机 CLI 可以启动，不证明已完成 EDA 受控工具任务。探测必须使用与桌面相同的用户 PATH；受限环境可能看不到 kimi/dsh。Windows DSH 探测直接调用已安装 Node 入口，避免 cmd 包装器影响进程超时回收。
+
+EDA **确实已打开**：真实进程的窗口标题为 `4寸墨水屏日历相框 | 嘉立创EDA(专业版) - V4.1.78`，运行包版本 `4.1.78.34f5b8d9`；磁盘资源目录包含 `pro-api/0.3.53.61b2011d`、`pro-ui/4.1.78.435b55cf`。资源目录版本不等同于扩展当前实际使用的 SDK；未得到入口回报前 SDK 运行版本仍未验证。
+
+本轮临时启动磁盘已有 Bridge（构建时间 2026-10-28），真实 WebSocket hello/status/list_projects 均成功，但 hello 和 status 都返回 **executorConnected=false**。列出的 Grow-G1.2 / Microduck / MojianC3 / WirelessMic 是 CircuitFabric 项目注册表，**不是 EDA 原生工程树**。因此当前阻塞从“没有 EDA 进程”更新为“EDA 已开，但插件执行器尚未接入 Bridge，未取得原生 API 回读”。本任务启动的 Bridge 已在探测结束后停止，未承诺常驻服务。
+
+| 能力 / 当前代码路径 | Codex | Claude Code | Kimi Code | DSH |
+|---|---|---|---|---|
+| 版本命令真实验证 | 0.165.0，通过 | 2.1.302，通过 | 2.3.1，通过 | 0.1.2-rc.1，通过 |
+| 桌面任务分派 | 已有适配器 | 已有适配器 | 已有适配器，kimi_account | 已有适配器，Chat Completions |
+| EDA 当前聊天路由 | 固定此运行时，仍待端到端验证 | 未接入 | 未接入 | 未接入 |
+| 原生会话恢复 | 持久 thread/resume 代码；本轮空线程无 rollout，不计通过 | 当前每任务 CLI，无原生绑定 | 当前 one-shot stream-json，无原生绑定 | 当前 headless 每任务启动，无原生绑定 |
+| 受控 MCP 工具 | 已有发现、授权收窄 | 已有 strict MCP 和白名单 | kimi_command 收到 servers 但未注入命令，不能宣称已有授权工具闭环 | patch 注入指定 MCP，关闭默认文件/执行工具 |
+| 图像输入 | localImage 代码，实际模型识图未验证 | 当前显式拒绝 | 当前显式拒绝 | 当前显式拒绝 |
+| 用户提问回答 | server request 当前拒绝 | 未接交互控制通道 | 未接交互控制通道 | 未接交互控制通道 |
+| 取消 | 取消标记和子进程路径已有，四者本轮均未做真实生成取消验收 | 同左 | 同左 | 同左 |
+| 子智能体 | 显式关闭 | 工具白名单未开放 | 当前未提供隔离委派契约，原生能力未验证 | patch 显式关闭 subagent 工具 |
+| 当前可用降级边界 | 可继续现有 Codex 路径，不能据此宣称全部能力通过 | 将来只能明确标注摘要续办，不能伪装原线程 | 同左；工具隔离未核定前不得开放工程写入 | 同左；不凭 headless 输出伪造 token 用量 |
+
+代码证据：`execution.rs` 中 AgentKind、图像前置拒绝、claude_command / kimi_command / dsh_command；`circuitfabric-jlc-bridge.rs` 的聊天 Provider 选择、backend_id 和 run_session_observed 均固定 Codex；iframe 也没有运行时选择器。此为阶段 1 发现的实际缺口，**不能把增加版本探测误报为已经实现四运行时 EDA 支持**。依既有阶段约束，统一运行时分派、会话绑定、用户输入与 UI 选择器仍由阶段 3 实现；父任务应按四运行时验收，不缩减成二选一。
+
+新增只读重现命令：
+
+```powershell
+python scripts/collaboration-probe/bridge_probe.py --out artifacts/collaboration-584-recheck --start-bridge target/debug/circuitfabric-jlc-bridge.exe --settings "$env:APPDATA/CircuitFabric/runtime.json"
+python scripts/collaboration-probe/runtime_probe.py --out artifacts/collaboration-584-recheck/runtime
+```
+
+bridge_probe 依赖已安装的 Python websockets，单次启动窗口 8 秒，RPC 分别限时，原始帧保存在 bridge-rpc.jsonl，结果保存在 bridge-result.json。仅由 --start-bridge 启动的子进程才由脚本结束；连接既有服务时不停止别人的服务。它不写 EDA、不切图、不创建工程、不触发模型。临时服务停止后，版本探测中 TCP 端口超时不与此前的 WebSocket 成功矛盾。
+
+本轮仍需真实扩展执行器连接后再采集工程树、页 UUID、创建/打开/保存/同步、稳定身份和双图页工程。阶段门禁未通过，后继保持 backlog；本增补不改变原来的确认、幂等和恢复要求。
 
 2026-10-29，TASK-5-36-1（584），父任务 583。状态：**协议候选，阶段门禁未通过**。本记录不能代替现场验收，也不授权推进阶段 2。
 
