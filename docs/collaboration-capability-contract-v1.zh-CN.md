@@ -1,4 +1,27 @@
-# 协作能力探测契约 v1.1
+# 协作能力探测契约 v1.2（候选，门禁未通过）
+
+## 2026-10-30 当前结果（评论 9113，执行 1550 / 1551）
+
+执行 1550 因平台模型容量错误中断；已完成的文件保留，1551 从原会话续测，没有重复创建 EDA 工程。本节是当前矩阵；下方带日期的旧矩阵保留为历史，不得单独作为当前支持表。
+
+| 真实探测 | Codex 0.165.0 | Claude Code 2.1.302 | Kimi Code 2.4.0 | DSH 0.1.2-rc.1 |
+|---|---|---|---|---|
+| 模型调用 | 已验证 | 失败：原生 CLI 返回 authentication_failed / Not logged in，退出 1 | 已验证，随机标记正确 | 已验证，随机标记正确 |
+| 持久会话恢复 | 原生 CLI 新进程 exec resume 已验证（评论 9107） | 未验证，受此次认证失败影响 | 新进程恢复同一 session 已验证，标记正确；必须使用原 cwd | 未验证；此次 headless 只执行单任务 |
+| 图像 | 原生 CLI 三色图识别已验证（评论 9107） | 未验证 | 未验证 | 未验证 |
+| 原生提问回答 | App Server 已验证：收到 item/tool/requestUserInput 后生成新答案，用原 request ID 回传，模型精确复述 | 未验证 | 未验证 | 未验证 |
+| 真实生成取消 | App Server 已验证：收到非空文本 delta 后 turn/interrupt 成功，同一 turn 最终 interrupted | 未验证 | 未验证 | 未验证 |
+| EDA 统一接入 | 当前聊天固定 Codex，端到端工具任务仍未验收 | 阶段 3 缺口 | 阶段 3 缺口 | 阶段 3 缺口 |
+
+Kimi 此次实际版本命令与流事件均报告 `2.4.0`，取代早前 `2.3.1` 的版本基线；不把旧版本帮助或成功结果套到新版本。首次恢复从不同输出目录执行，原生 CLI 明确拒绝“created under a different directory”；改用原目录后退出 0、标记匹配。失败与成功结果分别保留，不能解释成任意目录恢复通过。
+
+Codex App Server 使用现有登录、临时测试线程、只读沙箱，关闭 shell 与 multi_agent，未调用工程工具。提问的回答由探测客户端自动生成，不是 EDA UI 或人机交互验收。取消只验证原生生成中止，不代表 EDA 写入撤销。实际模型为 `gpt-6.1-sol`；现有配置的 Codegraph.type 警告和模型列表刷新超时保存在 stderr，最终测试通过不豁免这些配置问题。原始双向记录通过 `verify_interaction.py` 校验，四项负向控制（错误 turn、缺少真实 delta、错误 request ID、提前泄露答案）均被拒绝；校验器结果只是原始证据的交叉检查。
+
+原始文件在 `artifacts/collaboration-584-followup/`：`codex-interaction/result.json`、`rpc.jsonl`、`stderr.txt`；`kimi/result.json`（首轮）、`kimi-resume/result.json`（不同 cwd 拒绝）、`kimi-resume-cwd/result.json`（恢复成功）；`dsh/result.json`；`claude/result.json`。旧采集器在 Claude 失败、Kimi 尚未完成解析时写过 unverified，当前矩阵按实际退出码与原始消息判定；不修改历史原始输出。DSH 输出含其原生 reasoning，不能据此推断 token 用量或工具闭环。
+
+**尚未通过的条件与处理**：Claude 原生认证需要可用的现有账号或 Provider 注入路径；不能因 CLI 未登录而宣布 Claude 本身不支持。继续补 EDA 重启、多窗口/实例路由、未保存编辑的保存/保留/取消、原生归档重新导入和双页可区分内容持久化。SDK `0.4.27` 查询未找到 instance 成员，sys_Environment 不提供实例 ID；已有 editorTree 的 `editor-window-main` 是容器 ID，不能当全局实例身份。Bridge 当前 registry 只有一个 executor stream（代码检查，不是双实例现场验证），后继必须增加实例 ID、连接代次及原生 UUID 的路由绑定，不能按进程、窗口标题或图页名称路由。dirty/原生检查点缺口仍按未知处理；云端同步已排除，不重新作为阻塞。关键项未通过时，584 保持未验收，后继阶段不自动推进。
+
+复现及边界见 `scripts/collaboration-probe/README.zh-CN.md`。本节补齐原生协议证据，不修改生产适配器，不提前实现阶段 3。
 
 ## 2026-10-30 验收范围决定（评论 9105）
 
