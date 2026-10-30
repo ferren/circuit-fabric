@@ -5,10 +5,9 @@ void (async () => {
   const ALLOW_SWITCH_AFTER_SAVE: boolean = false;
   const expectedOriginal = '135d2e3c9573727175c3c7596ab2f66b90484cf174de38bfb60d0c03aa72d9ea';
   const testName = 'CF584-Lifecycle-20261030';
-  const targetFolder = 'C:/Users/Ferren/Projects/circuit-fabric/artifacts/cf584-native-projects';
   const steps: Array<{ method: string; value?: unknown; error?: string }> = [];
   const result: Record<string, unknown> = { schemaVersion: 1, probe: 'cf584-lifecycle-v1',
-    collectedAt: new Date().toISOString(), testName, targetFolder, steps,
+    collectedAt: new Date().toISOString(), testName, steps,
     sync: 'unverified; no explicit document sync API established',
     deletion: 'disabled', checkpoint: 'unverified',
     activeSdkVersion: null,
@@ -29,7 +28,9 @@ void (async () => {
     const original = await step('getCurrentProjectInfo.before', () => eda.dmt_Project.getCurrentProjectInfo());
     if (original?.uuid !== expectedOriginal) throw new Error('Original project changed; no writes performed');
     // No automatic retry: if creation result is unknown, inspect before rerunning.
-    const projectId = await step('createProject', () => eda.dmt_Project.createProject(testName, testName, targetFolder));
+    // Third argument is a team UUID, not a filesystem destination.
+    result.creationOwnerTeam = original.teamUuid;
+    const projectId = await step('createProject', () => eda.dmt_Project.createProject(testName, testName, original.teamUuid));
     if (!projectId) throw new Error('createProject returned no UUID; do not retry blindly');
     result.testProjectUuid = projectId;
     if (!await step('openProject', () => eda.dmt_Project.openProject(projectId))) throw new Error('openProject returned false');
