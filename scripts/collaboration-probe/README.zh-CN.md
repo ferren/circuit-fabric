@@ -2,11 +2,21 @@
 
 评论 9124 的专用工程增补：`eda-host/content.ts`、`archive.ts`、`dirty.ts` 均默认禁止写入；先只读核对 fixture UUID，再在一次性 artifact 副本中启用门禁。每次粘贴前须用窗口截图确认原生脚本编辑器确实打开，不能仅凭窗口标题。脚本可能打开多个原生导出对话框；`save_native_dialog.ps1 -WindowHandle <已核实句柄>` 可明确选择，禁止覆盖既有证据。导入未知结果不可盲目重跑。
 
-复核新宿主证据：`python scripts/collaboration-probe/verify_content.py --dir artifacts/collaboration-584-ready`。包括两个内容标记在新 EDA 进程中的回读，以及未保存编辑被 closeDocument 丢弃的反例。后者不应解释为保存/保留/取消支持。归档导入当前被外部交互权限拒绝；Claude Z.ai 当前进程缺少认证注入。三者仍关闭阶段门禁。新脚本以同一类型包编译：`npm --prefix scripts/collaboration-probe/eda-host run build`。
+复核新宿主证据：`python scripts/collaboration-probe/verify_content.py --dir artifacts/collaboration-584-ready`。包括两个内容标记在新 EDA 进程中的回读，以及未保存编辑被 closeDocument 丢弃的反例。后者不应解释为保存/保留/取消支持。当前规则以契约 v1.5 和评论 9171/9184 为准：dirty unknown 等用户明确已保存好；归档导入按需手工授权；Claude＋Z.ai 复用助手正式 Provider 注入路径，旧独立 CLI 缺认证不代表该组合不可用。新脚本以同一类型包编译：`npm --prefix scripts/collaboration-probe/eda-host run build`。
 
 探测依赖本机已安装的运行时与现有登录，不复制凭据。CLI 自身会写会话及配置缓存；在受限环境需允许该操作。结果保留实际版本、原始输出和退出码，脚本退出 0 只表示采集结束，不表示每项能力或阶段门禁通过。
 
 ## 运行时
+
+Kimi ACP 握手不调用模型；带 `--image` 时会新建测试会话并调用模型，产生费用和本地会话缓存。不要重跑已有成功探测：
+
+```powershell
+python scripts/collaboration-probe/kimi_acp_probe.py --out artifacts/cf584-kimi-acp
+python scripts/collaboration-probe/kimi_acp_probe.py --out artifacts/cf584-kimi-image --image artifacts/collaboration-584-option-a/runtime/fixture.png
+python scripts/collaboration-probe/verify_kimi_image.py artifacts/collaboration-584-decisions/kimi-image --negative-controls
+```
+
+ACP 客户端不提供文件/终端工具，拒绝所有权限请求；空 MCP 列表，不使用 yolo/自动批准，不接 EDA。这不是操作系统沙箱，也不证明 Kimi 内建工具被全面隔离。握手自报能力不算功能测试通过；图像通过不算生产 CLI 适配器已接入图像。现有 2.4.0 登录和 kimi-code/k3 已可用，用户暂不需配合。只有实际登录过期或开放特定测试工具需要批准时才请用户处理；无需提供密钥。校验器只交叉核对已捕获回复，不替代现场执行，也不能独立证明旧记录中未保存的图像请求字节。
 
 ```powershell
 python scripts/collaboration-probe/model_probe.py --out artifacts/cf584-codex-image-resume
