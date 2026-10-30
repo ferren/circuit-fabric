@@ -11,6 +11,7 @@ void (async () => {
     collectedAt: new Date().toISOString(), testName, targetFolder, steps,
     sync: 'unverified; no explicit document sync API established',
     deletion: 'disabled', checkpoint: 'unverified',
+    activeSdkVersion: null,
     sdkDeclarations: '@jlceda/pro-api-types 0.4.27' };
   async function step<T>(method: string, fn: () => Promise<T>): Promise<T> {
     try {
@@ -24,6 +25,7 @@ void (async () => {
   }
   try {
     if (!ALLOW_SWITCH_AFTER_SAVE) throw new Error('User saved-state confirmation required; no writes performed');
+    result.runtimeVersion = await step('getEditorCurrentVersion', async () => eda.sys_Environment.getEditorCurrentVersion());
     const original = await step('getCurrentProjectInfo.before', () => eda.dmt_Project.getCurrentProjectInfo());
     if (original?.uuid !== expectedOriginal) throw new Error('Original project changed; no writes performed');
     // No automatic retry: if creation result is unknown, inspect before rerunning.

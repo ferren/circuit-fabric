@@ -1,5 +1,6 @@
-param([Parameter(Mandatory=$true)][string]$Source, [switch]$DismissError)
+param([Parameter(Mandatory=$true)][string]$Source, [string]$WindowTitle, [switch]$DismissError)
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'native_host_windows.ps1')
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -TypeDefinition @'
 using System;
@@ -15,17 +16,20 @@ public class CFNativeScriptUi {
   [DllImport("user32.dll")] public static extern void mouse_event(uint f,uint x,uint y,uint d,UIntPtr e);
 }
 '@
-$edaProcess = Get-Process lceda-pro | Where-Object MainWindowTitle | Select-Object -First 1
-if (!$edaProcess) { throw 'No EDA window' }
+$projectWindows = @(Get-CFNativeWindows | Where-Object {
+  $_.Title -match 'V4\.' -and (!$WindowTitle -or $_.Title -eq $WindowTitle)
+})
+if ($projectWindows.Count -ne 1) { throw "Expected one matching EDA project window; found $($projectWindows.Count). Specify -WindowTitle." }
+$edaWindow = [IntPtr]$projectWindows[0].Handle
 [System.Windows.Forms.SendKeys]::SendWait('%')
-[CFNativeScriptUi]::ShowWindow($edaProcess.MainWindowHandle,9) | Out-Null
-[CFNativeScriptUi]::SetForegroundWindow($edaProcess.MainWindowHandle) | Out-Null
+[CFNativeScriptUi]::ShowWindow($edaWindow,9) | Out-Null
+[CFNativeScriptUi]::SetForegroundWindow($edaWindow) | Out-Null
 Start-Sleep -Milliseconds 250
 $foregroundPid = [uint32]0
 [CFNativeScriptUi]::GetWindowThreadProcessId([CFNativeScriptUi]::GetForegroundWindow(),[ref]$foregroundPid) | Out-Null
-if ($foregroundPid -ne $edaProcess.Id) { throw 'EDA focus not acquired' }
+if ($foregroundPid -ne $projectWindows[0].ProcessId -or [CFNativeScriptUi]::GetForegroundWindow() -ne $edaWindow) { throw 'EDA focus not acquired' }
 $bounds = New-Object CFNativeScriptUi+Rect
-[CFNativeScriptUi]::GetWindowRect($edaProcess.MainWindowHandle,[ref]$bounds) | Out-Null
+[CFNativeScriptUi]::GetWindowRect($edaWindow,[ref]$bounds) | Out-Null
 $width = $bounds.Right-$bounds.Left
 $height = $bounds.Bottom-$bounds.Top
 if ($width -lt 1280 -or $width -gt 1300 -or $height -lt 720 -or $height -gt 740) {
