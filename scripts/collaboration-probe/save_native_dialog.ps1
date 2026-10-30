@@ -1,4 +1,4 @@
-param([Parameter(Mandatory=$true)][string]$Destination)
+param([Parameter(Mandatory=$true)][string]$Destination, [long]$WindowHandle=0)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'native_host_windows.ps1')
 Add-Type -AssemblyName System.Windows.Forms
@@ -19,7 +19,7 @@ $workspacePrefix = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..')) + [
 if (!$targetPath.StartsWith($workspacePrefix,[StringComparison]::OrdinalIgnoreCase)) { throw 'Destination must be inside this workspace' }
 if (Test-Path -LiteralPath $targetPath) { throw 'Refusing to overwrite an existing export' }
 if (!(Test-Path -LiteralPath ([IO.Path]::GetDirectoryName($targetPath)))) { throw 'Destination directory missing' }
-$exports = @(Get-CFNativeWindows | Where-Object { $_.Title.StartsWith('blob:https://client/') })
+$exports = @(Get-CFNativeWindows | Where-Object { $_.Title.StartsWith('blob:https://client/') -and (!$WindowHandle -or $_.Handle -eq $WindowHandle) })
 if ($exports.Count -ne 1) { throw "Expected one EDA export dialog; found $($exports.Count)" }
 $popup = [IntPtr]$exports[0].Handle
 $caption = New-Object Text.StringBuilder 1024

@@ -1,4 +1,22 @@
-# 协作能力探测契约 v1.2（候选，门禁未通过）
+# 协作能力探测契约 v1.3（候选，门禁未通过）
+
+## 2026-10-30 评论 9124：专用现场重启、内容与未保存关闭实测
+
+用户已准备专用现场，并指定 Claude CLI 使用 Z.ai，不要求 Anthropic 原生网络。测试工程 UUID 与既有 fixture 一致，没有重新创建工程。类型包仍为 0.4.27，声明 SHA-256 `3e91ca9432bc6a640d5a7983c044ec63630ca94e5398744e17e0ac162674d5aa`，TS 5.9.3；活动 SDK 版本未知。以下更新覆盖历史章节中的相应未验证项。
+
+| 项目 | 新实测结果与边界 |
+|---|---|
+| 双图页内容 | Probe-A / Probe-B 分别含 CF584-CONTENT-A-20261030 / CF584-CONTENT-B-20261030；save=true，关闭重开回读正确，无跨页混淆 |
+| 进程重启 | 原主进程 42548 正常退出，新主进程 9232 从启动页打开测试工程。只读脚本回读工程 UUID、两页 UUID、不同内容均一致；回读未保存或创建 |
+| 未保存关闭 | Probe-A 添加额外标记，getAll 确认存在；未 save，closeDocument=true，无保存确认。重开后额外标记消失，原已保存标记仍在。因此 API 关闭可能丢弃编辑，保存/保留/取消流程未通过 |
+| 原生归档 | 导出 CF584-Content-20261030.epro2（12914 字节），ZIP CRC 正确，epru 含两个区别标记 |
+| 导入 API | 单次 importProjectByProjectFile 调用被宿主拒绝：未启用扩展和独立脚本的外部交互权限。未修改权限、未重试，隔离目标目录为空；导入和恢复仍未通过 |
+| 窗口与实例 | 命令行传工程路径产生空白窗口，已正常关闭；成功回读来自启动页已有工程条目。曾见同一 PID 9232 下两个 HWND，不能用 PID 当实例身份。不把空白窗口算第二工程实例成功，多实例路由未验证 |
+| Claude / Z.ai | 继承环境有 Z.ai 的 ANTHROPIC_BASE_URL 和 glm-5.3 模型映射，无认证变量。CLI 2.1.302 返回 apiKeySource=none / authentication_failed，未发模型请求。这是当前进程凭据注入缺口，不代表 Z.ai 不支持，也不要求原生 Anthropic 登录 |
+
+原始证据在 `artifacts/collaboration-584-ready/`：native-readonly.json、content-write-result.json、content-after-restart.json、dirty-result.json、archive-result.json、原生归档、claude/result.json。`verify_content.py` 交叉校验三份宿主结果，拒绝错误页 UUID、跨页替换、缺少未保存标记三项负向控制。校验器不替代宿主执行。最后保留专用测试工程，未修改用户原工程。
+
+返回父任务 583：持久化与重启补齐；导入权限、Claude 凭据注入、dirty 三态/显式保存保留取消、多实例路由仍有缺口。unknown dirty 时必须拒绝隐式 close/open/switch；显式丢弃需绑定工程/页并确认，closeDocument=true 仅表示关闭成功。归档不冒充原生 checkpoint。需在独立测试配置启用宿主外部交互后补导入，通过现有 Provider 正式注入路径补 Claude，不索取或复制保险库密码。统一四运行时 EDA 接入和多实例路由实现留给后继阶段；阶段门禁继续关闭，不自动推进。
 
 ## 2026-10-30 续跑 1552：现场前提与父任务处理方案
 

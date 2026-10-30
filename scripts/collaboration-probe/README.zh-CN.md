@@ -1,5 +1,9 @@
 # 原生协作能力探测
 
+评论 9124 的专用工程增补：`eda-host/content.ts`、`archive.ts`、`dirty.ts` 均默认禁止写入；先只读核对 fixture UUID，再在一次性 artifact 副本中启用门禁。每次粘贴前须用窗口截图确认原生脚本编辑器确实打开，不能仅凭窗口标题。脚本可能打开多个原生导出对话框；`save_native_dialog.ps1 -WindowHandle <已核实句柄>` 可明确选择，禁止覆盖既有证据。导入未知结果不可盲目重跑。
+
+复核新宿主证据：`python scripts/collaboration-probe/verify_content.py --dir artifacts/collaboration-584-ready`。包括两个内容标记在新 EDA 进程中的回读，以及未保存编辑被 closeDocument 丢弃的反例。后者不应解释为保存/保留/取消支持。归档导入当前被外部交互权限拒绝；Claude Z.ai 当前进程缺少认证注入。三者仍关闭阶段门禁。新脚本以同一类型包编译：`npm --prefix scripts/collaboration-probe/eda-host run build`。
+
 探测依赖本机已安装的运行时与现有登录，不复制凭据。CLI 自身会写会话及配置缓存；在受限环境需允许该操作。结果保留实际版本、原始输出和退出码，脚本退出 0 只表示采集结束，不表示每项能力或阶段门禁通过。
 
 ## 运行时
